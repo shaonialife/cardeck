@@ -41,6 +41,7 @@ class Iap2BluetoothClient(
     private val knownCarSsid: () -> String? = { null },
     /** 0x1D01 画像判定的链路代际（Phase 1 完成后回调，AirPlay 阶段分派用）。 */
     private val onGeneration: (ReceiverProfile.LinkGeneration) -> Unit = {},
+    private val onIdentity: ((String) -> Unit)? = null,
     /** 目标车机（动态读取：选择后无需重启链路，下一轮尝试即生效）。 */
     private val targetProvider: () -> TargetDevicePrefs.Target? = { null },
 ) {
@@ -360,6 +361,7 @@ class Iap2BluetoothClient(
                 onLinkClosed,
                 knownCarSsid,
                 onGeneration,
+                onIdentity,
             )
         } catch (error: IOException) {
             log("BT-C: SESSION 失败 - ${error.message}")

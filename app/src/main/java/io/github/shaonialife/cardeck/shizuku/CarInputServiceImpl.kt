@@ -87,6 +87,175 @@ class CarInputServiceImpl(
         }
     }
 
+    // ---- per-display 电源保活（2026-10-26，对照参考实现补齐）----
+    // 「按电源键真休眠后虚拟屏窗口表面被剥离、唤醒后重挂不稳定」的对策：给每块
+    // 虚拟屏持一把 **per-display 亮屏锁**（PowerManager 三参 newWakeLock，Android
+    // 15/16+ hidden API，反射调用——只有 shell uid 拿得到 DEVICE_POWER 语义），
+    // 并在非交互时对该 display 单独 wakeUp。表面剥离发生在 display 进 DOZE/OFF，
+    // 把虚拟 display 钉在交互态即可阻断。旧系统无该 API 时整体降级（维持现状）。
+    private val displayWakeLocks = HashMap<Int, android.os.PowerManager.WakeLock>()
+
+    /** 反射缓存：newWakeLock(int,String,int) / isInteractive(int) / wakeUp(long,int,String,int)。 */
+    private object DisplayPowerApi {
+        val newWakeLock3: Method? =
+            runCatching {
+                android.os.PowerManager::class.java.getMethod(
+                    "newWakeLock",
+                    Int::class.javaPrimitiveType,
+                    String::class.java,
+                    Int::class.javaPrimitiveType,
+                )
+            }.getOrNull()
+        val isInteractiveInt: Method? =
+            runCatching {
+                android.os.PowerManager::class.java.getMethod("isInteractive", Int::class.javaPrimitiveType)
+            }.getOrNull()
+        val wakeUp4: Method? =
+            runCatching {
+                android.os.PowerManager::class.java.getMethod(
+                    "wakeUp",
+                    Long::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    String::class.java,
+                    Int::class.javaPrimitiveType,
+                )
+            }.getOrNull()
+        val available: Boolean get() = newWakeLock3 != null
+    }
+
+    /** SCREEN_BRIGHT_WAKE_LOCK（deprecated 常量值 10，per-display 语义下是唯一可用档）。 */
+    private val screenBrightLevel = 10
+
+    private val powerManager: android.os.PowerManager? by lazy {
+        (context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager)
+    }
+
+    init {
+        if (DisplayPowerApi.available) {
+            // 真休眠（电源键）时系统广播 SCREEN_OFF：锁若不足以阻止全局 sleep，在此
+            // 对每块虚拟 display 补一次 wakeUp（只作用目标 display，不点亮主屏）。
+            runCatching {
+                val receiver =
+                    object : android.content.BroadcastReceiver() {
+                        override fun onReceive(
+                            receiverContext: Context?,
+                            intent: android.content.Intent?,
+                        ) {
+                            kickAllDisplaysAwake("SCREEN_OFF")
+                        }
+                    }
+                val filter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
+                try {
+                    context.registerReceiver(receiver, filter, android.content.Context.RECEIVER_EXPORTED)
+                } catch (_: Throwable) {
+                    context.registerReceiver(receiver, filter)
+                }
+                fileLog("per-display 保活就绪：SCREEN_OFF 补唤醒已注册")
+            }.onFailure { fileLog("SCREEN_OFF 注册失败（仅缺补唤醒，锁仍生效）: $it") }
+        } else {
+            fileLog("per-display 保活不可用：无三参 newWakeLock（Android 15/16 前），维持现状")
+        }
+    }
+
+    /** 给虚拟 display 持锁并按需唤醒；幂等。失败返回 false（调用方仅记日志）。 */
+    private fun keepDisplayAwake(
+        displayId: Int,
+        reason: String,
+    ): Boolean {
+        if (displayId < 0) return false
+        val pm = powerManager ?: return false
+        val newWakeLock = DisplayPowerApi.newWakeLock3 ?: return false
+        synchronized(displayWakeLocks) {
+            if (displayWakeLocks.containsKey(displayId)) return true
+            val lock =
+                try {
+                    newWakeLock.invoke(pm, screenBrightLevel, "CarDeck:vd", displayId) as? android.os.PowerManager.WakeLock
+                } catch (t: Throwable) {
+                    fileLog("vd #$displayId per-display wakeLock 获取失败（$reason）: $t")
+                    null
+                } ?: return false
+            lock.setReferenceCounted(false)
+            try {
+                lock.acquire()
+            } catch (t: Throwable) {
+                fileLog("vd #$displayId per-display wakeLock acquire 失败（$reason）: $t")
+                return false
+            }
+            displayWakeLocks[displayId] = lock
+        }
+        fileLog("vd #$displayId per-display 亮屏锁已持有（$reason）")
+        wakeDisplayIfNotInteractive(displayId, reason)
+        return true
+    }
+
+    /** display 非交互时对其单独 wakeUp（三/四参 hidden API；缺 API 则只持锁不唤醒）。 */
+    private fun wakeDisplayIfNotInteractive(
+        displayId: Int,
+        reason: String,
+    ) {
+        val pm = powerManager ?: return
+        val wakeUp = DisplayPowerApi.wakeUp4 ?: return
+        val interactive =
+            DisplayPowerApi.isInteractiveInt?.let { probe ->
+                runCatching { probe.invoke(pm, displayId) as? Boolean }.getOrNull()
+            }
+        if (interactive == true) return
+        wakeDisplay(displayId, reason, interactive)
+    }
+
+    /** 无条件 wakeUp（SCREEN_OFF 补唤醒用——交互态在 Doze 下不可信）。 */
+    private fun wakeDisplayUnconditionally(
+        displayId: Int,
+        reason: String,
+    ) = wakeDisplay(displayId, reason, null)
+
+    private fun wakeDisplay(
+        displayId: Int,
+        reason: String,
+        interactive: Boolean?,
+    ) {
+        val pm = powerManager ?: return
+        val wakeUp =
+            DisplayPowerApi.wakeUp4 ?: run {
+                fileLog("vd #$displayId 无法 wakeUp：无四参 wakeUp API")
+                return
+            }
+        runCatching {
+            wakeUp.invoke(pm, SystemClock.uptimeMillis(), 2, "CarDeck:vd", displayId)
+        }.onSuccess {
+            fileLog("vd #$displayId wakeUp 已发（$reason，interactive=$interactive）")
+        }.onFailure {
+            fileLog("vd #$displayId wakeUp 失败（$reason）: $it")
+        }
+    }
+
+    private fun kickAllDisplaysAwake(reason: String) {
+        val pm = powerManager
+        val ids = synchronized(displayWakeLocks) { displayWakeLocks.keys.toList() }
+        if (ids.isEmpty()) return
+        // 无条件逐屏 wakeUp（2026-10-26 17:2x 实测：真休眠 Dozing 下所有虚拟屏
+        // state=OFF + WMS 持 Display-off token，而 isInteractive(displayId) 仍返回
+        // true——按交互态短路会让 wakeUp 永远发不出去）。逐屏打 interactive 观测值，
+        // 便于判读 wakeUp 是否真把 display 拉回。
+        ids.forEach { id ->
+            val interactive =
+                DisplayPowerApi.isInteractiveInt?.let { probe ->
+                    runCatching { probe.invoke(pm, id) }.getOrNull()
+                }
+            wakeDisplayUnconditionally(id, reason)
+            fileLog("SCREEN_OFF 补唤醒 #$id：唤醒前 isInteractive=$interactive")
+        }
+    }
+
+    private fun releaseDisplayKeepAwake(displayId: Int) {
+        synchronized(displayWakeLocks) {
+            displayWakeLocks.remove(displayId)?.let { lock ->
+                runCatching { if (lock.isHeld) lock.release() }
+                fileLog("vd #$displayId per-display 亮屏锁已释放")
+            }
+        }
+    }
+
     private class Injector(
         val receiver: Any,
         val method: Method,
@@ -523,6 +692,11 @@ class CarInputServiceImpl(
             // 只有受信屏能设 IME 策略（WMS 对非受信屏抛 SecurityException），且正需要它：
             // dock 屏只承载自有 DockActivity，无输入场景
             if (trusted) applyImePolicyLocal(id)
+            // per-display 亮屏锁（真休眠表面剥离的对策，见 keepDisplayAwake 注释）：
+            // 旧系统无该 API 时静默降级为现状
+            if (!keepDisplayAwake(id, "create $name")) {
+                fileLog("$name(id=$id) 未获得 per-display 保活（降级，主屏休眠可能拖累该屏）")
+            }
             Log.i(TAG, "createDisplay $name id=$id size=${width}x$height@$dpi")
             id
         } catch (t: Throwable) {
@@ -557,6 +731,7 @@ class CarInputServiceImpl(
             fileLog("releaseDisplay id=$displayId -> 非本进程持有（跨进程无法释放）")
             return false
         }
+        releaseDisplayKeepAwake(displayId)
         return try {
             vd.release()
             Log.i(TAG, "releaseDisplay id=$displayId")

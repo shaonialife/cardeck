@@ -223,6 +223,96 @@ class Iap2LinkEngineTest {
         assertEquals(emitted.sorted(), emitted)
     }
 
+    /**
+     * 隧道形态的探测回显（2026-10-26 对照第三方发送端）：echoMarker 开启时协商期
+     * 每收到一条 marker 原样回写一条（车机在等「探测被应答」才发 SYN）；
+     * NORMAL 后重复探测忽略（不回显）。echoMarker 关闭时维持旧行为（上层应答）。
+     */
+    @Test
+    fun markerEchoedWhileNegotiatingAndIgnoredAfterNormal() {
+        val phone = Iap2LinkEngine()
+        phone.echoMarker = true
+        phone.enterNegotiating()
+
+        phone.feed(Iap2LinkEngine.MARKER, tick())
+        assertArrayEquals("协商期收到探测必须原样回显", Iap2LinkEngine.MARKER, phone.takeOutput())
+
+        phone.feed(Iap2LinkEngine.MARKER, tick())
+        assertArrayEquals("重复探测每次都回显", Iap2LinkEngine.MARKER, phone.takeOutput())
+
+        // 建链到 NORMAL：喂一条车机 SYN，回显即完成协商（响应方语义）
+        phone.feed(synFrame(peerSequence = 55), tick())
+        phone.takeOutput()
+        assertEquals(Iap2LinkEngine.State.NORMAL, phone.state)
+
+        phone.feed(Iap2LinkEngine.MARKER, tick())
+        assertTrue("NORMAL 后的重复探测不得回显", phone.takeOutput().isEmpty())
+    }
+
+    /** echoMarker 关闭（蓝牙/事件通道形态）：marker 由上层应答，引擎不得自行回显。 */
+    @Test
+    fun markerNotEchoedWhenDisabled() {
+        val phone = Iap2LinkEngine()
+        phone.enterNegotiating()
+
+        phone.feed(Iap2LinkEngine.MARKER, tick())
+        assertTrue(phone.takeOutput().isEmpty())
+    }
+
+    /**
+     * Re-SYN（2026-10-26 对照第三方发送端 L3 的 link_resync）：链路 NORMAL 后对端
+     * 用**新序号**重开协商 = 整轮重置——必须重跑协商并回调 onResynchronized；
+     * 同序号重发（DiPlay 每 500ms 重发同一 SYN）不算 Re-SYN，走幂等重放。
+     */
+    @Test
+    fun reSynAfterNormalResetsNegotiation() {
+        val phone = Iap2LinkEngine()
+        phone.echoFirst = true
+        phone.start(0)
+        phone.takeOutput()
+
+        phone.feed(synFrame(peerSequence = 77), tick())
+        phone.takeOutput()
+        assertEquals(Iap2LinkEngine.State.NORMAL, phone.state)
+
+        var resynced = 0
+        phone.onResynchronized = { resynced++ }
+
+        // 同序号重发：幂等重放，不触发重置
+        phone.feed(synFrame(peerSequence = 77), tick())
+        val replay = phone.takeOutput()
+        assertEquals("同 SYN 重发不触发 Re-SYN", 0, resynced)
+        assertTrue("重发必须原样重放 SYN|ACK", parseFrames(replay).any { it.control == 0xC0 })
+        assertEquals(Iap2LinkEngine.State.NORMAL, phone.state)
+
+        // 新序号 Re-SYN：重置 → 重新采纳 → 回 SYN|ACK → 回调
+        phone.feed(synFrame(peerSequence = 120), tick())
+        assertEquals("新序号 SYN 必须触发 Re-SYN 回调", 1, resynced)
+        val out = parseFrames(phone.takeOutput())
+        assertTrue("重置后必须重新回 SYN|ACK", out.any { it.control == 0xC0 })
+        assertEquals("echoFirst 回显即视为协商完成", Iap2LinkEngine.State.NORMAL, phone.state)
+    }
+
+    /** Re-SYN 超过上限（3 次）判死——对端无限重开协商视为链路不可用。 */
+    @Test
+    fun reSynBeyondLimitDies() {
+        val phone = Iap2LinkEngine()
+        phone.echoFirst = true
+        phone.start(0)
+        phone.takeOutput()
+        phone.feed(synFrame(peerSequence = 10), tick())
+        phone.takeOutput()
+        assertEquals(Iap2LinkEngine.State.NORMAL, phone.state)
+
+        phone.feed(synFrame(peerSequence = 20), tick())
+        phone.feed(synFrame(peerSequence = 30), tick())
+        phone.feed(synFrame(peerSequence = 40), tick())
+        assertEquals(Iap2LinkEngine.State.NORMAL, phone.state)
+
+        phone.feed(synFrame(peerSequence = 50), tick())
+        assertEquals("第 4 次 Re-SYN 必须判死", Iap2LinkEngine.State.DEAD, phone.state)
+    }
+
     // ---- 工具 ----
 
     private class ParsedFrame(

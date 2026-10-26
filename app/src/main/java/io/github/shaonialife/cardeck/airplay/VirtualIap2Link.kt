@@ -152,6 +152,21 @@ class VirtualIap2Link(
     init {
         engine.onEaData = { bytes -> handleEaData(bytes) }
         engine.onSynchronizationEchoSent = { pendingEchoFlush = true }
+        // Re-SYN：车机重开协商后控制会话作废，整套识别/MFi/runtime 重跑
+        // （MFi 长度记忆保留——同一台车的偏好不变）
+        engine.onResynchronized = {
+            tunnelCsmStarted = false
+            tunnelIdentified = false
+            mib3CsmStarted = false
+            mib3Identified = false
+            mib3AuthStage = 0
+            mfiFinished = false
+            mfiPosition = -1
+            mfiCurrentLength = 0
+            mfiOrder = emptyList()
+            mib3ControlSessionNotified = false
+            log("IAPLINK: Re-SYN——控制会话状态已重置，重跑识别/MFi/runtime")
+        }
         Thread(
             {
                 while (alive()) {
@@ -219,6 +234,22 @@ class VirtualIap2Link(
     }
 
     /**
+     * type-130 隧道的「现代认证」形态：接收端在 SETUP 应答 enabledFeatures 里声明了
+     * iAPChannel（参考实现/真 iPhone 同款分派）。声明者走两步式 0xAA00（先要
+     * 序列号）+ 记忆式挑战长度；未声明者（DiPlay 测试台：dataPort 照给但行为已知）
+     * 维持旧一步式 + 固定 32B，防回归。
+     */
+    @Volatile
+    var tunnelModernAuth: Boolean = false
+
+    /**
+     * 本机真实蓝牙 MAC（现代隧道形态的 0x4E0D 问候用）：由宿主在隧道建立前注入。
+     * 空/占位值时问候跳过 4E0D（不发假身份）。
+     */
+    @Volatile
+    var tunnelBluetoothMac: String? = null
+
+    /**
      * 调试/特殊形态用：强制开启一轮控制通道协商（正常路径由车机 marker 触发）。
      * 一经调用，后续 marker 按协商态处理。
      */
@@ -268,16 +299,53 @@ class VirtualIap2Link(
         drainLocked()
     }
 
-    /** 车机链路字节入口（事件通道 iAPSendMessage 的 data）。 */
+    /**
+     * 隧道入站「裸 CSM」形态（参考实现 A4 三模式之一）：comm 载荷直接以 `40 40`
+     * 开头、无 FF5A 链路封装。**按第一块数据定模式**（参考 "encapsulation fixed
+     * for this media session"）——逐块判 `40 40` 前缀会把「FF5A 帧拆包后恰好断在
+     * 载荷开头」的续块误判成裸 CSM（CSM 载荷必以 40 40 开头，非小概率）。该形态
+     * 无链路层：引擎永远到不了 NORMAL、积压队列不冲刷——**应答必须旁路引擎直写
+     * 隧道**（[sendCsmLocked] 分流），且首条消息到达即发 0x1D00（参考 F3.a()）。
+     */
+    private var tunnelIngressRawCsm = false
+
+    /** 裸 CSM 形态是否已发过 0x1D00（首条消息只发一次）。 */
+    private var rawCsmStarted = false
+
+    /** 车机链路字节入口（事件通道 iAPSendMessage 的 data；type-130 隧道 comm 包同入口）。 */
     fun onCarBytes(bytes: ByteArray) {
         synchronized(lock) {
-            // 隧道存在时切换「回显先行」协商语义（DiPlay 对端引擎硬性期望）
-            engine.echoFirst = tunnelWriter() != null
+            // 隧道存在时切换「回显先行」协商语义（DiPlay 对端引擎硬性期望）；
+            // 同时开启探测包引擎级回显——全双工隧道形态车机把 marker 放 comm 包里
+            // 发来，引擎收到即回（事件通道形态仍由本方法下方分支经控制通道应答）
+            val onTunnel = tunnelWriter() != null
+            engine.echoFirst = onTunnel && !tunnelIngressRawCsm
+            engine.echoMarker = onTunnel && !tunnelIngressRawCsm
+            if (onTunnel) {
+                if (!tunnelIngressRawCsm &&
+                    bytes.size >= 2 &&
+                    bytes[0] == 0x40.toByte() &&
+                    bytes[1] == 0x40.toByte()
+                ) {
+                    tunnelIngressRawCsm = true
+                    log("IAPLINK: 隧道入站形态 → 裸 CSM（40 40，无链路封装；本次会话固定）")
+                }
+                if (tunnelIngressRawCsm) {
+                    // 首条消息到达即发起识别（裸形态无链路协商，参考 F3.a() 直接 0x1D00）
+                    if (!tunnelIdentified && !mib3Identified && !rawCsmStarted) {
+                        rawCsmStarted = true
+                        sendCsmLocked(Iap2MessageIds.START_IDENTIFICATION)
+                    }
+                    handleFrameLocked(bytes)
+                    flushRawCsmLocked()
+                    return
+                }
+            }
             val isMarker =
                 bytes.size == 6 &&
                     bytes[0] == 0xFF.toByte() &&
                     bytes[1] == 0x55.toByte()
-            if (isMarker && tunnelWriter() == null) {
+            if (isMarker && !onTunnel) {
                 if (mib3Armed) {
                     mib3MarkerIgnores++
                     // iPhone 行为（sysdiagnose 2026-10-16 17:31:49.921）：车机每条
@@ -452,10 +520,28 @@ class VirtualIap2Link(
         log("IAPLINK: 链路状态 → $state（NORMAL 才可能收到车机 0x6800/0x6802 媒体键）")
     }
 
+    /**
+     * 链路已断（事件/控制通道 reset 或 POST 失败）标记：静默记忆只在「链路活着但
+     * 车机不回」时记录——断链后的无应答是断链不是静默，记成静默会把该车所有档位
+     * 污染成「快速跳过」（2026-10-26 6318 实测：拆 BT 回归轮把 16/20/32 全记静默）。
+     */
+    @Volatile
+    private var linkBroken = false
+
+    fun markLinkBroken() {
+        linkBroken = true
+    }
+
     /** MFi 挑战静默超时：记入该车机的记忆并换下一档重试（节拍线程每 200ms 驱动一次）。 */
     private fun checkMfiTimeoutLocked() {
         val identity = mfiIdentity ?: return
         if (mfiFinished || mfiCurrentLength == 0) return
+        if (linkBroken) {
+            log("IAPLINK: 链路已断——挑战 ${mfiCurrentLength}B 不记静默（断链≠静默），本轮认证作废")
+            mfiCurrentLength = 0
+            mfiPosition = mfiOrder.size // 后续不再盲试
+            return
+        }
         if (nowMillis() - mfiChallengeSentAtMs < mfiWindowMillis) return
         val failed = mfiCurrentLength
         MfiLengthMemory.recordSilent(mfiContext, identity, failed)
@@ -472,7 +558,7 @@ class VirtualIap2Link(
         val identity = mfiIdentity ?: return
         if (mfiOrder.isEmpty()) {
             mfiMemory = MfiLengthMemory.load(mfiContext, identity)
-            mfiOrder = MfiLengthMemory.orderAttempts(TUNNEL_MFI_BASELINE, mfiMemory)
+            mfiOrder = MfiLengthMemory.orderAttempts(tunnelMfiBaselineFor(identity), mfiMemory)
             if (!mfiMemory.isEmpty) {
                 log(
                     "IAPLINK: 隧道 MFi 按车机记忆：${MfiLengthMemory.describe(mfiMemory)}" +
@@ -480,6 +566,7 @@ class VirtualIap2Link(
                 )
             }
         }
+        if (linkBroken) return // 链路已断：不再盲试（见 checkMfiTimeoutLocked）
         mfiPosition += 1
         if (mfiPosition >= mfiOrder.size) {
             log("IAPLINK: 隧道 MFi 挑战全部无应答——跳过校验直接 0xaa05（由车机后续行为判定）")
@@ -526,12 +613,21 @@ class VirtualIap2Link(
         sendCsmLocked(Iap2MessageIds.START_IDENTIFICATION)
     }
 
-    /** 链路上的 CSM 发送（进入引擎 backlog，由引擎按发送窗口 flush）。 */
+    /**
+     * 链路上的 CSM 发送。裸 CSM 形态（[tunnelIngressRawCsm]）下**旁路引擎直写隧道**
+     * ——该形态无链路层，引擎积压队列在 NEGOTIATING 态永不冲刷（2026-10-26 审查
+     * P0：0x1D02/0xAA00 等应答全部堵死，车机等应答超时拆隧道）；其余形态进引擎
+     * backlog 由发送窗口 flush。
+     */
     private fun sendCsmLocked(
         messageId: Int,
         body: ByteArray = ByteArray(0),
     ) {
         val frame = Iap2Csm.encode(messageId, body)
+        if (tunnelIngressRawCsm) {
+            writeRawCsmToTunnelLocked(messageId, frame)
+            return
+        }
         val ok = engine.sendControl(frame, System.nanoTime() / 1_000_000L)
         log(
             "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
@@ -539,13 +635,34 @@ class VirtualIap2Link(
         )
     }
 
+    /** 裸 CSM 形态：4040 格式 CSM 消息直接写隧道（不经引擎加 FF5A 封装）。 */
+    private fun writeRawCsmToTunnelLocked(
+        messageId: Int,
+        frame: ByteArray,
+    ) {
+        val ok = tunnelWriter()?.writeIapBytes(frame) == true
+        log(
+            "IAPLINK: 裸CSM tx 0x${messageId.toString(16)} " +
+                "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B 直写隧道 ok=$ok",
+        )
+    }
+
+    /** 裸 CSM 形态的收尾冲刷（引擎路径的 drainLocked 等价物：该形态无引擎状态机）。 */
+    private fun flushRawCsmLocked() {
+        checkMfiTimeoutLocked()
+    }
+
     /** 直接投递完整 CSM 帧（Frida 抓的逐字节常量，勿重新编码）。 */
     private fun sendRawCsmLocked(frame: ByteArray) {
-        val ok = engine.sendControl(frame, System.nanoTime() / 1_000_000L)
         // CSM 帧布局：FF 5A [len:2] [msgId:2] …——消息号在 [4..5]，[2..3] 是载荷长度。
         // 曾误取 [2..3]，日志把 0xFFFA 打成 0x32、0xFFF0 打成 0x0E、0x4158 打成 0x64
         // （长度值），排查时极易被带偏（2026-10-23 实际误导过一轮）。
         val messageId = ((frame[4].toInt() and 0xFF) shl 8) or (frame[5].toInt() and 0xFF)
+        if (tunnelIngressRawCsm) {
+            writeRawCsmToTunnelLocked(messageId, frame)
+            return
+        }
+        val ok = engine.sendControl(frame, System.nanoTime() / 1_000_000L)
         log(
             "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B raw ok=$ok",
@@ -564,6 +681,7 @@ class VirtualIap2Link(
         val onTunnel = tunnelWriter() != null
         // 车机发起方形态复用 MIB3 那套识别/MFi 骨架（出站同样走控制通道）
         val mib3 = (mib3Armed || eventLinkArmed) && !onTunnel
+        val modernTunnel = onTunnel && tunnelModernAuth
         if (!onTunnel && !mib3) return
         val ids = Iap2MessageIds
         when (frame.messageId) {
@@ -599,24 +717,32 @@ class VirtualIap2Link(
                             receives.joinToString(" ") { "0x%04x".format(it) },
                     )
                 }
-                if (mib3) {
+                if (mib3 || modernTunnel) {
                     // 记忆键 = 车机身份 + " tunnel"：与蓝牙链路的记忆互不污染
                     mfiIdentity = mfiIdentityOf(params) + " tunnel"
                 }
                 sendCsmLocked(ids.IDENTIFICATION_ACCEPTED)
-                sendCsmLocked(ids.MFI_REQUEST_CERTIFICATE)
+                // 认证请求形态按接收端分派：声明 iAPChannel 的（modernTunnel）与
+                // MIB3 事件通道走两步式——先发带 param0(空值) 的 0xAA00 **要序列号**
+                // （车机回 0xAA06），再发空 body 的 0xAA00 要完整证书；未声明的
+                // （DiPlay：dataPort 照给但行为已验证）维持旧一步式防回归。
+                if (mib3 || modernTunnel) {
+                    sendCsmLocked(ids.MFI_REQUEST_CERTIFICATE, MFI_AUTH_SERIAL_REQUEST_BODY)
+                } else {
+                    sendCsmLocked(ids.MFI_REQUEST_CERTIFICATE)
+                }
                 mib3AuthStage = 1
             }
 
             MFI_AUTH_SERIAL -> {
-                if (!mib3 || mib3AuthStage != 1) return
+                if ((!mib3 && !modernTunnel) || mib3AuthStage != 1) return
                 sendCsmLocked(ids.MFI_REQUEST_CERTIFICATE)
                 mib3AuthStage = 2
-                log("IAPLINK: MIB3 0xaa06（auth serial）→ 再发 0xaa00")
+                log("IAPLINK: 0xaa06（auth serial）→ 再发 0xaa00 要完整证书")
             }
 
             ids.MFI_AUTHENTICATION_FAILED -> {
-                if (!mib3 || mfiFinished) return
+                if ((!mib3 && !modernTunnel) || mfiFinished) return
                 mfiIdentity?.let { MfiLengthMemory.recordRejected(mfiContext, it, mfiCurrentLength) }
                 log("IAPLINK: 隧道 MFi ${mfiCurrentLength}B 被拒（0xaa04）——记入记忆，换下一档")
                 mfiCurrentLength = 0
@@ -624,7 +750,7 @@ class VirtualIap2Link(
             }
 
             ids.MFI_CERTIFICATE -> {
-                if (mib3) {
+                if (mib3 || modernTunnel) {
                     // 长度按车机记忆（冷启动 20B 优先，Frida 真机值；详见 startNextMfiChallengeLocked）
                     startNextMfiChallengeLocked()
                 } else {
@@ -637,7 +763,7 @@ class VirtualIap2Link(
             }
 
             ids.MFI_RESPONSE -> {
-                if (mib3) {
+                if (mib3 || modernTunnel) {
                     mfiIdentity?.let { MfiLengthMemory.recordSuccess(mfiContext, it, mfiCurrentLength) }
                     log("IAPLINK: 隧道 rx=0xaa03 签名 ${frame.body.size}B（${mfiCurrentLength}B 挑战成功，已记忆）")
                     mfiCurrentLength = 0
@@ -647,6 +773,16 @@ class VirtualIap2Link(
                 if (mib3) {
                     mib3AuthStage = 4
                     sendMib3BurstLocked()
+                } else if (modernTunnel) {
+                    // 现代隧道形态（8015 类）：认证成功即发 runtime 问候（参考实现
+                    // 在隧道 ready 判定里要求「认证 + runtime 更新」都完成），随后由
+                    // 宿主重申 modesChanged
+                    mib3AuthStage = 4
+                    sendTunnelGreetingsLocked()
+                    if (!mib3ControlSessionNotified) {
+                        mib3ControlSessionNotified = true
+                        onControlSessionComplete?.invoke()
+                    }
                 } else {
                     log("IAPLINK: 隧道 MFi 完成——等待对端订阅（随后其标记隧道就绪）")
                 }
@@ -807,7 +943,7 @@ class VirtualIap2Link(
             }
         sendCsmLocked(
             WIRELESS_SESSION_ID,
-            Iap2Csm.param(0, sessionId.toByteArray(Charsets.UTF_8)),
+            Iap2Csm.param(0, "$sessionId\u0000".toByteArray(Charsets.UTF_8)),
         )
         // 0xA100 车辆状态能力：iPhone 只声明参数 6（sysdiagnose 2026-10-16 17:31:51.099，
         // `a1 00 00 04 00 06`）。旧「3 参数（3/6/9）」源自 Frida 抓包，与 iPhone 抓包矛盾
@@ -835,12 +971,51 @@ class VirtualIap2Link(
         }
     }
 
+    /**
+     * 现代隧道形态（8015 类）的 runtime 问候：0xAA05 后立即发，顺序对照参考实现
+     * （4E0C 身份 → 4E0B 时间 → **4E0D 无线激活(u8=1)** → 4E0A 语言 → 4E09 名称 →
+     * **4E0E 蓝牙 MAC**）。消息号与内容的对应见 [Iap2MessageIds] 第 8 组：
+     * 0x4E0D=WirelessCarPlayUpdate(u8)、0x4E0E=DeviceTransportIdentifier(MAC)。
+     * 首版曾把两者填反（4E0D 发了 MAC 字符串、4E0E 发了 u8），DiPlay 收到畸形的
+     * WirelessCarPlayUpdate 后 2 秒整栈下线（2026-10-26 17:15 实测：NSD 服务消失 +
+     * 全链 Connection reset）。MAC 为空/占位时跳过 4E0E（不发假身份）。
+     */
+    private fun sendTunnelGreetingsLocked() {
+        val sessionId =
+            mib3WirelessSessionId ?: UUID.randomUUID().toString().uppercase().also {
+                mib3WirelessSessionId = it
+            }
+        sendCsmLocked(
+            WIRELESS_SESSION_ID,
+            Iap2Csm.param(0, "$sessionId\u0000".toByteArray(Charsets.UTF_8)),
+        )
+        sendCsmLocked(DEVICE_TIME, mib3DeviceTimeParams())
+        sendCsmLocked(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+        sendCsmLocked(
+            DEVICE_LANGUAGE,
+            Iap2Csm.param(0, "zh\u0000".toByteArray(Charsets.UTF_8)),
+        )
+        sendCsmLocked(
+            DEVICE_INFORMATION_UPDATE,
+            Iap2Csm.param(0, "iPhone\u0000".toByteArray(Charsets.UTF_8)),
+        )
+        val mac = tunnelBluetoothMac
+        if (!mac.isNullOrEmpty() && mac != "02:00:00:00:00:00") {
+            sendCsmLocked(
+                DEVICE_TRANSPORT_IDENTIFIER,
+                Iap2Csm.param(0, "$mac\u0000".toByteArray(Charsets.US_ASCII)),
+            )
+        } else {
+            log("IAPLINK: ⚠ 隧道问候缺 4E0E——本机蓝牙 MAC 不可用（占位值不发）")
+        }
+        log("IAPLINK: 现代隧道 runtime 问候已发（会话标识 $sessionId）")
+    }
+
     /** 0x4E0B：u64 秒 + s16 时区偏移(分) + u8 夏令时。 */
     private fun mib3DeviceTimeParams(): ByteArray {
         val now = System.currentTimeMillis()
         val zone = TimeZone.getDefault()
         val offsetMin = zone.getOffset(now) / 60_000
-        val dst = if (zone.inDaylightTime(java.util.Date(now))) 1 else 0
         val seconds = ByteArray(8)
         for (i in 0 until 8) {
             seconds[i] = (now / 1000L ushr ((7 - i) * 8)).toByte()
@@ -850,7 +1025,11 @@ class VirtualIap2Link(
                 (offsetMin shr 8).toByte(),
                 offsetMin.toByte(),
             )
-        return Iap2Csm.param(0, seconds) + Iap2Csm.param(1, tz) + Iap2Csm.param(2, byteArrayOf(dst.toByte()))
+        // param2 = 夏令时偏移分钟数（参考实现 getDaylightSavings()/60——中国恒 0；
+        // 旧实现发 0/1 布尔，中国时区下字节相同，仅规范口径对齐）
+        val dstMinutes = zone.getOffset(now) / 60_000 - offsetMin
+        return Iap2Csm.param(0, seconds) + Iap2Csm.param(1, tz) +
+            Iap2Csm.param(2, byteArrayOf(dstMinutes.toByte()))
     }
 
     /** 大端 u16 数组（识别信息里的消息 ID 清单）。 */
@@ -915,8 +1094,22 @@ class VirtualIap2Link(
     }
 
     companion object {
-        /** 隧道 MFi 冷启动基线（Frida 真机 20B 优先；顺序会被按车机记忆重排）。 */
-        val TUNNEL_MFI_BASELINE = listOf(20, 32, 16)
+        /**
+         * 隧道 MFi 冷启动基线：按 0x1D01 身份的先验（2026-10-26 审查 P0 修正——
+         * 旧基线 20B 优先与实测相悖：奥迪 5163 系 BT 侧 32B 成功/20B 静默，参考
+         * 实现对 DELPHI AUDI5163 明确 32，且 20B 挑战对 EC 证书协议非法（MFi K4
+         * 语义：20B 属 RSA 时代档）。仅 DELPHI AUDI3260 按 20B 优先；默认 32 优先
+         * （参考默认 + DiPlay 32 + AUDI5163 32 三方一致）。车机记忆命中仍可覆盖。
+         */
+        fun tunnelMfiBaselineFor(identity: String): List<Int> {
+            val id = identity.lowercase()
+            return if (id.contains("delphi") && id.contains("audi3260")) {
+                listOf(20, 32, 16)
+            } else {
+                listOf(32, 20, 16)
+            }
+        }
+
         val TUNNEL_MFI_WINDOWS = mapOf(20 to 6_000L, 32 to 3_000L, 16 to 3_000L)
         const val TUNNEL_MFI_SILENT_WINDOW_MS = 1_500L
 
@@ -966,7 +1159,21 @@ class VirtualIap2Link(
         const val DEVICE_TIME = 0x4E0B
         const val DEVICE_LANGUAGE = 0x4E0A
         const val DEVICE_INFORMATION_UPDATE = 0x4E09
+
+        /**
+         * 0x4E0E = DeviceTransportIdentifier（param0 = 本机蓝牙 MAC 字符串 + NUL）。
+         * 0x4E0D（WirelessCarPlayUpdate，u8）直接复用 [Iap2MessageIds.WIRELESS_CARPLAY_UPDATE]
+         * ——两者勿再互相写反（见 [sendTunnelGreetingsLocked] 的实测记录）。
+         */
+        const val DEVICE_TRANSPORT_IDENTIFIER = 0x4E0E
         const val AUX_STATUS_NOTIFICATION = 0xA100
+
+        /**
+         * 0xAA00 的「请求认证序列号」形态 body（param 0 空值）：对照参考实现
+         * `new byte[]{0, 4, 0, 0}`——先要序列号（车机回 0xAA06），再发空 body 0xAA00
+         * 要完整证书。真 iPhone sysdiagnose 同款两步式。
+         */
+        val MFI_AUTH_SERIAL_REQUEST_BODY = byteArrayOf(0, 4, 0, 0)
         const val START_COMMUNICATIONS_UPDATES = 0x4157
         const val CALL_STATE_UPDATE = 0x4155
         const val START_CALL_STATE_UPDATES = 0x4154

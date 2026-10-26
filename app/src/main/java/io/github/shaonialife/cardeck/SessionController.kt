@@ -440,6 +440,13 @@ object SessionController {
     @Volatile
     private var senderLinkGenerationCache: ReceiverProfile.LinkGeneration? = null
 
+    /**
+     * BT 侧 0x1D01 的接收端身份原文（name/model/manufacturer；包含匹配时小写化）。
+     * 车型分派用：半移交「拆 BT」只对已验证车型开（见 [detachBtForMib3Handoff]）。
+     */
+    @Volatile
+    private var btReceiverIdentity: String = ""
+
     private fun knownCarHotspotSsid(): String? = boundCarSsid ?: lastCarWifiSsid
 
     /**
@@ -524,6 +531,7 @@ object SessionController {
                         senderLinkGenerationCache = g
                         appendLog("IAPLINK: 代际缓存更新 → $g（AirPlay 阶段布防分派用）")
                     },
+                    onIdentity = { identity -> btReceiverIdentity = identity },
                     targetProvider = targetProvider,
                 )
             bluetoothClient =
@@ -539,6 +547,7 @@ object SessionController {
                         senderLinkGenerationCache = g
                         appendLog("IAPLINK: 代际缓存更新 → $g（AirPlay 阶段布防分派用）")
                     },
+                    onIdentity = { identity -> btReceiverIdentity = identity },
                     targetProvider = targetProvider,
                 )
             ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
@@ -1782,6 +1791,23 @@ object SessionController {
      */
     fun detachBtForMib3Handoff() {
         if (senderLinkGeneration() != ReceiverProfile.LinkGeneration.CLASSIC_MIB3) return
+        // 车型白名单（2026-10-26 6318 定谳）：半移交「拆 BT」的依据全部来自 8015 系
+        // （AUDI 5163/5810：sysdiagnose + 0.1.28.8 实测车机配合重开协商）。6318
+        // （AUDI 3260）实测**不适用**——拆 BT 后车机照样配合到 0xAA01 证书，却在
+        // MFi 挑战后 180ms 拆掉整条 AirPlay 会话（EVENT reset → 六档音频全败 →
+        // 推流中止），此前的成功历史全部在「不拆 BT」形态。白名单外一律不拆
+        // （保留蓝牙双链），验证过的车型再进白名单。
+        val identity = btReceiverIdentity.lowercase()
+        if (!identity.contains("audi 5163") &&
+            !identity.contains("audi5163") &&
+            !identity.contains("audi 5810") &&
+            !identity.contains("audi5810")
+        ) {
+            appendLog(
+                "IAPLINK: 移交拆 BT 跳过——车型不在白名单（identity=${btReceiverIdentity.take(40)}），保留蓝牙双链",
+            )
+            return
+        }
         if (!btHandoffDone.compareAndSet(false, true)) return
         btHandoffActive = true
         appendLog(
@@ -2939,6 +2965,45 @@ object SessionController {
                             setup.hidDeviceUuids.forEach { uuid ->
                                 client.sendHidSetInputMode(uuid, mode = 0)
                             }
+                            // iAP 隧道（type-130）协商在屏幕流 SETUP **之前**（2026-10-26
+                            // 对照参考实现时序）：8015 类车机在隧道上完成 iAP2 协商后
+                            // 才进入 CarPlay 激活窗口；且隧道成功后 armMib3VirtualLink 的
+                            // 「隧道形态不布防」门禁才能在屏幕流 SETUP 时生效（顺序颠倒会
+                            // 先按事件通道形态发 DETECT）。失败不阻塞（返回 null 继续）。
+                            // modernAuth：接收端 SETUP 应答声明了 iAPChannel（8015 类）
+                            // → 全双工「现代认证」形态（两步式 0xAA00 + 记忆挑战 +
+                            // runtime 问候）；未声明（DiPlay）→ 旧半双工行为。
+                            val tunnelModern = setup.enabledFeatures.contains("iAPChannel")
+                            appendLog(
+                                "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}" +
+                                    " iAPChannel=$tunnelModern",
+                            )
+                            val tunnel = client.runIapTunnel(sessionKey, modernAuth = tunnelModern)
+                            if (tunnel != null && tunnelModern) {
+                                // 现代隧道形态：屏幕流 SETUP 前等待隧道控制会话完成
+                                // （识别+MFi+runtime，参考实现同款 6s 门；超时继续——
+                                // 隧道并发协商，屏幕流不无限等）
+                                val startedAt = SystemClock.elapsedRealtime()
+                                val ready = client.awaitModernTunnelSession(6_000L)
+                                appendLog(
+                                    "TUNNEL: 现代认证等待 " +
+                                        (if (ready) "完成" else "超时（继续屏幕流）") +
+                                        "（${SystemClock.elapsedRealtime() - startedAt}ms）",
+                                )
+                            }
+                            tunnel?.onIapMessage = { frame ->
+                                // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
+                                if (frame.messageId != 0x0000) {
+                                    val hex = frame.body.joinToString(" ") { "%02x".format(it) }
+                                    appendLog(
+                                        "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
+                                            "(${Iap2MessageIds.nameOf(
+                                                frame.messageId,
+                                            )}) ${frame.body.size}B" +
+                                            if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
+                                    )
+                                }
+                            }
                             val screen = client.runScreenStream(sessionKey, setup.displayUuid)
                             if (screen != null) {
                                 // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
@@ -2952,22 +3017,6 @@ object SessionController {
                                     client.startKeepAlive(host, setup.keepAlivePort!!)
                                 }
                                 client.startFeedbackLoop()
-                                // iAP 隧道（type-130）：车机→手机的 iAP2 EA 数据（触摸 HID 载体）。
-                                // 建立失败不阻塞会话（触摸不可用但视频照常）。
-                                val tunnel = client.runIapTunnel(sessionKey)
-                                tunnel?.onIapMessage = { frame ->
-                                    // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
-                                    if (frame.messageId != 0x0000) {
-                                        val hex = frame.body.joinToString(" ") { "%02x".format(it) }
-                                        appendLog(
-                                            "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
-                                                "(${Iap2MessageIds.nameOf(
-                                                    frame.messageId,
-                                                )}) ${frame.body.size}B" +
-                                                if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
-                                        )
-                                    }
-                                }
                                 // 关键时序（2026-10-17 奥迪定谳）：屏幕 SETUP 后必须尽快连上
                                 // dataPort——车机有 ~2s 看门狗。音频 SETUP 实测要 ~2.1s，
                                 // 若排在前面，端口连接迟到即触发车机 reset 控制通道

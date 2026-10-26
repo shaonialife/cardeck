@@ -124,6 +124,14 @@ class Iap2LinkEngine(
      */
     private var adoptedPeerControlSessionId: Int? = null
 
+    /**
+     * 采纳的对端 EA 会话 ID（会话表 kind==2 的条目）。奥迪形态表 {1:control, 2:EA}——
+     * 只认字面量 [SESSION_EA]=11 时，EA 数据（触摸 HID）以 sessionId=2 到达会被当
+     * 未知会话丢弃（DiPlay 表恰为 {10,11,12} 掩盖了问题，2026-10-26 审查 P1）。
+     * 未采纳回落字面量。
+     */
+    private var adoptedPeerEaSessionId: Int? = null
+
     /** 采纳的对端 sync 载荷（协商回显/诊断用）。 */
     private var adoptedSynchronization: SynchronizationPayload? = null
 
@@ -137,6 +145,25 @@ class Iap2LinkEngine(
      * 默认 false：蓝牙（RFCOMM/事件通道）路径语义不变（Audi 需 ACK+回显、等最终 ACK）。
      */
     var echoFirst: Boolean = false
+
+    /**
+     * 探测包（marker `FF 55 02 00 EE 10`）自动回显：协商期（NEGOTIATING）每收到一条
+     * 回一条、NORMAL 后忽略（对端实现 L3 同款语义；DiPlay 半双工时代此路径无流量，
+     * 隧道全双工后车机在隧道上等探测应答——不回显它永远不发 SYN）。
+     * 默认 false：蓝牙/事件通道形态的 marker 应答由上层（VirtualIap2Link）经控制
+     * 通道处理，引擎层再回显会双发。
+     */
+    var echoMarker: Boolean = false
+
+    /**
+     * 链路建立（NORMAL）后对端重开协商（Re-SYN）：重置协商状态重新应答，超过
+     * [MAX_RE_SYNCS] 次判死。对端实现把「established 后再发纯 SYN」定义为链路重置
+     * （清窗口/队列/协商态），宝马半移交、车机 HMI 重试都会出现；不重置则我方
+     * 序号账与对端失配，后续数据帧全被当重复丢弃。重置时回调 [onResynchronized]，
+     * 上层据此重跑控制会话（识别/MFi/runtime）。
+     */
+    var onResynchronized: (() -> Unit)? = null
+    private var reSyncCount = 0
 
     /** 诊断：首次采纳对端会话表时回调（打印对端提议的会话表，便于真车排查）。 */
     var onPeerSynchronizationAdopted: ((SynchronizationPayload) -> Unit)? = null
@@ -339,6 +366,17 @@ class Iap2LinkEngine(
     // ---- 接收解析 ----
 
     private fun parseAvailable(nowMillis: Long): Boolean {
+        // 探测包回显（隧道形态）：marker 到达即原样回写——车机在等「探测被应答」
+        // 才会发 SYN；established 后的重复探测忽略（对端实现同款语义）。
+        if (echoMarker &&
+            state == State.NEGOTIATING &&
+            receive.size >= MARKER.size &&
+            matchesMarkerAt(receive)
+        ) {
+            receive.discard(MARKER.size)
+            appendOutput(MARKER)
+            return true
+        }
         // 丢弃帧头前的杂字节（含对端 marker FF55…）
         while (receive.size >= 2 &&
             !(receive[0] == 0xFF.toByte() && receive[1] == 0x5A.toByte())
@@ -404,7 +442,19 @@ class Iap2LinkEngine(
             // 发起方 SYN，属于「它已应答」的信号（见下方 ACK 分支），再回一条就会形成
             // 双方互回 SYN|ACK 的无限乒乓（单测暴露：两个引擎互相喂帧时协商永不收敛）。
             val isPureSyn = (control and CONTROL_ACKNOWLEDGEMENT) == 0
-            if (sync != null && isPureSyn && (state == State.NEGOTIATING || echoFirst)) {
+            if (sync != null && isPureSyn && state != State.DEAD) {
+                // Re-SYN（新序号的纯 SYN 在链路 NORMAL 后到达）= 对端重开整轮协商：
+                // 序号账/窗口/积压全部作废，不重置则后续数据帧全被当重复丢弃。
+                // 同一 SYN 的重发（lastEchoPeerSequence 相同）不在此列——走下方幂等重放。
+                if (state == State.NORMAL && lastEchoPeerSequence != sequence) {
+                    reSyncCount++
+                    if (reSyncCount > MAX_RE_SYNCS) {
+                        die("peer resynchronized more than $MAX_RE_SYNCS times")
+                        return
+                    }
+                    resetNegotiationState()
+                    onResynchronized?.invoke()
+                }
                 val firstAdoption = adoptedSynchronization == null
                 peerSynchronization = sync
                 if (firstAdoption) adoptedSynchronization = sync
@@ -414,6 +464,9 @@ class Iap2LinkEngine(
                 // 之后 CSM 走采纳表的控制会话 ID（1）；发 10 会被静默丢弃。
                 sync.sessions.firstOrNull { it.kind == CONTROL_KIND }?.let {
                     adoptedPeerControlSessionId = it.id
+                }
+                sync.sessions.firstOrNull { it.kind == EA_KIND }?.let {
+                    adoptedPeerEaSessionId = it.id
                 }
                 lastReceivedInOrder = sequence
                 // **每次** SYN 都只回一帧 SYN|ACK（不回裸 ACK）：
@@ -446,6 +499,9 @@ class Iap2LinkEngine(
                 sync.sessions.firstOrNull { it.kind == CONTROL_KIND }?.let {
                     adoptedPeerControlSessionId = it.id
                 }
+                sync.sessions.firstOrNull { it.kind == EA_KIND }?.let {
+                    adoptedPeerEaSessionId = it.id
+                }
                 // Watermark must also advance (the pure SYN branch does the same): when left at 0,
                 // the initiator treats the responder's first data frame as an "expired frame", only re-sending ack=0 —
                 // the responder's send window gets poisoned by this bogus ack (backlog never flushes, unit test located)
@@ -467,7 +523,7 @@ class Iap2LinkEngine(
                 // 收到对端的数据即代表对端认为链路可用；ACK 帧若丢失/被跳过，这里兜底进入 NORMAL
                 completeNegotiationIfPending(nowMillis)
                 handleData(sequence, payload!!)
-            } else if (sessionId == SESSION_EA && onEaData != null) {
+            } else if ((sessionId == SESSION_EA || sessionId == adoptedPeerEaSessionId) && onEaData != null) {
                 // EA 会话数据（含触摸 HID）：对端序号账法与控制会话独立，直接上抛
                 onEaData?.invoke(payload!!)
                 sendAcknowledgement()
@@ -484,6 +540,21 @@ class Iap2LinkEngine(
             syncDeadline = null
             drainSendWindow(nowMillis)
         }
+    }
+
+    /** Re-SYN 重置：回到协商态、清空全部协商产物（序号账/窗口/积压/采纳表）。 */
+    private fun resetNegotiationState() {
+        state = State.NEGOTIATING
+        peerSynchronization = null
+        adoptedSynchronization = null
+        adoptedPeerControlSessionId = null
+        adoptedPeerEaSessionId = null
+        lastSentAcknowledged = null
+        lastEchoPeerSequence = null
+        unacknowledged.clear()
+        sendBacklog.clear()
+        markerDeadline = null
+        syncDeadline = null
     }
 
     private fun reportUnknownSessionData(
@@ -513,12 +584,18 @@ class Iap2LinkEngine(
      * 回显用的「我方参数」：会话表/超时沿用对端声明（手机端无特殊要求），
      * 但 **maxOutgoing 提到 0x7F**——原样回显会把我们自己的发送窗口限死在对端的
      * 小窗口（MIB3 突发 8 条在 maxOutgoing=4 下积压；真机 iPhone/AADisplay 均声明
-     * 0x7F）。maxLength 保持对端值（=我们的收包上限，勿放大）。
+     * 0x7F）。maxLength 收敛到 min(对端值, 4096)——参考实现回显恒声明 0x1000：对端
+     * 按「我方回显值」预估我方收包能力，放大无收益、还可能造出对端拒收的超大帧
+     * （2026-10-26 审查 P1）。
      */
     private fun ownSyncOf(peer: SynchronizationPayload): SynchronizationPayload =
-        peer.copy(maxOutgoing = PHONE_DECLARED_MAX_OUTGOING).also {
-            declaredMaxOutgoing = PHONE_DECLARED_MAX_OUTGOING
-        }
+        peer
+            .copy(
+                maxOutgoing = PHONE_DECLARED_MAX_OUTGOING,
+                maxLength = minOf(peer.maxLength, 4096),
+            ).also {
+                declaredMaxOutgoing = PHONE_DECLARED_MAX_OUTGOING
+            }
 
     private fun sendSynchronizationEcho(
         sync: SynchronizationPayload,
@@ -738,8 +815,23 @@ class Iap2LinkEngine(
         /** 会话描述符里的类型字段：0 = 控制会话（xcertplay/extractor/catplay 一致）。 */
         private const val CONTROL_KIND = 0
 
+        /** 会话描述符里的类型字段：2 = EA 数据会话（参考实现同款映射）。 */
+        private const val EA_KIND = 2
+
         val MARKER = byteArrayOf(0xFF.toByte(), 0x55, 0x02, 0x00, 0xEE.toByte(), 0x10)
         const val HEADER_BYTES = 9
+
+        /** 链路 NORMAL 后允许对端重开协商的次数上限（对端实现 L3 的 link_resync 上限）。 */
+        const val MAX_RE_SYNCS = 3
+
+        /** 探测包逐字节比对（[ReceiveBuffer] 起始处）。 */
+        private fun matchesMarkerAt(buffer: ReceiveBuffer): Boolean {
+            for (index in MARKER.indices) {
+                if (buffer[index] != MARKER[index]) return false
+            }
+            return true
+        }
+
         private const val SYNCHRONIZATION_VERSION = 1
         private const val CONTROL_SYNCHRONIZE = 0x80
         private const val CONTROL_ACKNOWLEDGEMENT = 0x40

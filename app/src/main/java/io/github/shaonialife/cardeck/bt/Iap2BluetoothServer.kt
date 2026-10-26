@@ -38,6 +38,7 @@ class Iap2BluetoothServer(
     private val knownCarSsid: () -> String? = { null },
     /** 0x1D01 画像判定的链路代际（Phase 1 完成后回调，AirPlay 阶段分派用）。 */
     private val onGeneration: (ReceiverProfile.LinkGeneration) -> Unit = {},
+    private val onIdentity: ((String) -> Unit)? = null,
     /** 目标车机（动态读取：拒绝非目标设备的连入；null=来者不拒）。 */
     private val targetProvider: () -> TargetDevicePrefs.Target? = { null },
 ) {
@@ -158,6 +159,7 @@ class Iap2BluetoothServer(
                 onLinkClosed,
                 knownCarSsid,
                 onGeneration,
+                onIdentity,
             )
         } catch (error: IOException) {
             log("SESSION 失败: ${error.message}")

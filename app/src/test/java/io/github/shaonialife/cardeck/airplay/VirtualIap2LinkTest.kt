@@ -254,7 +254,9 @@ class VirtualIap2LinkTest {
         // 0xAA06（auth serial）→ 再发 0xAA00
         assertEquals(listOf(0xAA00), h.carSends(0xAA06, Iap2Csm.string(0, "serial")))
 
-        // 0xAA01（证书）→ 0xAA02 挑战 20B（MIB3 真机长度；DiPlay 形态为 32B）
+        // 0xAA01（证书）→ 0xAA02 挑战 32B——身份白名单先验（AUDI 5163 → 32 优先；
+        // 2026-10-26 审查 P0：奥迪 5163 系 BT 侧实测 32 成功/20 静默，20B 对 EC
+        // 证书协议非法。仅 DELPHI AUDI3260 按 20B 优先）
         val challengeFrames = h.carSends(0xAA01, Iap2Csm.param(0, ByteArray(642)))
         assertEquals(listOf(0xAA02), challengeFrames)
         val challengeBody =
@@ -262,7 +264,7 @@ class VirtualIap2LinkTest {
                 .lastRawFrameOf(0xAA02)!!
                 .copyOfRange(6, h.lastRawFrameOf(0xAA02)!!.size)
                 .let { Iap2Csm.parseParams(it).first() }
-        assertEquals(20, challengeBody.value.size)
+        assertEquals(32, challengeBody.value.size)
 
         // 0xAA03（签名应答）→ 0xAA05 + 突发（0x4E0C/0xA100/0x4E0A/0x4E0B/0x4E09/0xFFFA/0xFFF0）
         assertEquals(
@@ -327,11 +329,13 @@ class VirtualIap2LinkTest {
         h.exchangeUntilNormal()
         h.carSends(0x1D01, Iap2Csm.string(0, "SilCar") + Iap2Csm.string(1, "SilMfr"))
         h.carSends(0xAA01, Iap2Csm.param(0, ByteArray(642)))
-        assertEquals(listOf(20), h.challengeLengths())
-        // 20B 静默：推进时钟越过 6s 窗口，喂一个 marker 触发节拍检查（drainLocked）
-        h.clock += 7_000
+        // 未知身份默认 32B 优先（2026-10-26 审查：参考默认 32 + DiPlay 32 + 奥迪
+        // 5163 系 BT 侧实测 32；窗口 3s）
+        assertEquals(listOf(32), h.challengeLengths())
+        // 32B 静默：推进时钟越过 3s 窗口，喂一个 marker 触发节拍检查（drainLocked）
+        h.clock += 4_000
         h.link.onCarBytes(Iap2LinkEngine.MARKER)
-        assertEquals(listOf(20, 32), h.challengeLengths())
+        assertEquals(listOf(32, 20), h.challengeLengths())
         // 32B 得到应答 → 0xAA05 + 突发照常
         val after = h.controlFrames().size
         h.carSends(0xAA03, Iap2Csm.param(0, ByteArray(96)))

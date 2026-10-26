@@ -32,6 +32,11 @@ class Iap2SenderSession(
      */
     private val onWifiCredentials: ((WifiConfiguration) -> Unit)? = null,
     /**
+     * 0x1D01 识别完成时回调接收端身份原文（name/model/manufacturer 空格连接）——
+     * 主控用于车型分派（如半移交拆 BT 只对已验证的 8015 系开）。
+     */
+    private val onIdentity: ((String) -> Unit)? = null,
+    /**
      * 0x4301 在 Phase 1 结束后才到达时的回调（车机打开 CarPlay 窗口的晚信号）。
      *
      * 保活泵此前把所有消息都当心跳只记长度：Audi MMI 9310 实测 0x4301 在
@@ -217,6 +222,7 @@ class Iap2SenderSession(
 
         // ---- MFi（跳过校验：0xAA05 自报成功）----
         val identityText = identityText(identification)
+        onIdentity?.invoke(identityText)
         val legacyCar = LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
         if (legacyCar) {
             log("iap2 识别为真车系（$identityText）——MFi 首选 20B（真 iPhone 实录长度；32B 对真车处置不稳定）")

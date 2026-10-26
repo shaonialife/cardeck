@@ -18,3 +18,9 @@ keystore.properties
 
 # 车型重放 fixtures（含真实地址/热点名，逐条评审后才入册）
 app/src/test/resources/carplay/fixtures/*.jsonl
+
+# 内部资料（第三方对照等，绝不入库）
+docs/internal/
+
+# 分发测试包（正式发布走 GitHub Release，不入库）
+CarDeck-*.apk

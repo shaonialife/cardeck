@@ -23,6 +23,8 @@ internal fun Iap2LinkChannel.runSenderSession(
     knownCarSsid: () -> String? = { null },
     /** 0x1D01 画像判定的链路代际（CLASSIC_MIB3/EVENT_LINK），Phase 1 完成后回调。 */
     onGeneration: (ReceiverProfile.LinkGeneration) -> Unit = {},
+    /** 0x1D01 识别完成时回调身份原文（车型分派用，如半移交拆 BT 白名单）。 */
+    onIdentity: ((String) -> Unit)? = null,
 ) {
     val session =
         Iap2SenderSession(
@@ -31,6 +33,7 @@ internal fun Iap2LinkChannel.runSenderSession(
             resolveBluetoothMac(context, log),
             DeviceIdentity.deviceName(context),
             onWifiCredentials,
+            onIdentity,
             onEndpointUpdate,
             knownCarSsid,
             // MFi 挑战长度按车机身份持久化（省掉 20B 静默 6 秒的试探）

@@ -158,16 +158,17 @@ hidSendReport 双槽报文解析（u16LE 像素坐标）→ UI 命中测试。�
 ## 工程结构
 
 ```
-app/src/main/java/com/lizhihua/carplaysender/
+app/src/main/java/io/github/shaonialife/cardeck/
 ├── MainActivity.kt                 # 手机侧操作台 UI（连接/声音/暗幕/日志/免责声明入口）
+├── PhoneSettingsActivity.kt        # 手机二级设置菜单入口
 ├── SessionController.kt            # 会话总管（进程级单例）：链路生命周期、配对、WiFi、取消
 ├── SenderApp.kt                    # Application（未捕获异常兜底、包变化失效缓存）
-├── iap2/                           # iAP2 链路层 + CSM + 发送端会话
-├── airplay/                        # AirPlay 配对/控制通道/流协商/流加密/Timing
+├── iap2/                           # iAP2 链路层 + CSM + 发送端会话（含车机画像/挑战长度记忆）
+├── airplay/                        # AirPlay 配对/控制通道/流协商/流加密/虚拟 iAP2 链路
 ├── audio/AudioSender.kt            # 音频通道（播放捕获 → RTP/ChaCha20 over UDP）
 ├── video/VideoSender.kt            # H.264 编码推流
 ├── bt/                             # RFCOMM 双向（Server 等回连 / Client 真车主动连）+ 目标设备
-├── launcher/                       # 隐形屏启动器（dock + 应用网格 + 地图屏；含 letterbox 提示）
+├── launcher/                       # 隐形屏启动器（dock + 应用网格 + 地图屏；含分屏把手/letterbox 提示）
 │   └── settings/                   # 设置面板 Fragment（车机双栏与手机二级菜单共用）
 ├── render/DualDisplayComposer.kt   # EGL 多屏合成 → 编码 Surface（含叠加卡片层）
 ├── input/                          # 触摸分流（dock/应用屏/地图屏直注）+ 消费键
@@ -180,6 +181,7 @@ app/src/main/java/com/lizhihua/carplaysender/
 ├── ui/                             # 暗幕、波形图、壁纸、深色弹窗、面板窗口尺寸
 ├── legal/                          # 免责声明（内容/接受状态/弹窗）
 └── util/                           # Bg（后台任务池）等工具
+app/src/remote/                     # 远程调试 flavor（调试桥代码只在 remote 变体编入）
 docs/PROTOCOL-NOTES.md              # 协议知识库（分层格式/时序/参考索引）
 docs/CARLIFE-GATEWAY-FEASIBILITY.md # 另一条路线的可行性调研（CarLife 网关）
 reference/                          # 参考仓库（gitignore，不入库不分发）

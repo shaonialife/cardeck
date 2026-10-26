@@ -538,6 +538,12 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   离场方式）；该 SSID 本轮之前已保存（用户选过「保留」）的不登记不删。
   **bindCurrentWifi 的 onLost 必须转发 onNetworkLost**（兜底入网成主路径后，不转发
   则熄火后英雄卡停在「已连接」、会话拖到心跳超时才死）。
+  **specifier 挂起还有一层「系统脏状态」**（2026-10-26 深夜实测）：删净系统已保存
+  网络后 specifier 依然两窗零回调（`cmd wifi forget-network` 无效）——WifiManager
+  服务内残留挂死的 NetworkRequest/脏缓存，**只有重启手机能清**（同机同热点重启后
+  立即恢复）。诊断顺序：①查系统已保存同 SSID → ②forget → ③仍挂起就让用户重启。
+  另：同一台手机上第三方同类 app 在同场景同样连不上（非本 app 特有），属 ROM 层
+  通病。
   **WEP 无法用 specifier 表达**（无对应 Builder API）→ `JoinResult.Unsupported`，
   走旧的 `connect-network` 兜底路径（`legacyJoinCarWifi`）。
   **PR17（BMW 带来的三个命令行坑，与 specifier 主线并存的知识）**：① `cmd wifi
@@ -924,6 +930,23 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   改协议代码前先对照。**0x5702 的外部佐证**在 §5b（catplay / xcertplay /
   amineross-showcase / wiomoc-iap2 四个独立车机实现全部声明它）、**0.1.13 奥迪回归的
   完整证据链与判读要点**在 §9j。
+- **黑盒抓包看不到条件分支，「这台车没走的路」不能推广为「这款车不走」**（2026-10-26
+  type130 教训）：3315 成功会话 `iAPChannel FeatureKey=0` 曾被当成「奥迪不走 type-130
+  隧道」的证据，runIapTunnel 在 3315「200 但无 dataPort」后归档为 DiPlay 专用——
+  8015 因此从未试过该路径；而对照文档（THIRD-PARTY-COMPARE）里的第三方实现恰以
+  type-130 为主路径且能连
+  新款奥迪。抓包证明的只是「这台车这次走了哪条路」，不是「只有哪条可走」：载体维度
+  （type-130 专用 socket vs 事件通道）在 accessoryd-packets 里都标「AirPlay 运输层」、
+  根本不可分辨，SETUP 应答的 enabledFeatures 也从未对 8015 解过。**判读多车抓包时，
+  每台车的「没走的路」要单独存疑；需要白盒证据（独立实现的分支逻辑）才能暴露
+  「存在另一条路」**。另：抓包里已看到的行为差异若当时判定非关键而未对齐（如两步式
+  0xAA00 的 body 差异——一步式在 3315/6318 都通过，按「工作即不动」纪律搁置），
+  要在文档里显式记为「已知差异」而非默默归档，否则拿到第二份佐证时想不起第一份在哪。
+- **8015/宝马攻关的第三方对照结论**（2026-10-24 起，`docs/THIRD-PARTY-COMPARE.md`，
+  依据=真 iPhone sysdiagnose 抓包推导 + `reference/` 下未入库的第三方同类实现行为
+  对照，后者溯源见 `reference/README.md`）：8015 迭代前必读——涉及 WiFi 侧 iAP2
+  会话载体选择（type130 隧道 vs 事件通道）、探测应答形态、MFi 流程步骤与挑战
+  长度、链路重协商、锁屏推流（VirtualDevice 路线）等关键分叉与行动清单。
 - **老车机（CarPlay 210.81 / 奥迪 4xxx 固件）必须按 catplay 的「三时代」分类处理**
   （2026-10-19 定谳，`docs/PROTOCOL-NOTES.md` §9f）：该代是 **pre-HomeKit** 接收端
   （`_airplay._tcp` features 无 bit38 `HK_PAIRING_AND_ENCRYPT`），只接受
