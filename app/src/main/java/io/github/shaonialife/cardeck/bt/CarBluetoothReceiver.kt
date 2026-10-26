@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import io.github.shaonialife.cardeck.SessionController
 import io.github.shaonialife.cardeck.service.CarPlayService
 import io.github.shaonialife.cardeck.util.DebugFileLog
 
@@ -54,7 +55,27 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             return
         }
 
+        // MIB3 无线移交拆 BT 后的 ACL 抖动一律豁免：拆链是刻意的（对齐真 iPhone，
+        // 车机 HMI 切屏的先决条件），此时 ACL_DISCONNECTED 若照常 AUTO_STOP 会把
+        // 刚建好的会话杀掉；车机侧 BT 栈回连（ACL_CONNECTED）也不该重启会话
+        if (SessionController.btHandoffActive) {
+            DebugFileLog.append(
+                app,
+                "AUTO: 无线移交已拆蓝牙——本次 ACL $action 忽略（会话走 AirPlay 链）",
+            )
+            return
+        }
+
         if (action == BluetoothDevice.ACTION_ACL_CONNECTED) {
+            // 用户刚取消过：ACL 抖动（车机拆栈重试）不再自动重连，尊重用户意愿
+            val remainingMs = SessionController.autoConnectSuppressedUntil - android.os.SystemClock.uptimeMillis()
+            if (remainingMs > 0) {
+                DebugFileLog.append(
+                    app,
+                    "AUTO: 用户刚取消连接——本次 ACL 连入忽略（冷却剩余 ${remainingMs / 1000}s）",
+                )
+                return
+            }
             DebugFileLog.append(app, "AUTO: 车机蓝牙已连上 ${name ?: "?"}（$address）——自动拉起会话")
             runCatching {
                 context.startForegroundService(

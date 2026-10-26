@@ -862,3 +862,82 @@ down in ~12s with no picture."
 结论：该车型只对「iAP2 配供应链带出的那次入网」激活 CarPlay 栈——系统里保存过/手动
 连过车机热点都会堵死连接（我们的「同 SSID 已保存弹窗清理」对此车是关键步骤），
 且必须严格用 0x5703 下发的 SSID（双频 SSID，成功路径是 `_5GHz`）。
+
+### 13c. 奥迪 MMI 8015（AUDI 5810 / DELPHI / 450.14）——「不切屏根因 = BT 永不拆除」（2026-10-24 定谳）
+
+五份 iPhone sysdiagnose（`/Users/lizhihua/logs/cardeck/audi/`，2026-10-15/16，含连接全程
+与音频）。**帧级证据源是 `crashes_and_spins/accessoryd-packets-*.log.ips`**——accessoryd 的
+iAP2 抓包（hex 载荷 + 运输层标注 `Bluetooth Classic` / `AirPlay` + 方向 `Acc`（车机→手机）
+/ `iPod`（手机→车机）），unified log 里没有这些帧；文件名时间戳是会话起点，内容滚动覆盖
+到抓包时刻，注意按行内时间过滤。`FF 55 02 00 EE 10` = control=0xEE 的 **DETECT 探测包**。
+
+#### 真机完整时间线（17:31:43~52，#4 抓包「先抓包后连接」）
+
+**BT 链（17:31:43.57 ATTACH）**：车机 marker ×3（~1Hz）→ iPhone 逐条**回 DETECT** →
+44.651 车机发 SYN（ctl=0x80 seq=2 + 会话表）→ 44.652 iPhone SYN|ACK（0xC0 + 回显表
+maxOutgoing=0x7F）→ 0x1D00/0x1D01/0x1D02 → MFi（**挑战 20B**、签名 132B、证书 912B）→
+0xAA05 → 0x4E0C/0x4E09（李永正的iPhone）/0x5702→0x5703 → 0x4301。
+
+**AirPlay 链（17:31:49.92 ATTACH，AirPlay ConnectedTime +0.37s）**：
+49.921 车机在 **AirPlay 运输层**发 marker → iPhone 回 DETECT → **50.015 iPhone 主动
+DETACH 蓝牙**（两链并存仅 94ms）→ **50.023 车机 SYN**（DETACH 后 8ms！ctl=0x80 + 3 会话
+表）→ iPhone SYN|ACK → ACK → 0x1D00→0x1D01→0x1D02→0xAA00→（车机 0xAA06→iPhone 重发
+0xAA00）→0xAA01→0xAA02(20B)→0xAA03→0xAA05→突发 0x4E0C/0xA100(**仅参数 0x0006**)/
+0x4E0A/0x4E09/0x4E0B/0xFFFA/0xFFF0 → 车机来 0xEA02/0x4157/0x4154/0x4170/0x5000/0xA101 →
+iPhone 应 0x5001/0x4158/0x4155/0x4171 + 会话 2（EA 数据，含 JPEG 封面流）→
+52.211 起车机 **0xFFFB（GPGGA+GPRMC+PASCD）~1Hz 推送**，iPhone 回一次 0xFFFC、
+**+6s 重发 0xFFFA/0xFFF0**。全程 2.3s 完成，此后只有 0x5001/0xFFFB 稳态流量。
+
+#### 三方对照（同车同手机 MEIZU 20 Pro）
+
+| 实现 | AirPlay iAP2 链 | 蓝牙 | 结果 |
+|---|---|---|---|
+| 0.1.0+NUL修复（用户侧 AI 改版） | 无（EA datastream SETUP 200 无 dataPort） | 保持 | **出画面/触摸/音频/方向盘全通**，RECORD+10.1s 拆链 |
+| 真 iPhone | marker→回DETECT→**拆BT**→SYN→全套会话 | 0.1s 内拆除 | 出画面，长期稳定 |
+| 0.1.37 | 主动 DETECT→全套会话（内容与时序基本同 iPhone） | **全程保持** | 不出画面，车机连接入口置灰直到重启 |
+
+判读：车机把「**BT 释放**」当无线移交完成条件。0.1.0 无 AirPlay 链时画面照切（BT-only
+形态、10s 看门狗拆链）；一旦隧道链存在而 BT 不拆，HMI 卡在半移交态。0.1.12「出画面
+3 秒断」说明协商早入时画面也能切——但正确形态是 iPhone 的「链成型即拆 BT」。
+
+另外两条被推翻的旧认知：①「回 marker 会把车机打回 Detecting」——iPhone 每条 marker 都
+回 DETECT，0.1.0 回 marker 也出画面；②「iPhone 不回 marker、车机自己发 SYN」——车机
+SYN 紧跟 iPhone 的 **BT DETACH**（8ms），不是凭空自发；0.1.0 全程回 marker 但 BT 不拆，
+车机就永远只发 marker 不发 SYN。
+
+落地（0.1.38，待真车验证）：`VirtualIap2Link.onMib3HandoffReady`（MIB3 控制通道形态、
+链路 NORMAL 即将发 0x1D00 时触发）→ `SessionController.detachBtForMib3Handoff`
+（CLASSIC_MIB3 + 推流中 + 每会话一次）：拆两路 BT 会话 + 停 server accept（防车机回连
+RFCOMM 重挂第二条链；每轮连接起步会重新 start）+ `btHandoffActive` 豁免
+`CarBluetoothReceiver` 的 ACL 事件（否则 ACL_DISCONNECTED 会 AUTO_STOP 把会话杀掉——
+HFP/A2DP 连接前已断，RFCOMM 是 ACL 唯一持有者）。客户端重连循环本就被
+`BtSessionGate.sessionActive` 静默，会话结束自动恢复探测。若实测仍不切屏，下一迭代对齐
+iPhone 的精确顺序：应答车机事件通道 marker → **先拆 BT 再等 SYN**（当前是等 SYN 后拆）。
+
+#### §13c 增补（2026-10-25 四路审查 + 抓包对照修正）
+
+1. **事实修正**：0.1.37 的链路并非「车机对我们的 DETECT 回 SYN」——日志实为裸 DETECT
+   发出后车机 1Hz marker 不应答，~1s 后我方升级「marker+FF5A 同步包」（engine.initiate）
+   才撬开车机应答。**我们是以发起方姿态强行建链**，与 iPhone（车机自发 SYN）角色相反。
+2. **半移交模型（唯一同时自洽解释三组证据的模型）**：车机只在「WiFi 侧 iAP2 会话存在」
+   时进入无线移交态，该态完成条件 =「探测被应答 + BT 释放」。0.1.0 无 WiFi 侧会话 →
+   画面照切（也不需要 SYN）；0.1.37 有会话但 BT 不拆、探测零应答 → HMI 卡死。
+   「SYN 依赖 BT 释放」被 0.1.37 证伪（BT 在挂时链路照样建成、3.4 分钟健康）。
+3. **iPhone 精确时序**（airplayd + 帧级抓包互证）：屏幕流 SETUP 应答 50.037、iAP2 舞蹈
+   夹在 SETUP 请求与应答之间、**BT 在首帧（50.098）前 83ms 已落下**。两链并存仅 94ms、
+   窗口内 BT 零流量；车机协议层对并存容忍 ≥分钟级（0.1.37 实证），HMI 层零容忍。
+4. **0.1.39 落地形态**（0.1.38 的审查修正版）：
+   - 拆 BT 触发点从「链 NORMAL」提前到 **armMib3 发出 DETECT 之后立即**（屏幕 SETUP 200
+     后、RECORD 前）——原时点与 videoSender.isRunning 存在竞态（事件通道 reader 先于
+     videoSender 创建启动，hook 触发时 isRunning 几乎必然 false 且 mib3CsmStarted 已
+     闭锁，整场静默不拆、无日志可判）；提前后 BT 保证在首帧前落下，复现 iPhone 可观察
+     顺序「DETECT → BT 落下 → 车机 SYN → 0x1D00」。marker 计数升级（第 2 个起 FF5A
+     协商）保留为车机不自发 SYN 的兜底。
+   - **CLASSIC_MIB3 逐条应答车机 marker**（经控制通道回 DETECT）——旧实现引擎层直接
+     丢弃、一条不回；iPhone 是每条 marker 同毫秒回 DETECT。
+   - onEnded 复位移交豁免 + 重启 server 监听 + 停音频（车机拆链是最常见离场，移交后
+     ACL 路径被豁免，不收口则熄火后音频无限空转、下次上车自动重连哑火）。
+   - AUTO_START_SESSION 加 isSessionRunning 短路（防会话中误触发重启被停的 server）。
+   - A100 突发改单参数 6（iPhone 抓包 `a1 00 00 04 00 06`；旧 3 参数源自 Frida 抓包）。
+   遗留小偏差（低风险、未改）：FFF0 12ms 双发、FFFA/FFF0 +5s 周期重发、首条 0xFFFB 回
+   0xFFFC、0x4171 应答给真实列表元数据（我们全零）、EA 会话 2（封面流）。

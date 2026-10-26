@@ -1,5 +1,6 @@
 package io.github.shaonialife.cardeck.iap2
 
+import io.github.shaonialife.cardeck.airplay.VirtualIap2Link
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import java.io.IOException
 import java.security.SecureRandom
@@ -686,12 +687,32 @@ class Iap2SenderSession(
      * 设备状态问候：0x4E0D 无线会话标识 / 0x4E0A 语言 / 0x4E09 设备名 /
      * 0x4E0B 设备时间 / 0x4E0C 设备 UUID。必须紧跟 0xAA05 发送。
      */
+
+    /**
+     * 设备状态问候（BT 链路，0xAA05 之后）。
+     *
+     * **顺序与内容按 iPhone sysdiagnose 真车抓包对齐**（2026-10-25，奥迪 MMI 3315 成功
+     * 会话 14:23:23.433~23.622，8 条连发、车机 14ms 后回 0x4301）：
+     * `4E0C → A100 → 4E0B → 4E0A → 4E09 → FFFA → FFF0 → 4300`。
+     * 旧实现只发 5 条（4E0D 代替 4E0C 的顺序、无 A100/FFFA/FFF0）——抓包里第一轮
+     * 没发这批时车机**没给 0x4301**（只回旧协议 0x5703），第二轮补发后立刻拿到。
+     */
     private fun sendDeviceStateGreetings(force: Boolean = false) {
         if (greetingsSent && !force) return
         greetingsSent = true
+        // 0x4E0D 无线能力声明（u8=1）必须发（6318 定谳 2026-10-26：不发它车机不武装
+        // AirPlay 栈——mDNS 零广播、0x4301 零下发、invite 永不到来；0.1.13 发它一切
+        // 正常。8015 的 iPhone 抓包虽不发 4E0D，但那是另一台车的形态，不能当普适
+        // 依据——§9i「车机识别字段改前必须真车 A/B」教训的又一次应验）
         send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
-        send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
-        send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
+        send(Iap2MessageIds.DEVICE_UUID_UPDATE, Iap2Csm.string(0, deviceUuid()))
+        // A100 车辆状态能力：真机 3 个空参数（id 3/6/9），旧实现只发 id=6
+        send(
+            VirtualIap2Link.AUX_STATUS_NOTIFICATION,
+            Iap2Csm.param(0x0003, ByteArray(0)) +
+                Iap2Csm.param(0x0006, ByteArray(0)) +
+                Iap2Csm.param(0x0009, ByteArray(0)),
+        )
         val epochSeconds = System.currentTimeMillis() / 1000L
         val timezoneMinutes =
             java.util.TimeZone
@@ -703,14 +724,28 @@ class Iap2SenderSession(
                 Iap2Csm.u16(1, timezoneMinutes and 0xFFFF) +
                 Iap2Csm.u8(2, 0),
         )
-        send(
-            Iap2MessageIds.DEVICE_UUID_UPDATE,
-            Iap2Csm.string(0, deviceUuid()),
-        )
+        send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
+        send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
+        // FFFA/FFF0：真机在 BT 链路也发（旧实现只在隧道突发里发）
+        sendRaw(VirtualIap2Link.MIB3_START_LOCATION_INFORMATION)
+        sendRaw(VirtualIap2Link.MIB3_GPRMC_DATA_STATUS)
         log(
-            "iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
+            "iap2 tx=4e0c/a100/4e0b/4e0a/4e09/fffa/fff0 设备状态问候（真机顺序）" +
                 "（name=$deviceName mac=$bluetoothMac）",
         )
+    }
+
+    /** 直接发一帧完整 CSM（逐字节常量用，勿重新编码）。 */
+    private fun sendRaw(frame: ByteArray) {
+        val limit = channel.peerMaxControlPayload() ?: frame.size
+        var offset = 0
+        while (offset < frame.size) {
+            val end = minOf(offset + limit, frame.size)
+            if (!channel.sendControl(frame.copyOfRange(offset, end))) {
+                throw IOException("iAP2 链路在发送 raw 帧时关闭")
+            }
+            offset = end
+        }
     }
 
     /** 分段等待用的截止时刻：取「整体 deadline」与「再等 millis 毫秒」的较小值。 */

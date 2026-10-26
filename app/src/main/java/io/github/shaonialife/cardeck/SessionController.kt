@@ -1,5 +1,6 @@
 package io.github.shaonialife.cardeck
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Network
 import android.os.SystemClock
@@ -26,6 +27,7 @@ import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
+import io.github.shaonialife.cardeck.media.MediaSessionsState
 import io.github.shaonialife.cardeck.net.AirPlayFeatures
 import io.github.shaonialife.cardeck.net.CarPlayCtrlAdvertiser
 import io.github.shaonialife.cardeck.net.CarPlayServiceBrowser
@@ -82,6 +84,12 @@ object SessionController {
 
     /** 加入确认弹窗的应答等待上限（无人应答按中止处理）。 */
     private const val JOIN_DIALOG_TIMEOUT_S = 90L
+
+    /** 用户取消连接后，「上车自动连接」的冷却窗（见 [autoConnectSuppressedUntil]）。 */
+    private const val AUTO_CONNECT_COOLDOWN_MS = 10 * 60_000L
+
+    /** 合成端点 mDNS 全 miss 后的「车机武装」加等窗（车机交接 FSM 可能在路上）。 */
+    private const val ENDPOINT_REARM_WAIT_MS = 4_000L
 
     /**
      * 空端点（车机声明会发 0x4301 但窗口内未到）的等待上限。
@@ -244,6 +252,30 @@ object SessionController {
         java.util.concurrent.ConcurrentHashMap
             .newKeySet<String>()
 
+    /**
+     * 用户在「清除/保留」弹窗里明确选过「保留」的 SSID（持久化）。
+     * connect-network 兜底的「不作会话末清除」例外**只认这个**（2026-10-25 定谳：
+     * 旧判据「系统里已存在」会把我们自己遗留的保存当成用户意愿——毒化自延续，
+     * 荣耀实测「specifier 永远不出场」的直接根因）。
+     */
+    private fun isUserKept(ssid: String): Boolean =
+        appContext
+            ?.getSharedPreferences("wifi_net", android.content.Context.MODE_PRIVATE)
+            ?.getStringSet("user_kept", emptySet())
+            ?.contains(ssid) == true
+
+    private fun markUserKept(
+        ssid: String,
+        kept: Boolean,
+    ) {
+        val prefs =
+            appContext?.getSharedPreferences("wifi_net", android.content.Context.MODE_PRIVATE)
+                ?: return
+        val set = prefs.getStringSet("user_kept", emptySet())?.toMutableSet() ?: mutableSetOf()
+        if (kept) set.add(ssid) else set.remove(ssid)
+        prefs.edit().putStringSet("user_kept", set).apply()
+    }
+
     /** WiFi 绑定互斥：auto-join 与端点交接两条路径可能同时绑定同一热点。 */
     private val wifiBindLock = Any()
 
@@ -323,6 +355,19 @@ object SessionController {
     val sessionStarting = AtomicBoolean(false)
 
     /**
+     * MIB3 无线移交已拆 BT（CarBluetoothReceiver 读）：真 iPhone 在 AirPlay 链成型后
+     * 94ms 内整体拆除 BT iAP2（sysdiagnose 2026-10-16），车机把「BT 释放」当移交完成
+     * 条件。我们拆 RFCOMM 后 ACL 随之掉线（HFP/A2DP 在连接前已被断开），若不豁免，
+     * ACL_DISCONNECTED 会立刻 AUTO_STOP_SESSION 把刚建好的会话杀掉。
+     */
+    @Volatile
+    var btHandoffActive: Boolean = false
+        private set
+
+    /** 本轮会话是否已执行过移交拆链（防重复；新一轮会话在 retireSession 复位）。 */
+    private val btHandoffDone = AtomicBoolean(false)
+
+    /**
      * 交接流程已在跑、但 AirPlayClient 尚未创建时收到的晚到端点（0x4301）。
      * 配对线程起步时取用一次后清空——此刻没有 client 可更新，丢了就白等到下一轮。
      */
@@ -340,10 +385,21 @@ object SessionController {
     @Volatile
     var phaseHint: String? = null
 
+    /**
+     * 用户取消后的自动连接冷却期（uptimeMillis）。取消只杀当轮会话，车机侧会因
+     * RFCOMM 断开拆掉整轮无线栈（ACL 随之抖动），每次 ACL 重连都会再次触发
+     * 「上车自动连接」——没有冷却的话用户点多少次取消都会被自动重连（2026-10-24
+     * 用户实测）。10 分钟后自然过期（下车再上车属新意愿）；进程重启同样清零。
+     */
+    @Volatile
+    var autoConnectSuppressedUntil: Long = 0L
+        private set
+
     /** 取消「连接中」：停链路 + 置取消标志，卡在错误网络/等待回连时用户可主动脱身。 */
     fun cancelConnecting(context: Context) {
         connectCancelled = true
-        appendLog("SESSION: 用户取消连接——正在停止蓝牙/WiFi 链路")
+        autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
+        appendLog("SESSION: 用户取消连接——正在停止蓝牙/WiFi 链路（自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟）")
         disconnect(context)
         // 强制释放互斥：配对流程线程可能阻塞在不可中断的连接/mDNS 等待上（如手机
         // 不在热点网段时连热点 IP），finally 遥遥无期——用户显式取消即强制解锁，
@@ -756,6 +812,10 @@ object SessionController {
         // （2026-10-16 实测）。BT 退役只在用户终态做，见 disconnect()。
         // 解除会话静默：出站探测恢复（下次会话建立时会再次置位）
         BtSessionGate.sessionActive = false
+        resetBtHandoffState()
+        // 音频路由抢占自愈的节流状态随会话复位
+        audioRouteReclaimLastAtMs = 0L
+        audioRouteReclaimAttempts = 0
         // 「强制应用横屏」覆盖的复原**不在这里做**（2026-10-23 奥迪 3315 真机日志定谳）：
         // 本方法在每轮配对起步时也会执行，此时距离上一轮会话结束只有几秒——上一轮的
         // 桌面/地图应用（与新一轮是同一批包）多半还活着；而本会话的应用在 attach 里
@@ -835,51 +895,84 @@ object SessionController {
         Bg.run("wifi-auto-join") {
             val shellReady =
                 appContext?.let { ShizukuGate.state(it) == ShizukuGate.State.READY } == true
-            // 1) 首选静默路径：Shizuku 命令行连网（0 弹窗）
-            if (shellReady) {
-                if (joinCarWifiSilently(wifi) is WifiCarPlayConnector.JoinResult.Joined) return@run
-                if (connectCancelled) return@run
-                // 热点已连上、只是 Network 通道没绑成：绝不能退回 specifier——那会重新
-                // 关联热点并弹系统确认框（用户看到「连上了又弹窗」）。直接中止并提示重连。
-                if (shellWifiStatus().second == wifi.ssid) {
-                    phaseHint = "已连上车机热点但未能绑定网络——请重新连接"
-                    appendLog(
-                        "WIFI: 已连在 \"${wifi.ssid}\" 但 requestNetwork 未回调——本轮中止" +
-                            "（不退回会弹窗的 specifier 路径）",
-                    )
+            // WLAN 关着时先开（specifier 对关闭的无线电只会 onUnavailable/挂起）：
+            // shell 可用走免打扰开启，否则走带指引的等待
+            if (!connectCancelled && shellWifiDisabled()) {
+                if (shellReady) {
+                    if (!ensureWifiEnabledSilently()) return@run
+                } else if (!waitForWifiEnabled()) {
                     return@run
                 }
             }
-            // 2) 回退：应用专属网络（不影响 4G/5G、不会保存为系统网络）
-            if (shellReady && shellWifiDisabled() && !waitForWifiEnabled()) return@run
             if (connectCancelled) return@run
+            // 1) specifier 优先（方案 C，2026-10-25）：应用专属网络不进系统、不动默认网、
+            //    其它应用照常 5G；内部自带快速/深度兜底（specifierQuick/DeepFallback）。
+            //    静默 connect-network 只覆盖两类场景：用户拒了 specifier 系统弹窗
+            //    （拒绝弹窗≠不想连，cmd wifi 不经弹窗）、WEP（specifier 表达不了）。
             when (val result = joinCarWifiSpecifier(wifi)) {
-                is WifiCarPlayConnector.JoinResult.Joined -> Unit
+                is WifiCarPlayConnector.JoinResult.Joined -> return@run
 
                 WifiCarPlayConnector.JoinResult.Unsupported -> {
                     appendLog("WIFI: 热点安全类型 ${wifi.securityType} 无法用应用专属网络表达——退回系统级加入")
+                    if (shellReady &&
+                        !connectCancelled &&
+                        joinCarWifiSilently(wifi) is WifiCarPlayConnector.JoinResult.Joined
+                    ) {
+                        return@run
+                    }
                     legacyJoinCarWifi(wifi, shellReady)
                 }
 
-                WifiCarPlayConnector.JoinResult.Unavailable -> promptSpecifierFailed(wifi, shellReady)
+                WifiCarPlayConnector.JoinResult.Unavailable -> {
+                    // 热点已连上、只是 Network 通道没绑成：不再走任何入网路径
+                    // （同款短路判断），直接中止并提示重连
+                    if (connectCancelled) return@run
+                    if (shellWifiStatus().second == wifi.ssid) {
+                        phaseHint = "已连上车机热点但未能绑定网络——请重新连接"
+                        appendLog(
+                            "WIFI: 已连在 \"${wifi.ssid}\" 但 requestNetwork 未回调——本轮中止" +
+                                "（不退回会弹窗的 specifier 路径）",
+                        )
+                        return@run
+                    }
+                    // 用户拒了 specifier 弹窗（onUnavailable）：静默直连兜底
+                    if (shellReady &&
+                        !connectCancelled &&
+                        joinCarWifiSilently(wifi) is WifiCarPlayConnector.JoinResult.Joined
+                    ) {
+                        return@run
+                    }
+                    promptSpecifierFailed(wifi, shellReady)
+                }
             }
         }
     }
 
     /**
-     * 端点先于 0x5703 到达（或上一轮换网失败）时的入网入口：静默路径优先，
-     * 静默失败再退回应用专属网络。
+     * 端点先于 0x5703 到达（或上一轮换网失败）时的入网入口。
+     *
+     * **specifier 优先（方案 C，2026-10-25 用户定夺）**：应用专属网络不进系统、
+     * 不动默认网、其它应用照常 5G——这些是 connect-network 拿不到的。静默
+     * connect-network 降为兜底：它把热点**存成系统网络**，无互联网时会被 ROM
+     * 自动断开/切回有网网络（荣耀实测「WiFi 自动断开」的直接来源），且存过的
+     * SSID 会毒化之后所有 specifier 请求（永久 pending，2026-10-22 定谳）。
+     * specifier 内部已有快速/深度兜底（specifierQuickFallback/DeepFallback），
+     * 这里补走静默直连覆盖的场景：用户拒了 specifier 弹窗（onUnavailable，内部
+     * 兜底不跑）、WEP（specifier 不支持但 cmd wifi 支持）。
      */
     private fun joinCarWifi(
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
     ): WifiCarPlayConnector.JoinResult {
-        if (!shellReady) return joinCarWifiSpecifier(wifi)
+        val viaSpecifier = joinCarWifiSpecifier(wifi)
+        if (viaSpecifier is WifiCarPlayConnector.JoinResult.Joined) return viaSpecifier
+        // 热点已连上但通道没绑成：不再走任何入网路径（specifier 同款短路判断）
+        if (!connectCancelled && shellWifiStatus().second == wifi.ssid) return viaSpecifier
+        if (!shellReady || connectCancelled) return viaSpecifier
         val silent = joinCarWifiSilently(wifi)
-        if (silent is WifiCarPlayConnector.JoinResult.Joined) return silent
-        // 热点已连上但通道没绑成：不再走会弹窗的 specifier（见 autoJoinCarWifi 同款判断）
-        if (!connectCancelled && shellWifiStatus().second == wifi.ssid) return silent
-        return joinCarWifiSpecifier(wifi)
+        // 静默也失败时回传 specifier 的结果：WEP（Unsupported）要让调用方转
+        // legacyJoinCarWifi，不能被静默的 Unavailable 顶掉
+        return if (silent is WifiCarPlayConnector.JoinResult.Joined) silent else viaSpecifier
     }
 
     /**
@@ -927,6 +1020,12 @@ object SessionController {
                 ">>> 静默加入车机热点 \"${wifi.ssid}\"（cmd wifi connect-network，0 弹窗；" +
                     "当前 ${current ?: "未连接"}）",
             )
+            // 与 specifierDeepFallback 同款收口（方案 C，2026-10-25）：connect-network
+            // 返回 ok 的瞬间热点已进系统配置，必须立即登记会话末清除——遗留的系统
+            // 网络会被 ROM 因无互联网自动断开/切回，且毒化之后所有 specifier 请求
+            // （同 SSID 永久 pending）。例外只认「用户选过保留」（isUserKept）：
+            // 旧判据「系统里已存在」会把自己遗留的保存当用户意愿，毒化自延续。
+            val preExisting = savedNetworkIds(wifi.ssid).isNotEmpty()
             // 命令把连接投给 WifiService 就返回，exit=0 不代表已连上 —— 必须轮询 SSID
             val result =
                 Shell.exec(
@@ -939,6 +1038,19 @@ object SessionController {
                         "${result.output.take(80)}）",
                 )
                 return WifiCarPlayConnector.JoinResult.Unavailable
+            }
+            when {
+                isUserKept(wifi.ssid) ->
+                    appendLog("WIFI: \"${wifi.ssid}\" 用户选过保留——不作会话末清除")
+                preExisting ->
+                    appendLog(
+                        "WIFI: \"${wifi.ssid}\" 此前已保存但来历不明——保守不自动清除" +
+                            "（连接弹窗里选「清除」可解除对 specifier 的毒化）",
+                    )
+                else -> {
+                    shellFallbackCleanupSsid = wifi.ssid
+                    appendLog("WIFI: connect-network 已执行（新存系统网络，已登记会话末自动清除）")
+                }
             }
             if (!waitForCarSsid(wifi.ssid, CAR_WIFI_JOIN_WAIT_MS)) {
                 return WifiCarPlayConnector.JoinResult.Unavailable
@@ -1005,13 +1117,18 @@ object SessionController {
     /**
      * 用应用专属网络（`WifiNetworkSpecifier`）加入车机热点，成功后进程网络已绑定。
      *
-     * **只是静默路径的兜底**（Shizuku 不可用，或 ROM 屏蔽了 `cmd wifi connect-network`）：
-     * 该网络只对本进程可见、不保存、不成为默认网络，但首次加入会弹系统确认框。
-     * 也因此不再询问「清除系统里保存的同名热点」——静默路径本来就会把热点存进
-     * 系统配置（这是设计，不是旧版本残留）。
+     * **specifier 优先（方案 C，2026-10-25）**：该网络只对本进程可见、不保存、
+     * 不成为默认网络、其它应用照常 5G，代价是首次加入弹一次系统确认框。
+     * 系统里存过同 SSID 时入口先问「清除/保留」——存过的 SSID 会让 specifier
+     * 永久挂起，且「保留」的选择是 connect-network 兜底免清理例外的唯一来源。
      */
     private fun joinCarWifiSpecifier(wifi: Iap2SenderSession.WifiConfiguration): WifiCarPlayConnector.JoinResult {
         val connector = wifiConnector ?: return WifiCarPlayConnector.JoinResult.Unavailable
+        // 注意：**不得在此处弹「清除/保留」询问**——它在连接关键路径上会阻塞等用户
+        // 应答（6318 实测 3.4s，车机 15s 窗口经不起这种消耗；2026-10-25 用户实测回归）。
+        // 「已保存 SSID → specifier 挂起」也只是部分 ROM 的形态（本机存过 netId=69
+        // 依然 0.8s 入网）——毒化由深度兜底 + 会话末清理解；用户选择只在
+        // [promptSpecifierFailed]（连接已失败、无关键路径）里收集。
         phaseHint = "正在加入车机热点 ${wifi.ssid}…（不影响移动数据）"
         appendLog(
             ">>> 以应用专属网络加入 \"${wifi.ssid}\"（不保存为系统 WiFi，其它应用继续走 4G/5G）",
@@ -1103,9 +1220,9 @@ object SessionController {
      * 自动连无互联网热点、挤掉移动数据，2026-10-23 审阅定谳）。forget 一个没保存过
      * 的 SSID 是无害 no-op，宁多勿漏。
      *
-     * 例外：该 SSID 在本轮**之前**就已保存在系统里（用户在弹窗里明确选过「保留」）
-     * ——connect-network 只是幂等复连，**不登记**清理，否则会话末会把用户决定保留
-     * 的网络删掉（违背「绝不擅自删除」）。
+     * 例外**只认用户选择**（isUserKept，2026-10-25 定谳）：「系统里已存在」不是用户
+     * 意愿的证据——可能正是我们自己上一轮遗留的保存；来历不明（存在但非用户保留）
+     * 保守不删，由 specifier 入口的「清除/保留」询问流程正当解决。
      */
     private fun specifierDeepFallback(wifi: Iap2SenderSession.WifiConfiguration): Network? {
         if (!shellWifiReady()) return null
@@ -1122,11 +1239,20 @@ object SessionController {
             appendLog("WIFI: connect-network 失败（${r.output.take(80)}）")
             return null
         }
-        if (preExisting) {
-            appendLog("WIFI: \"${wifi.ssid}\" 此前已保存在系统（用户选过保留）——不作会话末清除")
-        } else {
-            shellFallbackCleanupSsid = wifi.ssid
-            appendLog("WIFI: connect-network 已执行（新存系统网络，已登记会话末自动清除）")
+        // 例外只认「用户选过保留」（isUserKept）——「系统里已存在」不是用户意愿的
+        // 证据（可能正是我们上一轮遗留的保存，2026-10-25 定谳毒化自延续根因）
+        when {
+            isUserKept(wifi.ssid) ->
+                appendLog("WIFI: \"${wifi.ssid}\" 用户选过保留——不作会话末清除")
+            preExisting ->
+                appendLog(
+                    "WIFI: \"${wifi.ssid}\" 此前已保存但来历不明——保守不自动清除" +
+                        "（连接弹窗里选「清除」可解除对 specifier 的毒化）",
+                )
+            else -> {
+                shellFallbackCleanupSsid = wifi.ssid
+                appendLog("WIFI: connect-network 已执行（新存系统网络，已登记会话末自动清除）")
+            }
         }
         // 轮询切网完成（断旧网/关联/DHCP，实测 2-10s）
         repeat(30) {
@@ -1223,12 +1349,23 @@ object SessionController {
                         "WIFI: 已按用户选择清除系统级保存的热点 \"$ssid\"（netId=$id ok=${result.ok}）",
                     )
                 }
+                // 下次 specifier 才能正常工作（存过的 SSID 请求永久挂起）
+                markUserKept(ssid, false)
             }
 
-            false -> appendLog("WIFI: 用户选择保留系统保存的 \"$ssid\"——继续以应用专属网络连接")
+            // 「保留」持久化：这是 connect-network 兜底「不作会话末清除」例外的
+            // 唯一合法来源（2026-10-25 前例外按「系统里已存在」判定，被我们自己
+            // 遗留的保存冒名顶替，毒化自延续）
+            false -> {
+                markUserKept(ssid, true)
+                appendLog("WIFI: 用户选择保留系统保存的 \"$ssid\"——继续以应用专属网络连接")
+            }
 
             // 无人应答（UI 不在前台）：按「保留」处理，绝不在用户未确认时删网络
-            null -> appendLog("WIFI: 无人应答是否清除保存的网络——按保留处理（不改用户配置）")
+            null -> {
+                markUserKept(ssid, true)
+                appendLog("WIFI: 无人应答是否清除保存的网络——按保留处理（不改用户配置）")
+            }
         }
     }
 
@@ -1298,6 +1435,11 @@ object SessionController {
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
     ) {
+        if (connectCancelled) return
+        // 已存同 SSID 是 specifier 挂起的常见形态：这里已是失败分支（无关键路径），
+        // 顺势问一次「清除/保留」——「清除」解除毒化让重试走通专属网络路径，
+        // 「保留」持久化为例外依据（见 markUserKept）。连接路径上绝不弹（6318 定谳）。
+        promptForgetSavedNetworkIfAny(wifi.ssid)
         if (connectCancelled) return
         val choice =
             askWifiJoinChoice(
@@ -1580,6 +1722,83 @@ object SessionController {
     }
 
     /**
+     * MIB3 移交标志复位（会话任一终点都要走：车机侧拆链的 onEnded 不经过
+     * retireSession——只挂一端必漏，暗幕「会话断了还启动」同款教训）。
+     * 豁免解除后 ACL 事件回归常规语义，下一轮会话允许再次执行移交拆链。
+     */
+    private fun resetBtHandoffState() {
+        btHandoffActive = false
+        btHandoffDone.set(false)
+    }
+
+    /** 音频路由抢占自愈的节流状态（每会话最多 5 次、间隔 ≥30s；retireSession 复位）。 */
+    private var audioRouteReclaimLastAtMs = 0L
+
+    private var audioRouteReclaimAttempts = 0
+
+    /**
+     * 会话中音频路由被抢占的自愈（2026-10-26 荣耀+6318 定谳）：耳机/车机 A2DP
+     * 回连后手机媒体输出切去蓝牙，AudioPlaybackCapture 采不到（全零），推给车机的
+     * 就是静音流。判定「采集全零（回调已含）+ 确有应用在播」即断开全部音频类蓝牙
+     * 设备——路由回落本地后采集自动恢复。会话期间音频本就该走 WiFi 的 AirPlay，
+     * 任何蓝牙音频接收端都是抢占方。
+     */
+    @SuppressLint("MissingPermission")
+    private fun maybeReclaimAudioRoute() {
+        // 杂项设置开关（默认开）：不想被自动断开耳机的用户可关
+        if (appContext?.let { DisplayPrefs.audioRouteReclaim(it) } != true) return
+        if (MediaSessionsState.nowPlaying?.playing != true) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - audioRouteReclaimLastAtMs < 30_000L) return
+        if (audioRouteReclaimAttempts >= 5) return
+        audioRouteReclaimLastAtMs = now
+        audioRouteReclaimAttempts++
+        Bg.run("audio-route-reclaim") {
+            val ctx = appContext ?: return@run
+            val devices = BtProfiles.connectedAudioDevices(ctx)
+            if (devices.isEmpty()) {
+                appendLog("AUDIO: 采集全零且媒体在播，但无蓝牙音频设备在线——非路由抢占（查捕获权限/媒体音量）")
+                return@run
+            }
+            val names =
+                devices.joinToString("、") {
+                    runCatching { it.name }.getOrNull() ?: "?"
+                }
+            appendLog("AUDIO: ⚠ 音频路由被蓝牙设备抢占（$names）——断开以恢复车机侧声音")
+            devices.forEach { device -> BtProfiles.disconnect(ctx, device) }
+            appendLog("AUDIO: 蓝牙音频设备已断开——路由回落本地，采集自动恢复")
+        }
+    }
+
+    /**
+     * MIB3 无线移交拆 BT（0x1D01 画像=CLASSIC_MIB3 才做；在 armMib3 发出 DETECT 后、
+     * RECORD 之前触发）：真 iPhone 的 BT 在车机 SYN 与首帧视频之前就已落下
+     * （sysdiagnose 2026-10-16：50.015 拆 BT → 50.023 车 SYN → 50.098 首帧）。
+     * 我们此前 BT 全程保持——车机 HMI 卡在「半移交」态：会话健康但永不切屏、连接
+     * 入口置灰直到重启车机。仅控制通道虚拟链形态做（TCP 隧道形态的 DiPlay 见
+     * RFCOMM 断开即拆整轮无线栈，2026-10-16 实测，不可拆）。
+     * 服务端 accept 一并停掉：iPhone 拆 BT 后 90s+ 车机无 RFCOMM 回连，但停监听是
+     * 防御性正确（防车机回连挂上第二条链）；onEnded/下一轮 startConnection 会重启。
+     */
+    fun detachBtForMib3Handoff() {
+        if (senderLinkGeneration() != ReceiverProfile.LinkGeneration.CLASSIC_MIB3) return
+        if (!btHandoffDone.compareAndSet(false, true)) return
+        btHandoffActive = true
+        appendLog(
+            "IAPLINK: MIB3 移交启动——对齐真 iPhone 顺序，立即拆除蓝牙 iAP2 会话（ACL 断开豁免已开启）",
+        )
+        Bg.run("bt-handoff-detach") {
+            runCatching {
+                bluetoothServer?.stop()
+                detachActiveBtSessions()
+            }.onFailure { error ->
+                appendLog("IAPLINK: ⚠ 移交拆链异常 ${error.javaClass.simpleName}: ${error.message}")
+            }
+            appendLog("IAPLINK: 蓝牙已退役（无线移交完成形态：单一 AirPlay iAP2 链）")
+        }
+    }
+
+    /**
      * 等车机 ctrl 邀请（`GET /ctrl-int/1/connect`）——catplay 的连接触发点。
      *
      * 邀请意味着「车机已在 WiFi 上发现我们，且已把 AirPlay 端口打开」，此时连
@@ -1746,6 +1965,9 @@ object SessionController {
                     controlPort = audio.controlPort,
                 )
             audioSender = sender
+            // 音频路由抢占自愈（2026-10-26 荣耀实测：耳机 X7e 抢占 A2DP 后，
+            // 采集全零、推给车机的是静音流——用户视角「车机没声音了」）
+            sender.onRouteHijackSuspect = { maybeReclaimAudioRoute() }
             if (!sender.start(projection)) {
                 audioSender = null
                 activeAudioProfile = null
@@ -1857,6 +2079,13 @@ object SessionController {
                     Thread.sleep(minOf(remain, 200L))
                 }
                 if (epoch != modesReclaimEpoch || client.cancelled || connectCancelled) return@run
+                // 通话/语音/借用期间重申会被车机资源仲裁拒绝（HTTP 200 但响应体 status=1）：
+                // 反复顶撞疑似把 8015 的资源管理器打成锁存（连接入口置灰）。跳过本轮，
+                // 归还事件（onModesRestored）会触发补发。
+                if (client.modesBusy()) {
+                    appendLog("AIRPLAY: 车机通话/语音/借用占用资源——跳过本次 modesChanged 重申（归还后补发）")
+                    continue
+                }
                 if (!client.assertModes()) return@run
                 appendLog("AIRPLAY: modesChanged 资源重申（burst 后 +${atMs / 1000}s，AADisplay r17 时序）")
             }
@@ -1875,7 +2104,7 @@ object SessionController {
     private fun resolveEndpointHost(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
-    ): Iap2SenderSession.CarPlayEndpoint {
+    ): Iap2SenderSession.CarPlayEndpoint? {
         var effective = endpoint
         val cached = endpointBrowser?.awaitEndpoint(0)
         if (cached != null) {
@@ -1892,6 +2121,22 @@ object SessionController {
         // 网段过滤（防误连同网 macOS 接收器）由 browser 的 accept 统一做。
         val info =
             endpointBrowser?.awaitEndpoint(ENDPOINT_RESOLVE_WAIT_MS) ?: run {
+                // 2026-10-24 奥迪 8015 定谳：**合成端点**（本轮从未拿到 0x4301 完整地址，
+                // port=0 且无 IP）在 mDNS 完全未发现时，网关直连会把 AirPlay 会话建在
+                // 「车机还没武装」的状态上——隧道 0x1d00 零应答、modesChanged 重申永不
+                // 触发、87s 后车机 reset 并锁死连接入口（要重启车机）。改为：再等
+                // [ENDPOINT_REARM_WAIT_MS] 仍无发现 → 返回 null，调用方转「保活等
+                // 0x4301」（PR19 路径；0x4301 是车机交接 FSM 完成的信号）。
+                // 带 0x4301 端口/IP 的端点不适用此守卫（车机已明确告知连哪里）。
+                if (endpoint.airPlayPort <= 0 && endpoint.ipAddresses.isEmpty()) {
+                    appendLog(">>> [$source] mDNS 未发现——车机 CarPlay 栈可能未武装（0x4301 未到），加等 ${ENDPOINT_REARM_WAIT_MS / 1000}s 再判")
+                    val rearm = endpointBrowser?.awaitEndpoint(ENDPOINT_REARM_WAIT_MS)
+                    if (rearm != null) {
+                        return mergeBrowserEndpoint(effective, rearm, source, needPort = true)
+                    }
+                    appendLog(">>> [$source] 仍无 mDNS——不网关直连（会建在未武装状态上），转保活等 0x4301")
+                    return null
+                }
                 // 兜底：热点场景车机 IP = 网关（Audi 实测 .1，但取网关更通用）。
                 // mDNS 在部分网络/机型上不稳定（2026-10-11 实测车机 mDNS 时有时无）；
                 // 网关地址 + 默认端口 7000 直接连，AirPlay 端口是固定约定。
@@ -2013,10 +2258,12 @@ object SessionController {
 
     /**
      * 空端点等待期（车机声明会发 0x4301 但迟迟未到）的观察任务：
-     * 1. 每 5s 轮询当前 WiFi——用户手动连上车机热点后弹窗确认，确认即以该 SSID
+     * 1. **mDNS 发现即自动重走**：当前网是 0x5703 热点且浏览器发现 `_airplay._tcp`
+     *    ——车机晚武装（6318 实测入网 +88s 才广播、15s 后又消失），立即连接；
+     * 2. 每 5s 轮询当前 WiFi——用户手动连上车机热点后弹窗确认，确认即以该 SSID
      *    合成端点重走 [onCarPlayEndpoint]（无端口 → mDNS/网关兜底）；
-     * 2. 晚到 0x4301 触发新一轮交接（sessionStarting 重新置位）时让位退出；
-     * 3. 超过 [PENDING_START_SESSION_WAIT_MS] 无进展：记日志并拆掉保活链路，
+     * 3. 晚到 0x4301 触发新一轮交接（sessionStarting 重新置位）时让位退出；
+     * 4. 超过 [PENDING_START_SESSION_WAIT_MS] 无进展：记日志并拆掉保活链路，
      *    让 BT 重连循环接管（与旧「8s 拆链」的区别只在窗口长度）。
      */
     private fun watchForPendingStartSession(
@@ -2032,6 +2279,23 @@ object SessionController {
                 // 晚到 0x4301 已触发新一轮交接——观察任务让位。
                 if (sessionStarting.get()) return@run
                 val ssid = shellWifiStatus().second ?: continue
+                // 车机晚武装（6318 实测 2026-10-25：入网后 +88s 才广播 _airplay._tcp，
+                // 又 15s 后消失）：当前网就是 0x5703 下发的热点且 mDNS 已发现车机
+                // AirPlay 服务——无需用户确认，立即以发现结果重走连接。旧版每 8s
+                // 拆链重试的循环天然能接住晚武装，保活等待模式必须自己补这个钩子，
+                // 否则「发现了却无人消费，干等车机拆 BT」。
+                if (ssid == endpoint.ssid) {
+                    val found = endpointBrowser?.awaitEndpoint(0)
+                    if (found != null && found.port > 0) {
+                        val merged = enrichEndpointFromBrowser(endpoint, source) ?: endpoint
+                        appendLog(
+                            ">>> [$source] 保活等待中发现车机 AirPlay" +
+                                "（${found.host?.hostAddress}:${found.port}）——立即重走连接（车机晚武装）",
+                        )
+                        onCarPlayEndpoint(merged, "$source/mDNS 发现")
+                        return@run
+                    }
+                }
                 // 同一 SSID 只问一次（用户选「继续等待」后不再打扰）；换网络再问。
                 if (ssid.isEmpty() || promptedSsid == ssid) continue
                 promptedSsid = ssid
@@ -2295,13 +2559,22 @@ object SessionController {
                     // 端点解析放在邀请之后：车机的 `_airplay._tcp` 常在受邀后才上线，
                     // 且这一步最长 3s——必须在后台线程做，不能占住网络回调线程。
                     var effectiveEndpoint = resolveEndpointHost(endpoint, source)
+                    if (effectiveEndpoint == null) {
+                        // 合成端点 + mDNS 全 miss：车机未武装（0x4301 未到）。转保活
+                        // 等 0x4301（PR19 路径）——此时直连只会建出注定被 reset 的会话。
+                        appendLog(">>> [$source] 端点未解析且车机未武装——转入保活等待 0x4301")
+                        sessionStarting.set(false)
+                        watchForPendingStartSession(endpoint, source)
+                        return@run
+                    }
                     // 交接流程起步期间车机补发的 0x4301（比 mDNS 合成更权威）在此并入。
                     pendingEndpointUpdate?.let { late ->
                         pendingEndpointUpdate = null
-                        effectiveEndpoint = preferEndpoint(late, effectiveEndpoint)
+                        val merged = preferEndpoint(late, effectiveEndpoint)
+                        effectiveEndpoint = merged
                         appendLog(
                             "AIRPLAY: 并入交接期间晚到的 0x4301 端点 → " +
-                                "${effectiveEndpoint.ipAddresses.firstOrNull()}:${effectiveEndpoint.airPlayPort}",
+                                "${merged.ipAddresses.firstOrNull()}:${merged.airPlayPort}",
                         )
                     }
                     if (connectCancelled) {
@@ -2310,9 +2583,12 @@ object SessionController {
                         return@run
                     }
 
+                    // 上面的 null 分支已 return——此处断言非空仅为满足 var 的类型
+                    val resolvedEndpoint = effectiveEndpoint!!
+
                     fun newClient() =
                         AirPlayClient(
-                            effectiveEndpoint,
+                            resolvedEndpoint,
                             log = { line -> appendLog(line) },
                             context = context.applicationContext,
                             // 链路代际：蓝牙侧 0x1D01 画像已判定（CLASSIC_MIB3/EVENT_LINK），
@@ -2351,6 +2627,27 @@ object SessionController {
                             // 车机全程健康却永不切 CarPlay 画面）。
                             created.onTunnelControlSessionComplete = {
                                 scheduleModesReclaim(created)
+                            }
+                            // MIB3 虚拟链成型 → 拆 BT 完成无线移交（真 iPhone 时序，
+                            // 车机 HMI 切屏的先决条件；详见 detachBtForMib3Handoff）
+                            created.onMib3HandoffReady = { detachBtForMib3Handoff() }
+                            // 实验 C（跳过隧道布防）时隧道永远不完成 → 重申无触发源。
+                            // 视频起流后立刻排一遍（时序与 AADisplay 的「起流 +1.5s」等价）。
+                            created.onStreamingStarted = {
+                                if (!created.mib3LinkArmed) {
+                                    appendLog("AIRPLAY: 未布防隧道（实验模式）——起流后直接排 modesChanged 重申")
+                                    scheduleModesReclaim(created)
+                                }
+                            }
+                            // 车机归还资源（UNBORROW/UNTAKE）= 切屏窗口：80ms 后补发
+                            // modesChanged（AADisplay CarPlayEventChannel 同款时序）
+                            created.onModesRestored = {
+                                Bg.run("modes-restored") {
+                                    Thread.sleep(80)
+                                    if (!created.cancelled && created.assertModes()) {
+                                        appendLog("AIRPLAY: 资源归还——modesChanged 补发完成（切屏窗口）")
+                                    }
+                                }
                             }
                         }
                     // 「强制应用横屏」覆盖写入在配对起步就入队：`am compat enable` 会立即
@@ -2613,10 +2910,9 @@ object SessionController {
                                     }
 
                                     "changeModes" -> {
-                                        // 车机请求资源仲裁（如用户在 MMI 上点了手机）：
-                                        // 回 modesChanged 声明手机持有主屏/主音频
-                                        appendLog("EVENT: 车机请求 changeModes → 回 modesChanged 接管资源")
-                                        client.assertModes()
+                                        // 车机请求资源仲裁：状态更新与带 status+params 的 200 应答
+                                        // 已在 AirPlayClient 事件循环完成（空 200 曾让奥迪黑屏拆链）；
+                                        // 归还类事件（UNBORROW/UNTAKE）的补发由 onModesRestored 驱动。
                                     }
 
                                     else ->
@@ -2741,6 +3037,25 @@ object SessionController {
                                             log = { line -> appendLog(line) },
                                             keepAliveWithStats = setup.keepAliveSendStatsAsBody,
                                             onEnded = {
+                                                // MIB3 移交收口（「两端收口」铁律）：车机拆链
+                                                // 是最常见的离场方式，此处必须复位移交豁免并
+                                                // 恢复入站监听——否则下次上车的 ACL 自动重连被
+                                                // 豁免吞掉、server 停摆无人重启（暗幕当年同款
+                                                // 「只挂一端」教训）。移交形态下 BT 已无会话可
+                                                // 接续端点，音频一并停止：改动前靠
+                                                // ACL_DISCONNECTED 全量收摊，移交后该路径被
+                                                // 豁免，熄火后音频会无限空转（审查定谳）。
+                                                if (btHandoffActive) {
+                                                    resetBtHandoffState()
+                                                    appendLog(
+                                                        "IAPLINK: 移交形态会话结束——恢复 ACL 常规语义与入站监听，停止音频采集",
+                                                    )
+                                                    audioSender?.stop()
+                                                    audioSender = null
+                                                    Bg.run("bt-server-restore") {
+                                                        runCatching { bluetoothServer?.start() }
+                                                    }
+                                                }
                                                 // 会话真实结束：解除静默降噪（客户端恢复探测/重连）
                                                 appendLog(">>> CarPlay 会话结束（推流终止）——恢复蓝牙探测")
                                                 BtSessionGate.sessionActive = false
@@ -2804,6 +3119,8 @@ object SessionController {
                                         // 应用启动时只挂触摸探针，避免「会话早断了、手机过一会儿还是变暗」。
                                         if (ok) {
                                             ScreenDimmer.setSessionActive(true)
+                                            // 视频起流（虚拟屏已就绪）——实验模式下重申的触发源
+                                            client.onStreamingStarted?.invoke()
                                             // 虚拟屏已建好 → 按「连接时真息屏」开关决定是否硬件断电
                                             if (DisplayPrefs.screenOffOnConnect(context)) {
                                                 enterPhoneScreenOff()

@@ -6,31 +6,56 @@ plugins {
 }
 
 /**
- * 版本号约定：`MAJOR.MINOR.PATCH`（语义化版本）。
+ * 版本号约定：四段制 `主.次.修订.内部号`（2026-10-25 起，详见 [appVersionName] 处注释）。
+ * 内部测试只动第 4 位；对外发布升第 3 位、第 4 位归 0，展示层不带第 4 位
+ * （[displayVersionName]）。
  *
  * `versionCode` 由 `versionName` **推导**而不是手填两处——两者不同步是更新失效的
  * 经典原因（系统只看 versionCode，填小了用户装不上新包，且不会有任何提示）。
- * 0.x 表示实验性阶段；发布前只需改这一行。
+ * 发布前只需改 [appVersionName] 这一行。
  *
  * CI（`.github/workflows/android-ci.yml`）每次推送会传
- * `-Pcardeck.buildNumber=<github.run_number>`，得到 `0.1.13.<N>` / `versionCode = base*10000+N`
- * 的**正式签名**包（见下方 [buildNumber]），不需要往仓库写提交。
+ * `-Pcardeck.buildNumber=<github.run_number>`，构建号顶替第 4 位（见下方 [buildNumber]），
+ * 不需要往仓库写提交。
  */
-val appVersionName = "0.1.28"
-val appVersionCode =
-    appVersionName
-        .split(".")
-        .let { (major, minor, patch) -> major.toInt() * 10_000 + minor.toInt() * 100 + patch.toInt() }
+// 版本号四段制（2026-10-25 起）：`主.次.修订.内部号`，当前基线 0.1.28.1（0.1.28 为最后一个对外测试版，下次正式版 0.1.29.0）。
+//  - **内部测试：只递增第 4 位**（0.1.28.1 → 0.1.28.2 → …）；
+//  - **对外发布：第 3 位 +1、第 4 位归 0**（0.1.29.0），且对外展示不带第 4 位
+//    （显示 0.1.29）——见 [displayVersionName] / `BuildConfig.DISPLAY_VERSION`；
+//  - `versionCode = (主*10000+次*100+修订)*100000 + 内部号`：对旧三段公式
+//    （0.1.41 = 1_410_000）天然反超（0.1.28.1 = 12_800_001），换轨无需跳版本，
+//    已装用户可直接覆盖升级。
+//  - CI（`.github/workflows/android-ci.yml`）传 `-Pcardeck.buildNumber=<run_number>`
+//    时，构建号**顶替第 4 位**（0.1.28.57），无需往仓库写提交。
+val appVersionName = "0.1.28.8"
+val versionParts =
+    appVersionName.split(".").map { part ->
+        part.toIntOrNull() ?: error("appVersionName 必须是数字点分（收到 \"$part\"）")
+    }
+check(versionParts.size == 4) {
+    "appVersionName 必须是四段「主.次.修订.内部号」（收到 \"$appVersionName」）"
+}
+val versionBase = versionParts[0] * 10_000 + versionParts[1] * 100 + versionParts[2]
+val appVersionCode = versionBase * 100_000 + versionParts[3]
+
+/**
+ * 对外展示版本：第 4 位为 0（正式版）时只取前三段，否则四段全显。
+ * 经 `BuildConfig.DISPLAY_VERSION` 暴露给 UI（首页底部版本信息等对外的位置）；
+ * 诊断类展示（日志导出、桥 hello）仍用完整 VERSION_NAME（含 flavor 后缀）。
+ */
+val displayVersionName =
+    if (versionParts[3] == 0) {
+        versionParts.take(3).joinToString(".")
+    } else {
+        appVersionName
+    }
 
 /**
  * 预发布构建号（CI 每次推送传 `-Pcardeck.buildNumber=<run_number>`）。
  *
- *  - `versionName` 追加 `.N`：`0.1.13` → `0.1.13.42`；
- *  - `versionCode` 把低 4 位留给构建号：`113` → `1_130_042`。
- *
- * 效果：同一 base 下每次推送**单调递增**，能直接覆盖安装上一版；base 升到下一个
- * patch（`0.1.14` → `1_140_000`）时自动反超本 patch 的所有构建（要求 N < 10000）。
- * 不传时退回纯 base（`1_130_000`），本地/分叉构建仍然可用。
+ *  - 构建号**顶替第 4 位**：`0.1.28.1` + N=57 → `0.1.28.57`（内部测试语义一致）；
+ *  - `versionCode = base*100000 + N`，同一 base 下随 N 单调递增，可覆盖安装；
+ *    base 升修订（0.1.29.0 → 12_900_000）时自动反超本修订所有构建（N < 100000）。
  *
  * **传了构建号就必须有正式 keystore**：否则这个包会被当成「正式版」流出去，
  * 而 debug 证书签的包日后换正式证书时所有用户都得卸载重装。
@@ -41,12 +66,16 @@ val buildNumber = buildNumberText?.toIntOrNull()
 check(buildNumberText == null || buildNumber != null) {
     "cardeck.buildNumber 必须是整数（收到 \"$buildNumberText\"）"
 }
-check(buildNumber == null || buildNumber in 1..9_999) {
-    "cardeck.buildNumber 必须在 1..9999（versionCode 的低 4 位留给构建号），当前=$buildNumber"
+check(buildNumber == null || buildNumber in 1..99_999) {
+    "cardeck.buildNumber 必须在 1..99999（versionCode 的低 5 位留给构建号），当前=$buildNumber"
 }
-val effectiveVersionName = if (buildNumber == null) appVersionName else "$appVersionName.$buildNumber"
-val effectiveVersionCode =
-    if (buildNumber == null) appVersionCode * 10_000 else appVersionCode * 10_000 + buildNumber
+val effectiveVersionName =
+    if (buildNumber == null) {
+        appVersionName
+    } else {
+        "${versionParts.take(3).joinToString(".")}.$buildNumber"
+    }
+val effectiveVersionCode = versionBase * 100_000 + (buildNumber ?: versionParts[3])
 
 /**
  * 发布签名配置：从仓库外的 `keystore.properties` 读取（已在 .gitignore 排除）。
@@ -78,6 +107,9 @@ android {
         targetSdk = 34
         versionCode = effectiveVersionCode
         versionName = effectiveVersionName
+        // 对外展示版本（第 4 位为 0 时不带第 4 位）：不含 flavor/debug 后缀，
+        // 给首页底部等面向用户的位置；诊断场景用完整 VERSION_NAME
+        buildConfigField("String", "DISPLAY_VERSION", "\"$displayVersionName\"")
     }
 
     signingConfigs {
@@ -140,6 +172,16 @@ android {
         // 协议层回放测试驱动真实 AirPlayClient，request() 里的 SystemClock 等
         // android 调用在 JVM 上返回默认值即可（否则 "not mocked" 直接炸）
         unitTests.isReturnDefaultValues = true
+        unitTests.all { test ->
+            // 快速集开关（2026-10-25）：-Dtest.quick=true 跳过重放回归（BtLinkReplayTest
+            // 单类 240s，占全量 89%）——实验迭代期用，提交前必须跑一次全量（无 -D 即全量）
+            if (System.getProperty("test.quick") == "true") {
+                test.filter {
+                    excludeTestsMatching("io.github.shaonialife.cardeck.replay.*")
+                    excludeTestsMatching("io.github.shaonialife.cardeck.airplay.ForbiddenAudiReplayTest")
+                }
+            }
+        }
     }
 
     lint {

@@ -17,15 +17,6 @@
         android:paddingBottom="10dp">
 
         <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:layout_marginBottom="11dp"
-            android:text="视频流按车机分辨率的百分比生成虚拟屏与编码画面（逻辑布局不变）。分辨率改动下次连接起效；帧率为推流刷新频率，切换实时生效。"
-            android:textColor="#FF8E8E93"
-            android:textSize="12sp" />
-
-        <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="连接时真息屏"
@@ -78,113 +69,9 @@
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="上车自动连接"
-            android:textColor="#FFF5F5F7"
-            android:textSize="14sp" />
+        
 
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:background="@drawable/bg_segment"
-            android:orientation="horizontal"
-            android:padding="3dp">
-
-            <TextView
-                android:id="@+id/btnAutoConnectOn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:background="@drawable/bg_segment_sel"
-                android:paddingLeft="18dp"
-                android:paddingTop="6dp"
-                android:paddingRight="18dp"
-                android:paddingBottom="6dp"
-                android:text="开"
-                android:textColor="#FFFFFFFF"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:id="@+id/btnAutoConnectOff"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginLeft="2dp"
-                android:paddingLeft="18dp"
-                android:paddingTop="6dp"
-                android:paddingRight="18dp"
-                android:paddingBottom="6dp"
-                android:text="关"
-                android:textColor="#FF8E8E93"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-
-        <TextView
-            android:id="@+id/autoConnectNote"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="车机蓝牙连上时自动拉起会话（需 Shizuku 已启动）。需要「显示在其他应用上层」权限才能在后台启动；该权限缺失时会自动补授。"
-            android:textColor="#FF8E8E93"
-            android:textSize="12sp" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="HID 原始日志"
-            android:textColor="#FFF5F5F7"
-            android:textSize="14sp" />
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:background="@drawable/bg_segment"
-            android:orientation="horizontal"
-            android:padding="3dp">
-
-            <TextView
-                android:id="@+id/btnHidRawOn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:background="@drawable/bg_segment_sel"
-                android:paddingLeft="18dp"
-                android:paddingTop="6dp"
-                android:paddingRight="18dp"
-                android:paddingBottom="6dp"
-                android:text="开"
-                android:textColor="#FFFFFFFF"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:id="@+id/btnHidRawOff"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginLeft="2dp"
-                android:paddingLeft="18dp"
-                android:paddingTop="6dp"
-                android:paddingRight="18dp"
-                android:paddingBottom="6dp"
-                android:text="关"
-                android:textColor="#FF8E8E93"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-
-        <TextView
-            android:id="@+id/hidRawNote"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="键位校准用：打开后每帧 HID 报文写一行 HID-RAW（uuid + hex 字节），对照按下方向盘/旋钮时打印的字节调整键位映射。平时请关闭，避免日志刷屏。"
-            android:textColor="#FF8E8E93"
-            android:textSize="12sp" />
+        
 
         <TextView
             android:layout_width="wrap_content"
@@ -223,7 +110,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="保存后下次连接起效"
+            android:text="视频流按车机分辨率的百分比生成虚拟屏与编码画面（逻辑布局不变）；保存后下次连接起效"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 

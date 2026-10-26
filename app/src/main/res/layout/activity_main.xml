@@ -712,7 +712,7 @@
                     android:layout_marginStart="54dp"
                     android:background="#5A394444" />
 
-                <!-- 立即假息屏 -->
+                <!-- 立即息屏 -->
                 <LinearLayout
                     android:id="@+id/rowDim"
                     android:layout_width="match_parent"
@@ -751,7 +751,7 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="立即假息屏"
+                            android:text="立即息屏"
                             android:textColor="@color/m3_on_surface"
                             android:textSize="14.5sp"
                             android:textStyle="bold" />

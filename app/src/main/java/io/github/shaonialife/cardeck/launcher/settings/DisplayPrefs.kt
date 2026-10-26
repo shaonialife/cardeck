@@ -33,12 +33,37 @@ object DisplayPrefs {
     /** HID 原始报文日志默认值：默认关（校准键位时临时打开，避免刷屏）。 */
     const val HID_RAW_LOG_DEFAULT = false
 
+    /** 音频路由自愈默认值：默认开（断开的是会话期间抢走媒体输出的蓝牙设备）。 */
+    const val AUDIO_ROUTE_RECLAIM_DEFAULT = true
+
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_FPS = "display_fps"
     private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
     private const val KEY_HID_RAW_LOG = "hid_raw_log"
+    private const val KEY_AUDIO_ROUTE_RECLAIM = "audio_route_reclaim"
+
+    /**
+     * 音频路由自愈（杂项设置开关，默认开）：会话中检测到「采集全零 + 有应用在播」
+     * 时自动断开蓝牙音频设备（耳机/车机 A2DP 回连抢走媒体输出会让推给车机的是
+     * 静音流，2026-10-26 荣耀实测）。
+     */
+    fun audioRouteReclaim(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUDIO_ROUTE_RECLAIM, AUDIO_ROUTE_RECLAIM_DEFAULT)
+
+    fun setAudioRouteReclaim(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUDIO_ROUTE_RECLAIM, enabled)
+            .apply()
+    }
 
     /**
      * HID 原始报文日志（键位校准用）：打开后每帧 `hidSendReport` 会写一行

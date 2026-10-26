@@ -132,7 +132,7 @@ object ReinstallFlow {
     ): File? {
         if (baseSha256.isNullOrBlank()) return null
         val patch =
-            download(ctx, deltaUrl) ?: run {
+            download(ctx, deltaUrl, "bridge-update.bspatch") ?: run {
                 DebugFileLog.append(ctx, "BRIDGE: 差分包下载失败")
                 return null
             }
@@ -235,6 +235,7 @@ object ReinstallFlow {
     private fun download(
         ctx: Context,
         url: String,
+        cacheName: String = "bridge-update.apk",
     ): File? {
         return try {
             val target = URL(url)
@@ -251,7 +252,9 @@ object ReinstallFlow {
             connection.readTimeout = 60_000
             connection.instanceFollowRedirects = true
             if (connection.responseCode !in 200..299) return null
-            val file = File(ctx.cacheDir, "bridge-update.apk")
+            // 补丁与全量必须用不同缓存文件（2026-10-25 实测：共用 bridge-update.apk
+            // 会让补丁内容被同目录的旧全量覆盖 → sha 校验必然失败、差分永远回退）
+            val file = File(ctx.cacheDir, cacheName)
             connection.inputStream.use { input ->
                 file.outputStream().use { output -> input.copyTo(output) }
             }

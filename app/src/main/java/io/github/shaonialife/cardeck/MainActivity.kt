@@ -498,6 +498,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun beginWithAudio(enabled: Boolean) {
         SessionController.audioEnabledForSession = enabled
+        // 用户偏好持久化：「上车自动连接」要尊重它（2026-10-25 测试者反馈：选了
+        // 仅视频，自动连接重连后又自动带声音，UI 显示「车机侧声音：开启」）。
+        // null 从未手动选过 → 自动连接维持默认带声音。
+        getSharedPreferences("settings", MODE_PRIVATE)
+            .edit()
+            .putBoolean("audio_user_pref", enabled)
+            .putBoolean("audio_user_pref_set", true)
+            .apply()
         // 声音只剩一个模式：通路协商（AAC-LC 优先，不行自动退 PCM）在会话内自动完成，
         // 不再有「兼容档」这种人工分支。
         SessionController.audioPreferCompat = false
@@ -556,7 +564,9 @@ class MainActivity : AppCompatActivity() {
         disclaimerDeadlineAt = savedInstanceState?.getLong(KEY_DISCLAIMER_DEADLINE, 0L) ?: 0L
 
         appVersionFooter = findViewById(R.id.appVersionFooter)
-        appVersionFooter.text = "CarDeck v${BuildConfig.VERSION_NAME}"
+        // 对外展示用 DISPLAY_VERSION（正式版第 4 位为 0 时不显示第 4 位）；
+        // 内部测试号（0.1.28.1）与 flavor 后缀只在诊断输出（日志导出）里出现
+        appVersionFooter.text = "CarDeck v${BuildConfig.DISPLAY_VERSION}"
         deviceSubtitle = findViewById(R.id.deviceSubtitle)
         shizukuChip = findViewById(R.id.shizukuChip)
         shizukuDesc = findViewById(R.id.shizukuDesc)

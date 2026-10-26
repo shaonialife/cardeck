@@ -297,6 +297,8 @@ class AirPlayClient(
                     val keys = PairVerifyClient(identity, fastPathTransport, log).run(receiverStaticKey)
                     cipher = ControlCipher(keys.phoneReadKey, keys.phoneWriteKey)
                     log("AIRPLAY: 控制通道加密已启用（已配对快路径）")
+                    // 认证缺口探针：iPhone 在 pair-verify 之后做两轮 /fp-setup（我们缺失）
+                    runCatching { probeFpSetup() }
                     return keys
                 }
                 val receiverStaticKey = endpoint.publicKey?.let(::hexToBytes)
@@ -304,6 +306,8 @@ class AirPlayClient(
                 // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
                 cipher = ControlCipher(keys.phoneReadKey, keys.phoneWriteKey)
                 log("AIRPLAY: 控制通道加密已启用")
+                // 认证缺口探针（见 probeFpSetup 注释）
+                runCatching { probeFpSetup() }
                 return keys
             } catch (error: IOException) {
                 val message = error.message.orEmpty()
@@ -325,6 +329,68 @@ class AirPlayClient(
         }
         log("AIRPLAY: 配对最终失败（接收端 RTSP 无应答）")
         return null
+    }
+
+    /**
+     * /fp-setup 探针（2026-10-25，奥迪 8015/3315 不切屏排查）。
+     *
+     * **背景**：iPhone sysdiagnose（真车成功会话）显示 pair-verify 之后还有两轮
+     * `/fp-setup`：33B → **711B**（内含 607B MFi 证书 + 64B 挑战 + 64B 签名，
+     * iPhone 用 4 张 Apple MFi 根证书验签）→ 785B → 133B。车机首轮 403 正是拒在
+     * 这一步（`mfiAuthentication_AuthenticateEndpoint → 200403 Forbidden →
+     * Stage 1 failed → Activation Failed`）。我们从未发过这一步，SETUP/RECORD/
+     * 推流却全 200——车机很可能因此永不把会话当作「已认证 CarPlay」去显示。
+     *
+     * **本函数只是探针**：真实第 2 轮要用 Apple MFi 私钥对车机挑战签名，我们无法伪造。
+     * 目标 = 确认车机是否暴露 `/fp-setup`、接受哪种请求形态、返回什么。
+     * 按 catplay 接收端解析（`FairPlaySession::setup`：请求 16B、mode 在 `[14]`、
+     * 应答 142B、应答 mode 在 `[13]`）逐个 mode 试，全部打日志。
+     */
+    fun probeFpSetup() {
+        if (cipher == null) {
+            log("FP-SETUP: 跳过（未配对无加密通道）")
+            return
+        }
+        for (mode in 0..3) {
+            // 候选 A：FPLY + version + 01 + 01 + 000000 + len(0x10) + 0000 + mode + 00
+            val candidate =
+                byteArrayOf(
+                    0x46,
+                    0x50,
+                    0x4C,
+                    0x59,
+                    0x03,
+                    0x01,
+                    0x01,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x10,
+                    0x00,
+                    0x00,
+                    mode.toByte(),
+                    0x00,
+                )
+            try {
+                val (statusLine, body) = request("POST", "/fp-setup", candidate, timeoutMillis = 4_000)
+                log(
+                    "FP-SETUP: mode=$mode 请求 16B → [$statusLine] resp=${body.size}B" +
+                        if (body.isNotEmpty()) {
+                            " head=${body.take(32).joinToString(" ") { "%02x".format(it) }}"
+                        } else {
+                            ""
+                        },
+                )
+                if (statusLine.contains("200") && body.size >= 16) {
+                    log("FP-SETUP: ✓ 车机暴露 /fp-setup（mode=$mode）——可作为认证缺口修复的落点")
+                    return
+                }
+            } catch (error: IOException) {
+                log("FP-SETUP: mode=$mode 失败 - ${error.message}")
+            }
+        }
+        log("FP-SETUP: 四种 mode 均未得到 200——车机可能不暴露该端点（或需要特定期望形态）")
     }
 
     /** 拉取并解析 /info（注意：接收端在活跃会话期间可能不应答）。 */
@@ -586,15 +652,18 @@ class AirPlayClient(
      * 回出畸形行 "OK 200 OK"；我们再回 → 无限回声，日志雪崩且空耗加密通道。
      * 通道写与 postEventCommand 共用一把锁，避免两线程加密帧交叉。
      */
-    private fun respondEventRequest(cseq: String?) {
+    private fun respondEventRequest(
+        cseq: String?,
+        body: ByteArray? = null,
+    ) {
         val socket = eventCommandSocket ?: return
         val cipher = eventCommandCipher
         try {
             synchronized(eventCommandLock) {
                 val head =
-                    "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n" +
+                    "RTSP/1.0 200 OK\r\nContent-Length: ${body?.size ?: 0}\r\n" +
                         (cseq?.let { "CSeq: $it\r\n" } ?: "") + "\r\n"
-                val plaintext = head.toByteArray(Charsets.US_ASCII)
+                val plaintext = head.toByteArray(Charsets.US_ASCII) + (body ?: ByteArray(0))
                 socket.getOutputStream().apply {
                     write(cipher?.encrypt(plaintext) ?: plaintext)
                     flush()
@@ -603,6 +672,68 @@ class AirPlayClient(
         } catch (_: IOException) {
         }
     }
+
+    /**
+     * 车机资源/应用状态快照（/info 自报与 changeModes 事件共同更新）。
+     * 语义出自 catplay change_modes.rs（镜像 Apple 配件框架枚举）：
+     * appStateID 1=Speech/2=PhoneCall/3=TurnByTurn，speechMode -1=None/1=Speaking，
+     * transferType 3=Borrow（主屏被借用）。
+     */
+    data class ModesState(
+        val phoneCall: Boolean,
+        val speechActive: Boolean,
+        val screenBorrowed: Boolean,
+    ) {
+        val busy: Boolean get() = phoneCall || speechActive || screenBorrowed
+    }
+
+    @Volatile
+    var modesState = ModesState(false, false, false)
+        private set
+
+    /** 车机资源被占用（通话/语音/借用）——此期间 modesChanged 会被仲裁拒绝，重申必须冻结。 */
+    fun modesBusy(): Boolean = modesState.busy
+
+    /** 车机归还资源（UNBORROW/UNTAKE）回调——切屏窗口，宿主应立即补发 modesChanged。 */
+    var onModesRestored: (() -> Unit)? = null
+
+    /**
+     * 事件通道 changeModes 请求的状态更新。返回 true = 车机归还了资源
+     * （从占用 → 空闲）：这是切屏窗口，宿主应在 ~80ms 后补发 modesChanged。
+     */
+    fun onCarModesEvent(params: Map<*, *>?): Boolean {
+        val previous = modesState
+        val next = parseModesState(params, previous)
+        modesState = next
+        val restored = previous.busy && !next.busy
+        log(
+            "AIRPLAY: changeModes 事件 → 通话=${next.phoneCall} 语音=${next.speechActive} " +
+                "主屏借用=${next.screenBorrowed}" + if (restored) "（归还——切屏窗口）" else "",
+        )
+        return restored
+    }
+
+    /** changeModes 应答体：status=0 + 当前资源快照（AADisplay CarPlayEventChannel.kt:344 同构）。 */
+    private fun modesResponseBody(): ByteArray =
+        BinaryPlist.encode(
+            linkedMapOf(
+                "status" to 0L,
+                "params" to
+                    linkedMapOf(
+                        "appStates" to
+                            listOf(
+                                linkedMapOf<String, Any?>("appStateID" to 2L, "entity" to 0L),
+                                linkedMapOf<String, Any?>("appStateID" to 3L, "entity" to 0L),
+                                linkedMapOf<String, Any?>("appStateID" to 1L, "entity" to 0L, "speechMode" to -1L),
+                            ),
+                        "resources" to
+                            listOf(
+                                linkedMapOf<String, Any?>("resourceID" to 1L, "entity" to 1L, "permanentEntity" to 1L),
+                                linkedMapOf<String, Any?>("resourceID" to 2L, "entity" to 1L, "permanentEntity" to 1L),
+                            ),
+                    ),
+            ),
+        )
 
     fun assertModes(): Boolean {
         val body =
@@ -1325,6 +1456,15 @@ class AirPlayClient(
      */
     var onTunnelControlSessionComplete: (() -> Unit)? = null
 
+    /** 视频起流回调（屏幕上第一帧发出后）——实验模式下重申的触发源。 */
+    var onStreamingStarted: (() -> Unit)? = null
+
+    /**
+     * MIB3 虚拟链路移交就绪（链路 NORMAL、即将发 0x1D00）：宿主据此拆 BT iAP2 会话
+     * （对齐真 iPhone 的无线移交形态：AirPlay 链成型后 BT 立刻退役，单一链路）。
+     */
+    var onMib3HandoffReady: (() -> Unit)? = null
+
     /** MIB3 虚拟链路是否已布防（armMib3 成功）——拆链归因用：布防了但控制会话没完成就被拆 = 链路看门狗，与音频档位无关。 */
     var mib3LinkArmed: Boolean = false
         private set
@@ -1350,6 +1490,7 @@ class AirPlayClient(
                         mib3ControlSessionDone = true
                         onTunnelControlSessionComplete?.invoke()
                     }
+                    it.onMib3HandoffReady = { onMib3HandoffReady?.invoke() }
                     it.begin()
                     iapLink = it
                 }
@@ -1368,10 +1509,20 @@ class AirPlayClient(
     private fun armMib3VirtualLink() {
         if (cipher == null) return
         if (iapTunnel != null) return // DiPlay 隧道形态：不需要（也不该）布防
-        val generation = linkGeneration ?: ReceiverProfile.LinkGeneration.EVENT_LINK
-        obtainIapLink().setGeneration(generation)
-        obtainIapLink().armMib3()
-        mib3LinkArmed = true
+        // 实验 C（2026-10-25，8015 不切屏排查）：CLASSIC_MIB3 完全跳过隧道布防——
+        // 不发 DETECT、车机因此不发 marker、链路永不协商。对齐真 iPhone 形态
+        // （sysdiagnose 成功会话 iAPChannel=0 = 无隧道）。已排除的变量：SPS level
+        // （40/32 都不切）、帧率（30/60 都不切）、分辨率（= /info 声明值）、
+        // modesChanged 重申与资源仲裁（全 200、modes 干净）。剩「协商完成抑制切屏」
+        // 这一条：0.1.12 切屏窗口恰在协商完成之前。
+        if (MIB3_TUNNEL_ARM_ENABLED) {
+            val generation = linkGeneration ?: ReceiverProfile.LinkGeneration.EVENT_LINK
+            obtainIapLink().setGeneration(generation)
+            obtainIapLink().armMib3()
+            mib3LinkArmed = true
+        } else {
+            log("IAPLINK: 实验模式——跳过 MIB3 隧道布防（不发 DETECT，纯 AirPlay 流）")
+        }
     }
 
     /**
@@ -1407,7 +1558,13 @@ class AirPlayClient(
                 val head =
                     "IAPLINK: tx(控制通道) #$controlIapCount ${frame.size}B [$statusLine]" +
                         (if (reply.isEmpty()) "" else " resp=${reply.size}B hex=" + hexPrefix(reply))
-                if (controlIapCount <= 10 || controlIapCount % 50 == 0 || reply.isNotEmpty()) {
+                // 节流注意：不能按「应答体非空」放行——奥迪对每次 POST 都回 42B bplist
+                // （1Hz 全命中，曾把这条节流击穿成每秒刷屏）。常态只打前 10 条 + 每 100 条；
+                // 非 200 状态始终打（异常必须可见）
+                if (controlIapCount <= 10 ||
+                    controlIapCount % 100 == 0 ||
+                    !statusLine.contains("200")
+                ) {
                     log(head)
                 }
                 // 车机可能把链路字节直接塞在应答体里（而不是另发事件通道）：认出来就喂给
@@ -1473,7 +1630,50 @@ class AirPlayClient(
     /** plist 端口是 u16 但以 2 字节有符号整数编码（>32767 读出为负），按位掩出真实值。 */
     private fun portOf(value: Any?): Int = ((value as? Long) ?: 0L).toInt() and 0xFFFF
 
-    private companion object {
+    companion object {
+        /**
+         * MIB3 隧道布防开关（2026-10-25 实验 C）：false = CLASSIC_MIB3 不发 DETECT。
+         * 实验结论出来后：切屏则永久改为「不发隧道」路线；不切则恢复 true 并转向
+         * 隧道内数据通路（仪表盘订阅/0x5201 等）。
+         */
+        private const val MIB3_TUNNEL_ARM_ENABLED = true
+
+        /** 从 /info 或 changeModes 的 modes 结构解析状态；缺失的清单沿用 [base]。 */
+        internal fun parseModesState(
+            modes: Map<*, *>?,
+            base: ModesState,
+        ): ModesState {
+            if (modes == null) return base
+            var phoneCall = base.phoneCall
+            var speechActive = base.speechActive
+            var screenBorrowed = base.screenBorrowed
+            (modes["appStates"] as? List<*>)?.forEach { entry ->
+                val item = entry as? Map<*, *> ?: return@forEach
+                when ((item["appStateID"] as? Number)?.toLong()) {
+                    2L -> {
+                        // 注意 Elvis 与比较的优先级：`a ?: b != 0L` 会解析成 (a ?: b) != 0L——
+                        // Boolean 的 false 被拿去和 0L 比较恒为 true（实测踩过：state=false
+                        // 被解析成「车机正在通话」，重申被错误冻结）
+                        val stateFlag = item["state"] as? Boolean
+                        phoneCall =
+                            stateFlag ?: (((item["entity"] as? Number)?.toLong() ?: 0L) != 0L)
+                    }
+
+                    1L -> speechActive = (item["speechMode"] as? Number)?.toLong() != -1L
+                }
+            }
+            (modes["resources"] as? List<*>)?.forEach { entry ->
+                val item = entry as? Map<*, *> ?: return@forEach
+                if ((item["resourceID"] as? Number)?.toLong() == 1L) {
+                    val transferType = (item["transferType"] as? Number)?.toLong()
+                    screenBorrowed =
+                        transferType == 3L ||
+                        (transferType == null && item.containsKey("borrowID"))
+                }
+            }
+            return ModesState(phoneCall, speechActive, screenBorrowed)
+        }
+
         /** 主屏视频流类型（对照接收端 STREAM_TYPE_MAIN_SCREEN；100 是音频、130 是数据/iAP 隧道）。 */
         const val SCREEN_STREAM_TYPE = 110L
 
@@ -2165,10 +2365,13 @@ class AirPlayClient(
                             val tokens = firstLine.split(" ")
                             val isRequest = tokens.size >= 2 && tokens[1].startsWith("/")
                             if (!isRequest) continue
-                            // 车机请求：立即回 200（echo 请求 CSeq）；/command 走分发，其余节流留痕
+                            // 车机请求：非 /command 立即回空 200；/command **先解析后应答**——
+                            // changeModes 的 200 必须带 status+params 体（空体曾让奥迪黑屏后
+                            // ~5s 拆链，AADisplay CarPlayEventChannel.kt:169 原话；2026-10-24
+                            // 8015 置灰案的放大器）。
                             val cseq = CSEQ_REGEX.find(message.head)?.groupValues?.get(1)
-                            respondEventRequest(cseq)
                             if (!firstLine.contains("/command")) {
+                                respondEventRequest(cseq)
                                 unknownEventRequests++
                                 if (unknownEventRequests <= 10) {
                                     log("EVENT: 未知请求 [$firstLine] body=${message.body.size}B")
@@ -2191,6 +2394,7 @@ class AirPlayClient(
                                 }
                             val command = parsed as? Map<*, *>
                             if (command == null) {
+                                respondEventRequest(cseq)
                                 // 车机每秒都会 POST 一条解不出来的 /command——按「体型指纹」
                                 // 去重，每种体型留一次全文（原因 + 报文头 + 完整 hex），其余只计数。
                                 badEventCommands++
@@ -2211,6 +2415,13 @@ class AirPlayClient(
                                     log("EVENT: 累计 $badEventCommands 条 /command 解析失败（已静默，仅计数）")
                                 }
                                 continue
+                            }
+                            if (command["type"] == "changeModes") {
+                                val restored = onCarModesEvent(command["params"] as? Map<*, *>)
+                                respondEventRequest(cseq, modesResponseBody())
+                                if (restored) onModesRestored?.invoke()
+                            } else {
+                                respondEventRequest(cseq)
                             }
                             try {
                                 onCommand(command)
@@ -2845,6 +3056,19 @@ class AirPlayClient(
         root.entries
             .filter { (key, _) -> key.toString().contains("hid", ignoreCase = true) }
             .forEach { (key, value) -> log("AIRPLAY: /info $key=$value") }
+        // 车机资源/应用状态（2026-10-24 8015 定谳）：通话/语音/借用期间 modesChanged
+        // 会被资源仲裁拒绝（HTTP 仍 200，拒绝在响应体）——重申必须冻结至归还
+        (root["modes"] as? Map<*, *>)?.let { modes ->
+            val previous = modesState
+            modesState = parseModesState(modes, previous)
+            if (modesState.busy) {
+                log(
+                    "AIRPLAY: /info modes——车机通话=${modesState.phoneCall} " +
+                        "语音=${modesState.speechActive} 主屏借用=${modesState.screenBorrowed}" +
+                        "（重申冻结至归还）",
+                )
+            }
+        }
         val features = root["features"] as? Long
         log(
             "AIRPLAY: /info 摘要 name=${root["name"]} model=${root["model"]} " +

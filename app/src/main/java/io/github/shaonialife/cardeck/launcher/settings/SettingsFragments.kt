@@ -10,7 +10,6 @@ import android.widget.SeekBar
 import android.widget.TextView
 import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.SessionController
-import io.github.shaonialife.cardeck.bt.AutoConnectPrefs
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.AppIcons
 import io.github.shaonialife.cardeck.launcher.DefaultMapPrefs
@@ -589,8 +588,9 @@ class DefaultMapPanelFragment : SettingsPanelFragment() {
 
 /**
  * 「显示」面板：流分辨率缩放（30%–160%，下次连接起效）+ 目标帧率（30/60，
- * 运行中实时切换）。英雄卡展示的是会话运行时生效值（SessionController 快照），
- * 与本页偏好值相区别。
+ * 运行中实时切换）+ 真息屏 + 触摸节流。「上车自动连接」「HID 原始日志」与显示
+ * 无关，2026-10-26 拆到 [MiscPanelFragment]。英雄卡展示的是会话运行时生效值
+ * （SessionController 快照），与本页偏好值相区别。
  */
 class DisplayPanelFragment : SettingsPanelFragment() {
     override fun onCreateView(
@@ -636,62 +636,6 @@ class DisplayPanelFragment : SettingsPanelFragment() {
         }
         screenOffOn.setOnClickListener { applyScreenOff(true) }
         screenOffOff.setOnClickListener { applyScreenOff(false) }
-
-        // 上车自动连接（车机蓝牙 ACL 连上时自动拉起会话）：默认开
-        val autoConnectOn = view.findViewById<TextView>(R.id.btnAutoConnectOn)
-        val autoConnectOff = view.findViewById<TextView>(R.id.btnAutoConnectOff)
-        var autoConnectEnabled = AutoConnectPrefs.enabled(ctx)
-
-        fun refreshAutoConnect(enabled: Boolean) {
-            autoConnectOn.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
-            )
-            autoConnectOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
-            autoConnectOff.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
-            )
-            autoConnectOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
-        }
-
-        refreshAutoConnect(autoConnectEnabled)
-
-        fun applyAutoConnect(enabled: Boolean) {
-            if (enabled == autoConnectEnabled) return
-            autoConnectEnabled = enabled
-            AutoConnectPrefs.setEnabled(ctx, enabled)
-            refreshAutoConnect(enabled)
-            hostToast(if (enabled) "已开启：上车自动连接" else "已关闭：上车不再自动启动")
-        }
-        autoConnectOn.setOnClickListener { applyAutoConnect(true) }
-        autoConnectOff.setOnClickListener { applyAutoConnect(false) }
-
-        // HID 原始日志（键位校准）：默认关；打开后每帧 hidSendReport 写一行 HID-RAW
-        val hidRawOn = view.findViewById<TextView>(R.id.btnHidRawOn)
-        val hidRawOff = view.findViewById<TextView>(R.id.btnHidRawOff)
-        var hidRawEnabled = DisplayPrefs.hidRawLog(ctx)
-
-        fun refreshHidRaw(enabled: Boolean) {
-            hidRawOn.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
-            )
-            hidRawOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
-            hidRawOff.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
-            )
-            hidRawOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
-        }
-
-        refreshHidRaw(hidRawEnabled)
-
-        fun applyHidRaw(enabled: Boolean) {
-            if (enabled == hidRawEnabled) return
-            hidRawEnabled = enabled
-            DisplayPrefs.setHidRawLog(ctx, enabled)
-            refreshHidRaw(enabled)
-            hostToast(if (enabled) "已开启 HID 原始日志（校准完请关掉）" else "已关闭 HID 原始日志")
-        }
-        hidRawOn.setOnClickListener { applyHidRaw(true) }
-        hidRawOff.setOnClickListener { applyHidRaw(false) }
 
         // 滑条 progress（0..26）→ 百分比（30..160，步进 5）
         fun progressOf(percent: Int) = (percent - DisplayPrefs.SCALE_MIN) / DisplayPrefs.SCALE_STEP

@@ -308,8 +308,12 @@ class VideoSender(
             log("VIDEO: csd 缺少 SPS/PPS（${nalUnits.size} 个 NAL），跳过 config")
             return
         }
-        // level_idc 补丁到 4.0（关键帧内嵌 SPS 同样会打补丁，见 sendVideoFrame）
-        val sps = patchSpsLevel(rawSps)
+        // level_idc 补丁到 4.0（关键帧内嵌 SPS 同样会打补丁，见 sendVideoFrame）。
+        // 2026-10-25 8015 实验开关：旁路补丁让 30fps 回编码器原始 level——隔离
+        // 「SPS 补丁是否是 8015 不切屏的因素」（0.1.31 因编辑事故开关未接线，实验作废）
+        // level：实验模式非空时强制改写；否则走正式补丁（只升不降，0628 依赖它）
+        val sps =
+            if (SPS_LEVEL_FORCE != null) patchSpsLevelForExperiment(rawSps) else patchSpsLevel(rawSps)
         val avcc = ByteArrayOutputStream(8 + sps.size + pps.size)
         avcc.write(1)
         avcc.write(sps[1].toInt()) // profile
@@ -365,7 +369,11 @@ class VideoSender(
         val packed = ByteArrayOutputStream(size)
         for (nal in nalUnits) {
             val out =
-                if (nal.isNotEmpty() && (nal[0].toInt() and 0x1F) == 7) patchSpsLevel(nal) else nal
+                if (nal.isNotEmpty() && (nal[0].toInt() and 0x1F) == 7) {
+                    if (SPS_LEVEL_FORCE != null) patchSpsLevelForExperiment(nal) else patchSpsLevel(nal)
+                } else {
+                    nal
+                }
             packed.write((out.size ushr 24) and 0xFF)
             packed.write((out.size ushr 16) and 0xFF)
             packed.write((out.size ushr 8) and 0xFF)
@@ -401,7 +409,10 @@ class VideoSender(
         framesSent++
         framesSinceKeepAlive++
         bytesSinceKeepAlive += plain.size.toLong()
-        if (keyFrame || framesSent <= 3 || framesSent % 150 == 0L) {
+        // 不能按 keyFrame 无条件打——编码器 I 帧 1 秒一个，等于每秒刷屏（且 2MB 日志
+        // 轮转会冲掉关键证据，2026-10-26 两次实测）。前 3 帧 + 每 300 帧（30fps 下
+        // 每 10s）打一条
+        if (framesSent <= 3 || framesSent % 300 == 0L) {
             log("VIDEO: 帧 #$framesSent ${plain.size}B${if (keyFrame) " (key)" else ""} 已发送")
         }
     }
@@ -595,6 +606,27 @@ private const val TARGET_LEVEL_IDC = 40
  * 动机：奥迪 DELPHI 解码器对 level 3.1/3.2 的流静默不渲染（TCP 照收、会话正常、
  * 车机黑屏；2026-10-22 奥迪 0628 真机日志：同机 level=40 全部成功、level=32 首例黑屏）。
  */
+/**
+ * SPS level 实验开关（2026-10-25，8015 不切屏排查）：
+ *  - null = 不干预（编码器自选——MEIZU 对 1412x654@30 自报 4.0，无法产生低 level 流）
+ *  - 非 null = 强制把 level_idc 写成该值（csd 与关键帧内嵌 SPS 双端），隔离
+ *    「车机解码器对 level 4.0 不消费」假设。当前 32 = 强制 3.2 实验。
+ */
+private val SPS_LEVEL_FORCE: Int? = null
+
+/**
+ * 实验用 level 改写（[SPS_LEVEL_FORCE] 非空时把 level_idc 强制写成该值）。
+ * 与 [patchSpsLevel] 的「只升不降」不同——本函数是**双向强制**（实验要产生
+ * 低 level 流，验证车机解码器对 level 4.0 的消费行为）。
+ */
+internal fun patchSpsLevelForExperiment(sps: ByteArray): ByteArray {
+    val target = SPS_LEVEL_FORCE ?: return sps
+    if (sps.size < 4) return sps
+    val patched = sps.copyOf()
+    patched[3] = target.toByte()
+    return patched
+}
+
 internal fun patchSpsLevel(sps: ByteArray): ByteArray {
     if (sps.size < 4) return sps
     val current = sps[3].toInt() and 0xFF

@@ -47,7 +47,10 @@ UserService 子进程持有，**父应用卸载后该进程仍存活**，4 块�
 
 **发布（GitHub Release）**：
 ```bash
-# 1) 改 app/build.gradle.kts 的 appVersionName（versionCode 自动推导）
+# 1) 改 app/build.gradle.kts 的 appVersionName（versionCode 自动推导）。
+#    版本号四段制（2026-10-25 起）：主.次.修订.内部号——内部测试只递增第 4 位
+#    （0.1.28.1 → 0.1.28.2）；对外发布升第 3 位、第 4 位归 0（0.1.29.0），
+#    首页等对外位置经 BuildConfig.DISPLAY_VERSION 显示三段（0.1.29）。
 # 2) 用正式密钥构建（需仓库根目录有 keystore.properties + .jks，均已 gitignore）
 ./gradlew :app:assembleStandardRelease
 # 3) 验证签名的 CN 不是 "Android Debug"（必须是自己的证书，见下）
@@ -71,6 +74,11 @@ keystore 与密码只存本地/密码管理器：私钥泄露 = 任何人可签�
 私钥丢失 = 已安装用户再也收不到更新。证书 SHA-256 指纹写进 Release 备注，
 便于用户核对下载完整性。
 
+**测试分级（2026-10-26 用户约定）**：非协议相关改动（UI/文案/设置项/日志格式等）
+  跑单测时用 `-Dtest.quick=true` **跳过重放测试**（BtLinkReplay/TunnelReplay/
+  ForbiddenAudiReplay，一轮要 4 分多钟）；只有协议层（iap2/airplay/video/audio/
+  Iap2LinkEngine 等）改动才需要全量含重放。远程/装机验证流程同理：先 quick 筛一遍，
+  验证通过后再补全量。
 **提交**：pre-commit 钩子（`.githooks/pre-commit`，经 `core.hooksPath` 启用；克隆后需
 执行一次 `git config core.hooksPath .githooks`）会自动格式化暂存的 kt/kts 并跑
 `lintDebug`，失败即拦截。存量 lint 问题豁免在 `app/lint-baseline.xml`——新代码引入
@@ -474,13 +482,39 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   「未连接」，反而掩盖真实状态。诊断日志：`BT-PROFILE: 连接前…的蓝牙配置文件状态=`。
 - **Shell 命令**：参数用 `shellQuote`（单引号转义）；查 WiFi 开关/当前 SSID 用一次
   `cmd wifi status`（勿用「任意 WiFi 即成功」的盲绑判定——手机连着别的 WiFi 时会误判）。
-  **无互联网热点：默认走应用专属网络，不再系统级入网**（2026-10-18 定谳）：
+  **无互联网热点：默认走应用专属网络，不再系统级入网**（2026-10-18 定谳；
+  **2026-10-25 方案 C 修正「specifier 被静默路径架空」**）：
   `WifiNetworkSpecifier`（`WifiCarPlayConnector.joinCarPlayNetwork`）加入车机热点——
   网络只对本进程可见（系统侧 `Ephemeral: true` + `OwnerUid=本应用`），**不进系统已保存
   网络、不成为默认网络**，其它应用继续走 4G/5G。实测（荣耀 + Redmi K40 + DiPlay）：
   `cmd wifi list-networks` 无该 SSID（返回 0）、`Active default network` 仍是蜂窝、
   推流期间 `ping baidu.com` 0 丢包。顺带解决三个老问题：系统 watchdog 不再切回原
   WiFi；不需要 Shizuku 也能自动加入；不会因「已连接无互联网」被 ROM 连带关掉移动数据。
+  **曾被静默路径架空（2026-10-25 定谳「WiFi 自动断开」根因）**：端点先到的入网入口
+  `joinCarWifi` 曾是「Shizuku 就绪 → 静默 connect-network 优先」（为绕 specifier 强制
+  弹窗），而 Shizuku 就绪是隐形屏模式硬前置 ⇒ specifier 事实永不出场；系统级入网把
+  热点存进系统 + 顶掉当前 WiFi + 默认网变成无互联网热点 → ROM（荣耀 WLAN+）自动断开/
+  切回有网网络 = 用户看到的「WiFi 自动断开」；且存过的 SSID 毒化之后所有 specifier
+  请求（永久 pending）→ 永远走系统级的恶性循环（荣耀日志 21:53~21:54 实录）。
+  **方案 C 现状**：全部入网入口 specifier 优先（含 0x5703 主路径 autoJoinCarWifi——
+  2026-10-25 二次修正：只改端点先到的 joinCarWifi 不够，autoJoin 里还有一段静默优先，
+  荣耀实测「连上又切回 CMCC」正是它）；静默 connect-network 降为兜底（覆盖用户拒
+  specifier 弹窗、WEP 两场景）。**「清除/保留」弹窗绝不在连接关键路径上**（三次修正
+  2026-10-25 晚：挂在 specifier 入口实测阻塞 3.4s，6318 连接失败回归的成分之一——
+  现只挂在 promptSpecifierFailed 失败分支）。「保留」例外只认用户选择
+  （`wifi_net/user_kept` 持久化）：旧判据「系统里已存在」会把自己遗留的保存当用户
+  意愿——静默路径存的网络因 force-stop 没走到会话末清理时，例外让毒化**自延续**。
+  来历不明的保存（存在但非用户保留）保守不删；两条 connect-network 路径（静默/深度
+  兜底）都在命令 ok 瞬间登记会话末 forget。另：**「已保存 SSID → specifier 必挂起」
+  并非普适**（荣耀存过 netId 69/63 依然 0.8s 入网），挂起只是部分 ROM 形态。
+- **保活等待必须监听 mDNS 发现（2026-10-25 奥迪 6318「连不上」定谳）**：晚武装车机
+  （6318 实测入网后 **+88s** 才广播 `_airplay._tcp`、15s 后又消失）在旧「每 8s 拆链
+  重试」循环里天然能接住；改成「无新凭据不拆链、保活等待」后，等待任务只轮询 WiFi/
+  等 0x4301，**对 mDNS 发现无反应**——日志实录「21:02:32 NSD 发现 10.174.189.1:7000
+  → 无人消费 → 21:03:34 车机拆 BT」。修法：`watchForPendingStartSession` 每 5s 检查
+  「当前网==0x5703 下发的 SSID 且浏览器发现 `_airplay._tcp`」→ 立即以发现端点重走
+  onCarPlayEndpoint（不需用户确认）。**把「拆链重试」改成「保活等待」类优化时，
+  必须清点旧循环隐式提供的重试触发源**（mDNS 发现、热点出现等事件钩子）。
   **迁移坑**：旧版本用 `cmd wifi connect-network` 存过热点，只要还在系统配置里系统就
   会自动全局连接——加入前先 `cmd wifi list-networks` 查同 SSID，**命中则弹窗询问用户
   是否清除，绝不擅自删除**（保留是正当需求：用户可能就想用系统自动连、或车机热点
@@ -797,6 +831,22 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   建隧道」结论存疑，动隧道前先真车 A/B。
   ④ 两车成功路径全是 **IPv6 link-local :7000** + pair-verify + MFi（标准 MODERN 形态，
   无特殊协议）；SETUP 应答可无 streamID（我们只读 dataPort 天然兼容）。
+- **sysdiagnose 里的 iAP2 帧级证据在 `crashes_and_spins/accessoryd-packets-*.log.ips`**
+  （2026-10-24）：accessoryd 的抓包文件——hex 载荷 + 运输层标注（Bluetooth Classic /
+  AirPlay）+ 方向（Acc=车机发 / iPod=手机发），**unified log 里没有 iAP2 帧**，别再从
+  airplayd 挖。`FF 55 02 00 EE 10` = control=0xEE 的 DETECT 探测包。文件名时间戳是
+  会话起点、内容滚动覆盖到抓包时刻，按行内时间过滤。
+- **8015 不切屏根因 = 半移交态：BT 不拆 + 探测不应答（2026-10-24/25 定谳，§13c）**：
+  三方对照（同车同手机）——0.1.0 无 AirPlay iAP2 链+BT 保持 → 出画面 10s 拆；真 iPhone =
+  AirPlay 链上**逐条应答车机 marker**、**94ms 拆 BT（首帧前 83ms）**、车机随后自发 SYN →
+  稳定；0.1.37 链建成（我方 FF5A 升级**强行发起**，非车机应答 DETECT）但 BT 全程保持、
+  探测零应答 → **车机 HMI 卡半移交态**（入口置灰直到重启）。模型：车机只在「WiFi 侧
+  iAP2 会话存在」时进入移交态，完成条件=「探测被应答+BT 释放」。0.1.39 落地：
+  `armMib3` 发 DETECT 后**立即** `detachBtForMib3Handoff`（RECORD 前，保证 BT 先于首帧
+  落下；不得挂链 NORMAL——那里与 videoSender.isRunning 竞态会整场静默跳过）+ 逐条回
+  marker（CLASSIC_MIB3）+ onEnded 复位豁免/重启 server/停音频 + AUTO_START 会话中短路。
+  两条被推翻：iPhone **每条 marker 都回 DETECT**；「车机 SYN 由 BT DETACH 触发」不成立
+  （0.1.37 BT 在挂时链照样建成）——SYN 与 HMI 是两层状态机。
 - **车机画像（ReceiverProfile）：版本/能力信号统一收口**（2026-10-20）：`iap2/ReceiverProfile`
   纯函数聚合三处信号——0x1D01 身份+收/发双清单、mDNS features/srcvers——产出
   era（三时代）/wifiGen（新旧 WiFi 协议）判定，**依据随日志输出**（`PROFILE:` 行，
@@ -907,6 +957,27 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   序号）。两条踩坑：**裸 ACK 会与 SYN|ACK 撞号**（故主机路径只回 SYN|ACK，Audi
   帧序随之从「裸 ACK+SYN|ACK」变为单帧，需复测）；**不能对所有带 SYN 位的帧都回**
   （会与对端的 SYN|ACK 形成无限乒乓，单测曾因此空转 55 秒，只有 `jstack` 能看出）。
+- **会话中音频路由被蓝牙设备抢占 → 推静音流（2026-10-26 荣耀+6318 定谳）**：耳机
+  （X7e）或车机 A2DP 回连后，手机媒体输出切去蓝牙，AudioPlaybackCapture 采不到
+  （诊断行「采集样本 非零0%」持续）、推给车机的就是静音流——用户报「车机没声音了」，
+  极易误判为音频协商问题。自愈（0.1.28.5）：采集全零 + MediaSessionsState 确认有
+  应用在播 → `BtProfiles.connectedAudioDevices` 枚举并断开全部音频类蓝牙设备
+  （每会话 ≤5 次、间隔 ≥30s）——路由回落本地后采集自动恢复。会话期间音频本就该
+  走 WiFi 的 AirPlay，任何蓝牙音频接收端都是抢占方。
+- **手动断开后立即重连必走二轮（2026-10-26 6318 日志定谳，非回归）**：手动断开
+  （突关 RFCOMM）后车机有 ~25-30s 的清理/闭锁期——期间接受 BT 链路与识别、但
+  **不理 0x5702**；车机自身 ~15s 链路看门狗拆掉第一轮（expectOrNull 经
+  `!channel.isAlive` 提前返回），第二轮（3s 后）秒答 0x5703。0.1.13 同场景同形态
+  （它也是等链路死再重走）。处置：接受二轮（总计 ~20s 连上）；想一轮连成，断开后
+  等 ≥30s 再连。改这里的耐心没用——拆链是车机干的。
+- **0x4E0D（WirelessCarPlayUpdate，u8=1）必须在设备状态问候里发**（2026-10-26
+  奥迪 6318 定谳，0.1.28.3 修复）：0.1.37 按「iPhone 不发 4E0D」对齐 8015 抓包时把它
+  删了——6318 随即**完全连不上**：车机不武装 AirPlay 栈（`_airplay._tcp` 零广播、
+  0x4301 零下发、ctrl invite 永不到来），而 WiFi 入网/ctrl 注册侧一切正常，极易误判成
+  网络/mDNS 问题。铁证：车机自己的 0x1D01 可收清单（7 项）**就声明了 0x4e0d**。
+  恢复一行即修复（真机 A/B：恢复后 BT 连上 → 1 分钟内视频/触摸/仪表盘全通）。
+  **§9i 教训升级：「某台车的 iPhone 抓包不发 X」只对那台车成立**——删任何消息字段前，
+  先查目标车机的可收清单里有没有声明它；声明过的，删前必须真车 A/B。
 - **车机如何识别我们的字段，一律不许"照 catplay 抄"**（2026-10-19 奥迪 0.1.7 回归
   定谳，`docs/PROTOCOL-NOTES.md` §9i）：把 ctrl TXT 的 `srcvers` 从 `950.7.1` 改成
   catplay 的 `566.25.21`、实例名 `sender` → `iPhone` 之后，同一台 Audi MMI 3315

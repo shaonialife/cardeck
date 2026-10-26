@@ -211,10 +211,20 @@ class VirtualIap2LinkTest {
             h.link.setGeneration(generation)
             h.link.armMib3()
             val detect = h.controlSent.size
-            // 第 1 个：还不判定（车机会再发探测重发）
+            // 第 1 个：CLASSIC_MIB3 按 iPhone 抓包逐条回 DETECT（半移交模型：
+            // 「探测被应答」是移交完成的一半条件，sysdiagnose 2026-10-16）；
+            // EVENT_LINK 维持旧行为不回应
             h.link.onCarBytes(Iap2LinkEngine.MARKER)
-            assertEquals("$generation 首个 marker 不应额外发字节", detect, h.controlSent.size)
-            // 第 2 个：升级为 marker + 会话表
+            if (generation == ReceiverProfile.LinkGeneration.CLASSIC_MIB3) {
+                assertEquals(
+                    "$generation 首个 marker 必须回一条 DETECT（对齐真 iPhone）",
+                    detect + 1,
+                    h.controlSent.size,
+                )
+            } else {
+                assertEquals("$generation 首个 marker 不应额外发字节", detect, h.controlSent.size)
+            }
+            // 第 2 个：升级为 marker + 会话表（车机不自发 SYN 时的兜底路径）
             h.link.onCarBytes(Iap2LinkEngine.MARKER)
             assertTrue(
                 "$generation 第 2 个 marker 必须触发协商字节（0.1.17 证伪「忽略」路线）",

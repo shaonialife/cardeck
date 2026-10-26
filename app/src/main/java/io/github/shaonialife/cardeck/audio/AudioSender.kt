@@ -112,6 +112,12 @@ class AudioSender(
     private var thread: Thread? = null
     private var syncThread: Thread? = null
 
+    /**
+     * 采集诊断发现全零时的嫌疑回调（宿主侧核「确有应用在播」后再断开蓝牙音频
+     * 设备回收路由——采集约每 14s 一次诊断采样，宿主有自己的节流）。
+     */
+    var onRouteHijackSuspect: (() -> Unit)? = null
+
     /** AAC-LC 编码器（仅 [AudioCodec.AAC_LC] 时创建）。 */
     private var aacEncoder: AacLcEncoder? = null
 
@@ -452,6 +458,11 @@ class AudioSender(
                         "AUDIO: 采集样本 seq=$sequence 非零$percent% 峰值=$peak" +
                             if (peak == 0) "（⚠ 全零：捕获不到音频——app 可能禁止播放捕获或音频走了蓝牙）" else "",
                     )
+                    // 全零即通知宿主做路由抢占判定（宿主侧再核「确有应用在播」，
+                    // 避免把「没放歌的正常静音」误判成抢占）
+                    if (peak == 0) {
+                        onRouteHijackSuspect?.invoke()
+                    }
                 }
 
                 // PCM 通路：采一段 = 发一包；AAC 通路：喂一帧 PCM，编码器可能吐出 0~N 帧

@@ -105,12 +105,30 @@ class CarPlayService : Service() {
         // WiFi 连接器、mDNS 广播器都在 ensureSessionObjects 里），再走与首页按钮相同的流程。
         // 放后台线程：冷启动时 ensure 要读偏好/绑定 UserService，别压在服务主线程上。
         if (intent?.action == ACTION_AUTO_START_SESSION) {
+            // 会话活跃时短路：自动连接的 ACL 信号可能滞后/重复（移交拆链后的回弹、
+            // 会话中车机 HFP 抖动），此时再跑 startConnection 会重启被移交刻意停掉的
+            // server 监听、暴露「车机回连挂第二条 BT 链」的风险面
+            if (SessionController.isSessionRunning()) {
+                fileLog("AUTO: 会话已在进行——忽略本次「上车自动启动」")
+                return START_STICKY
+            }
             fileLog("SVC: 收到「上车自动启动」——拉起会话")
             val app = applicationContext
             Bg.run("auto-session-start") {
                 SessionController.ensure(app)
-                // 自动连接默认带声音：先静默领取投屏令牌；失败退回只推视频
-                SessionController.audioEnabledForSession = acquireProjectionSilently()
+                // 自动连接默认带声音（先静默领取投屏令牌；失败退回只推视频）——
+                // 但用户在「启动连接」弹窗里明确选过「仅视频」时尊重其选择
+                // （2026-10-25 测试者反馈：选仅视频后被自动连接覆盖成带声音）
+                val prefs = app.getSharedPreferences("settings", MODE_PRIVATE)
+                val userDeclinedAudio =
+                    prefs.getBoolean("audio_user_pref_set", false) &&
+                        !prefs.getBoolean("audio_user_pref", true)
+                if (userDeclinedAudio) {
+                    fileLog("AUTO: 用户偏好仅推视频——本次自动连接不带声音")
+                    SessionController.audioEnabledForSession = false
+                } else {
+                    SessionController.audioEnabledForSession = acquireProjectionSilently()
+                }
                 SessionController.startConnection(app)
             }
         }

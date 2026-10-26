@@ -447,13 +447,20 @@ class Iap2SenderSessionTest {
             }
         }
 
-        /** 设备状态问候五连（0x4E0D/0x4E0A/0x4E09/0x4E0B/0x4E0C）。 */
+        /**
+         * 设备状态问候：**4E0D（无线能力声明 u8=1）打头**——6318 定谳（2026-10-26）：
+         * 不发它车机不武装 AirPlay 栈（车机自己的可收清单里就声明了 0x4e0d）；
+         * 其后按 iPhone 抓包顺序 4E0C → A100 → 4E0B → 4E0A → 4E09 → FFFA → FFF0。
+         */
         private fun expectDeviceStateGreetings() {
             expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
+            expect(Iap2MessageIds.DEVICE_UUID_UPDATE)
+            expect(0xA100)
+            expect(Iap2MessageIds.DEVICE_TIME_UPDATE)
             expect(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE)
             expect(Iap2MessageIds.DEVICE_INFORMATION_UPDATE)
-            expect(Iap2MessageIds.DEVICE_TIME_UPDATE)
-            expect(Iap2MessageIds.DEVICE_UUID_UPDATE)
+            expect(0xFFFA)
+            expect(0xFFF0)
         }
 
         /** 0x1D01 的 name（奥迪/宝马/CT5 形态用真实车机名，MFi 记忆与画像键才一致）。 */

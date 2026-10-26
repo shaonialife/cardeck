@@ -69,6 +69,24 @@ object BtProfiles {
         }
 
     /**
+     * 当前经音频类配置文件（HFP/A2DP/LE_AUDIO）在线的全部设备。
+     * 用途：会话中「采集全零但媒体在播」的音频路由抢占回收——断开后媒体输出
+     * 回落本地，AudioPlaybackCapture 才采得到（2026-10-26 荣耀实测：耳机抢占
+     * A2DP 后推给车机的是静音流）。**必须在后台线程调用**（proxy 阻塞等回调）。
+     */
+    fun connectedAudioDevices(context: Context): List<BluetoothDevice> =
+        profiles
+            .flatMap { id ->
+                val p = proxy(context, id) ?: return@flatMap emptyList<BluetoothDevice>()
+                try {
+                    @Suppress("DEPRECATION")
+                    p.connectedDevices
+                } catch (_: Throwable) {
+                    emptyList()
+                }
+            }.distinctBy { runCatching { it.address }.getOrNull() }
+
+    /**
      * 尽力断开该设备的全部配置文件连接。
      *
      * @return 断开前在线的配置文件（空 = 本来就没连接，无需任何动作）

@@ -199,6 +199,10 @@ class VirtualIap2Link(
             mib3Armed = true
             sendControlIap(Iap2LinkEngine.MARKER)
             log("IAPLINK: MIB3 detect 已发（控制通道 iAPSendMessage，代际=$generation）——等待车机")
+            // 半移交顺序（见 onMib3HandoffReady）：DETECT 发出即拆 BT——iPhone 的 BT
+            // 在车机 SYN 与首帧视频之前就已落下；拖到链 NORMAL 再拆会错过车机 HMI
+            // 的早期激活窗口（审查定谳：原时点还与 videoSender.isRunning 存在竞态）
+            onMib3HandoffReady?.invoke()
         }
     }
 
@@ -238,6 +242,18 @@ class VirtualIap2Link(
     var onControlSessionComplete: (() -> Unit)? = null
 
     /**
+     * MIB3 无线移交启动（armMib3 发出 DETECT 后立即触发，仅控制通道形态）。
+     * **半移交模型（2026-10-24 抓包对照定谳）**：车机只在「WiFi 侧 iAP2 会话存在」时
+     * 进入无线移交态，该态以「探测被应答 + BT 释放」为完成条件——0.1.0 无 WiFi 侧会话
+     * 所以画面照切；0.1.37 会话建成但 BT 不拆、探测零应答，HMI 卡死到重启车机。
+     * 真 iPhone 的可观察顺序（sysdiagnose 2026-10-16 17:31）：marker 应答 → 94ms 内
+     * 拆 BT → 车机 8ms 后自发 SYN → 0x1D00。宿主据此**在 RECORD 之前**拆 BT，
+     * 保证 BT 在首帧视频前已落下（若车机因此不自发 SYN，marker 计数升级协商仍是兜底）。
+     * 不适用于 TCP 隧道形态（DiPlay 见 RFCOMM 断开即拆整轮栈）。
+     */
+    var onMib3HandoffReady: (() -> Unit)? = null
+
+    /**
      * 开一轮控制通道协商：marker + 本表同步包（会话 10/11/12），刷新引擎重发节拍。
      */
     private fun startControlRoundLocked(reason: String) {
@@ -264,6 +280,17 @@ class VirtualIap2Link(
             if (isMarker && tunnelWriter() == null) {
                 if (mib3Armed) {
                     mib3MarkerIgnores++
+                    // iPhone 行为（sysdiagnose 2026-10-16 17:31:49.921）：车机每条
+                    // marker 同毫秒回一条 DETECT。半移交模型里「探测被应答」是移交
+                    // 完成的一半条件（另一半是 BT 释放，见 onMib3HandoffReady）。
+                    // 经控制通道回（MIB3 不读事件通道出站，Frida/HondaHFT 定谳）。
+                    // 仅 CLASSIC_MIB3：EVENT_LINK（Honda）维持既有「计数→升级协商」。
+                    if (generation == ReceiverProfile.LinkGeneration.CLASSIC_MIB3) {
+                        sendControlIap(Iap2LinkEngine.MARKER)
+                        if (mib3MarkerIgnores <= 3 || mib3MarkerIgnores % 20 == 0) {
+                            log("IAPLINK: 车机 marker（#$mib3MarkerIgnores）——已回 DETECT（对齐真 iPhone）")
+                        }
+                    }
                     val now = nowMillis()
                     when (generation) {
                         // 2026-10-23 定谳：**所有代际都必须完成链路协商**。曾按「奥迪忽略
@@ -309,7 +336,9 @@ class VirtualIap2Link(
                                     )
                                 }
                                 return
-                            } else if (mib3MarkerIgnores <= 3) {
+                            } else if (mib3MarkerIgnores <= 3 &&
+                                generation != ReceiverProfile.LinkGeneration.CLASSIC_MIB3
+                            ) {
                                 log("IAPLINK: 车机 marker（#$mib3MarkerIgnores）——凑够 $EVENT_LINK_MARKER_THRESHOLD 个后补发协商")
                             }
                         }
@@ -780,7 +809,14 @@ class VirtualIap2Link(
             WIRELESS_SESSION_ID,
             Iap2Csm.param(0, sessionId.toByteArray(Charsets.UTF_8)),
         )
-        sendCsmLocked(AUX_STATUS_NOTIFICATION, Iap2Csm.param(0x0006, ByteArray(0)))
+        // 0xA100 车辆状态能力：iPhone 只声明参数 6（sysdiagnose 2026-10-16 17:31:51.099，
+        // `a1 00 00 04 00 06`）。旧「3 参数（3/6/9）」源自 Frida 抓包，与 iPhone 抓包矛盾
+        // ——按本车族 iPhone 实测对齐；车机对 3 参数形态也会回 A101(6)，但少声明我们
+        // 永不推送的状态类型更贴近真实语义
+        sendCsmLocked(
+            AUX_STATUS_NOTIFICATION,
+            Iap2Csm.param(0x0006, ByteArray(0)),
+        )
         sendCsmLocked(
             DEVICE_LANGUAGE,
             Iap2Csm.param(0, "zh".toByteArray(Charsets.UTF_8)),
@@ -947,9 +983,13 @@ class VirtualIap2Link(
                     "0004000200088002000000fa000400040008800400000014",
             )
 
-        /** 0xFFF0 GPRMCDataStatusValuesNotification。 */
+        /**
+         * 0xFFF0 GPRMCDataStatusValuesNotification。
+         * iPhone 真车抓包（2026-10-21 14:23:23.621）：**18B、3 个空参数（id 0/1/2）**——
+         * 旧常量 14B/2 参数（缺 `00 04 00 02`），字节级不一致。
+         */
         internal val MIB3_GPRMC_DATA_STATUS: ByteArray =
-            hex("4040000efff00004000000040001")
+            hex("40400012fff0000400000004000100040002")
 
         /** 0x5001 NowPlayingUpdate 空态（无媒体/无播放）。 */
         internal val MIB3_NOW_PLAYING_UPDATE_IDLE: ByteArray =
