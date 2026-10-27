@@ -1102,7 +1102,11 @@ class VirtualIap2Link(
          * （参考默认 + DiPlay 32 + AUDI5163 32 三方一致）。车机记忆命中仍可覆盖。
          */
         fun tunnelMfiBaselineFor(identity: String): List<Int> {
-            val id = identity.lowercase()
+            // 空格归一化后匹配：0x1D01 的 model 实际形态是 "AUDI 3260"（带空格），
+            // 首版只匹配无空格 "audi3260" 而漏判——6318 走了默认 32 优先，32B 挑战
+            // 触发车机 166ms 拆链（2026-10-27 07:15 实测；同车 BT 侧 20B 秒答）。
+            // 身份类字符串匹配必须先与日志实际值核对（同 0x4E0D/0x4E0E 换算教训）。
+            val id = identity.lowercase().replace(" ", "").replace("_", "")
             return if (id.contains("delphi") && id.contains("audi3260")) {
                 listOf(20, 32, 16)
             } else {

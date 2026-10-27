@@ -1797,12 +1797,10 @@ object SessionController {
         // MFi 挑战后 180ms 拆掉整条 AirPlay 会话（EVENT reset → 六档音频全败 →
         // 推流中止），此前的成功历史全部在「不拆 BT」形态。白名单外一律不拆
         // （保留蓝牙双链），验证过的车型再进白名单。
-        val identity = btReceiverIdentity.lowercase()
-        if (!identity.contains("audi 5163") &&
-            !identity.contains("audi5163") &&
-            !identity.contains("audi 5810") &&
-            !identity.contains("audi5810")
-        ) {
+        // 空格/下划线归一化后匹配（identity 实际形态如 "Audi_MMI_6318 AUDI 3260
+        // DELPHI"——分隔符形态随机型而异，见 tunnelMfiBaselineFor 的漏判教训）
+        val identity = btReceiverIdentity.lowercase().replace(" ", "").replace("_", "")
+        if (!identity.contains("audi5163") && !identity.contains("audi5810")) {
             appendLog(
                 "IAPLINK: 移交拆 BT 跳过——车型不在白名单（identity=${btReceiverIdentity.take(40)}），保留蓝牙双链",
             )
