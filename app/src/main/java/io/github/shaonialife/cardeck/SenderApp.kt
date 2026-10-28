@@ -48,6 +48,30 @@ open class SenderApp : Application() {
             },
             packageFilter,
         )
+        // Rust 协议库（cardeck-protocol）安全加载：失败只记日志，不影响任何现有功能。
+        // 这里不能用 SessionController.appendLog——它要等 ensure() 设过 appContext 才写文件，
+        // 而本任务可能在 MainActivity 之前就跑完（表现：日志里完全没有 RUST 行）。
+        io.github.shaonialife.cardeck.util.Bg.run("rust-load") {
+            val line =
+                try {
+                    val bridge = io.github.shaonialife.cardeck.protocol.NativeBridge
+                    if (bridge.ensureLoaded()) {
+                        // 顺手验一遍固件原语：marker 判定 + 校验和 + 参数名查表
+                        val marker = byteArrayOf(0xFF.toByte(), 0x55, 0x02, 0x00, 0xEE.toByte(), 0x10)
+                        val detect = bridge.nativeIap2IsDetectMarker(marker, marker.size)
+                        val sum = bridge.nativeIap2Checksum(marker, 5, 0)
+                        val p6 = bridge.nativeIdentificationParamName(6)
+                        "RUST: ✓ ${bridge.nativeVersion()}（${bridge.nativeHello()}；" +
+                            "固件原语 detect=$detect sum=$sum p6=$p6）"
+                    } else {
+                        "RUST: ⚠ cardeck_protocol 未加载"
+                    }
+                } catch (t: Throwable) {
+                    "RUST: ⚠ 原生入口异常：$t"
+                }
+            DebugFileLog.append(this, line)
+            Log.i(TAG, line)
+        }
     }
 
     companion object {
