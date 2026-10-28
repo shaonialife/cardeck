@@ -60,4 +60,12 @@ object NativeBridge {
 
     /** 0x1D01 识别帧的参数名（固件查表；未知参数返回 "Unknown"）。 */
     external fun nativeIdentificationParamName(paramId: Int): String?
+
+    /**
+     * 固件自己的链路层 SYN 协商默认参数（16 字节 / 4 个 u32 槽位）。
+     *
+     * iAP2 链路建立的第一个字节级契约。之前 Kotlin 侧是按对照实现抄的常量，
+     * 现在直接用 accessoryd 里的值。
+     */
+    external fun nativeIap2SynParamDefaults(): ByteArray?
 }

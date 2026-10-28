@@ -61,8 +61,12 @@ open class SenderApp : Application() {
                         val detect = bridge.nativeIap2IsDetectMarker(marker, marker.size)
                         val sum = bridge.nativeIap2Checksum(marker, 5, 0)
                         val p6 = bridge.nativeIdentificationParamName(6)
+                        val syn =
+                            bridge
+                                .nativeIap2SynParamDefaults()
+                                ?.joinToString("") { "%02x".format(it) }
                         "RUST: ✓ ${bridge.nativeVersion()}（${bridge.nativeHello()}；" +
-                            "固件原语 detect=$detect sum=$sum p6=$p6）"
+                            "固件原语 detect=$detect sum=$sum p6=$p6 syn=$syn）"
                     } else {
                         "RUST: ⚠ cardeck_protocol 未加载"
                     }
