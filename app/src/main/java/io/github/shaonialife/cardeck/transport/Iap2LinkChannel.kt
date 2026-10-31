@@ -96,6 +96,7 @@ class Iap2LinkChannel(
         if (useNativeEngine) {
             // 出帧：Rust 协议层 → RFCOMM 写
             NativeBridge.nativeSetTransport(
+                handle,
                 object : NativeBridge.TransportSender {
                     override fun send(bytes: ByteArray) {
                         dumpOutbound(bytes)
@@ -113,6 +114,7 @@ class Iap2LinkChannel(
             // Rust 端到端处理，不进 recvControl 队列；0x1D01 本体仍转发——
             // 会话层要从里面取身份文本/EA 协议表，但不再回 0x1D02）
             NativeBridge.nativeSessionSetEventSink(
+                handle,
                 object : NativeBridge.EventSink {
                     override fun onEvent(
                         msgId: Int,

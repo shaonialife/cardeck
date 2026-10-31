@@ -1562,7 +1562,7 @@ class AirPlayClient(
     // 复用 [io.github.shaonialife.cardeck.iap2.Iap2LinkEngine] 完成握手与帧收发。
 
     @Volatile
-    private var iapLink: VirtualIap2Link? = null
+    private var iapLink: NativeTunnelIap2Link? = null
 
     /**
      * 车机媒体键回调（方向盘/面板的上一曲、下一曲）。
@@ -1617,22 +1617,16 @@ class AirPlayClient(
         return mib3ControlSessionDone
     }
 
-    /** 虚拟链路唯一实例（出站路由/三形态语义见 [VirtualIap2Link]）。 */
-    private fun obtainIapLink(): VirtualIap2Link =
+    /** 隧道链路唯一实例（原生会话薄层，协议行为全在 cardeck-protocol）。 */
+    private fun obtainIapLink(): NativeTunnelIap2Link =
         iapLink ?: synchronized(this) {
             iapLink
-                ?: VirtualIap2Link(
+                ?: NativeTunnelIap2Link(
                     log = { line -> log(line) },
                     sendEventIap = ::sendIap,
                     sendControlIap = ::postControlIap,
                     tunnelWriter = { iapTunnel },
                     alive = { socket?.isClosed == false },
-                    // MFi 长度记忆必须持久化：缺 context 时记忆只在进程内存活，
-                    // 冷启动即清零 → 基线 20B 排第一 → DiPlay（只认精确 32B，
-                    // 长度不符直接断链）每次冷启动首连必断、二连才成
-                    // （2026-10-26 17:38 实测定谳）。带上后每台车只在记忆空白
-                    // 的第一次付一次试错代价。
-                    mfiContext = context,
                 ).also {
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
                     it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
@@ -1641,7 +1635,6 @@ class AirPlayClient(
                         onTunnelControlSessionComplete?.invoke()
                     }
                     it.onMib3HandoffReady = { onMib3HandoffReady?.invoke() }
-                    it.begin()
                     iapLink = it
                 }
         }
@@ -1666,8 +1659,6 @@ class AirPlayClient(
         // modesChanged 重申与资源仲裁（全 200、modes 干净）。剩「协商完成抑制切屏」
         // 这一条：0.1.12 切屏窗口恰在协商完成之前。
         if (MIB3_TUNNEL_ARM_ENABLED) {
-            val generation = linkGeneration ?: ReceiverProfile.LinkGeneration.EVENT_LINK
-            obtainIapLink().setGeneration(generation)
             obtainIapLink().armMib3()
             mib3LinkArmed = true
         } else {
@@ -1725,7 +1716,8 @@ class AirPlayClient(
                 }
             } catch (error: IOException) {
                 log("IAPLINK: 控制通道 POST 失败 - ${error.message}")
-                iapLink?.markLinkBroken()
+                iapLink?.close()
+                iapLink = null
             }
         }
     }
@@ -2585,7 +2577,8 @@ class AirPlayClient(
                     log("EVENT: 读取结束 - ${error.message}")
                     // 事件通道断开 = 整条会话将拆：虚拟链路的 MFi 静默计时必须停
                     // （断链≠静默，防止把该车所有挑战档位污染成快速跳过）
-                    iapLink?.markLinkBroken()
+                    iapLink?.close()
+                    iapLink = null
                 }
             }, "event-reader").apply {
                 isDaemon = true

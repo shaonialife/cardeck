@@ -82,7 +82,10 @@ object NativeBridge {
     external fun nativeSessionPeerMaxControl(handle: Long): Int
 
     /** 事件汇：每条完整会话消息（含被 Rust handler 消费的）镜像给 Kotlin。 */
-    external fun nativeSessionSetEventSink(sink: EventSink)
+    external fun nativeSessionSetEventSink(
+        handle: Long,
+        sink: EventSink,
+    )
 
     /**
      * 启动 Phase-1 编排线程（识别→MFi→问候→WiFi→CarPlay 会话，全固件真身）。
@@ -94,6 +97,20 @@ object NativeBridge {
         bluetoothMac: String,
     )
 
+    /** 隧道模式编排（车机发起型：mode 1=DiPlay、2=MIB3、3=现代隧道）。 */
+    external fun nativeSessionFlowStartTunnel(
+        handle: Long,
+        mode: Int,
+        deviceName: String,
+        bluetoothMac: String,
+    )
+
+    /** 裸 CSM 分发（DiPlay type-130 隧道：入站即完整会话消息，无链路封装）。 */
+    external fun nativeSessionDispatchRaw(
+        handle: Long,
+        bytes: ByteArray,
+    ): Int
+
     /** 事件回调：msgId = iAP2 消息 ID（0x1D01/0x5703/0x4301…），bytes = 完整 40 40 帧。 */
     interface EventSink {
         fun onEvent(
@@ -103,7 +120,10 @@ object NativeBridge {
     }
 
     /** 注册传输出口（Rust 协议层的 bt_write 落地）。 */
-    external fun nativeSetTransport(sender: TransportSender)
+    external fun nativeSetTransport(
+        handle: Long,
+        sender: TransportSender,
+    )
 
     /** 传输出口回调接口：Rust 协议层出帧 → Kotlin RFCOMM 写。 */
     interface TransportSender {

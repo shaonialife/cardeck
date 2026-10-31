@@ -1,6 +1,5 @@
 package io.github.shaonialife.cardeck.iap2
 
-import io.github.shaonialife.cardeck.airplay.VirtualIap2Link
 import io.github.shaonialife.cardeck.protocol.NativeBridge
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import java.io.IOException
@@ -188,6 +187,30 @@ class Iap2SenderSession(
 
         /** 挑战档位（长度, 首次试探窗口）：顺序与窗口由 DiPlay/Audi 双端实测决定。 */
         private val MFI_ATTEMPTS = listOf(32 to 3_000L, 20 to 6_000L, 16 to 3_000L)
+
+        /** 0xA100 VehicleStatusUpdate（问候序第 2 条，引擎路径用）。 */
+        const val AUX_STATUS_NOTIFICATION = 0xA100
+
+        /** 0xFFFA StartLocationInformation（逐字节常量，MIB3 真机抓包）。 */
+        val MIB3_START_LOCATION_INFORMATION: ByteArray =
+            hex(
+                "40400032fffa00080000000000140004000100088001000000fa" +
+                    "0004000200088002000000fa000400040008800400000014",
+            )
+
+        /** 0xFFF0 GPRMCDataStatusValuesNotification（18B、3 个空参数）。 */
+        val MIB3_GPRMC_DATA_STATUS: ByteArray =
+            hex(
+                "40400012fff0000400000004000100040002",
+            )
+
+        private fun hex(s: String): ByteArray {
+            val digits = "0123456789abcdef"
+            val clean = s.replace(" ", "")
+            return ByteArray(clean.length / 2) { i ->
+                ((digits.indexOf(clean[i * 2]) shl 4) or digits.indexOf(clean[i * 2 + 1])).toByte()
+            }
+        }
 
         /** 真车系接收端特征（0x1D01 name/model/manufacturer 子串，小写比对）。 */
         private val LEGACY_RECEIVER_MARKERS = listOf("audi", "delphi", "mib", "harman", "porsche")
@@ -915,7 +938,7 @@ class Iap2SenderSession(
         send(Iap2MessageIds.DEVICE_UUID_UPDATE, Iap2Csm.string(0, deviceUuid()))
         // A100 车辆状态能力：真机 3 个空参数（id 3/6/9），旧实现只发 id=6
         send(
-            VirtualIap2Link.AUX_STATUS_NOTIFICATION,
+            AUX_STATUS_NOTIFICATION,
             Iap2Csm.param(0x0003, ByteArray(0)) +
                 Iap2Csm.param(0x0006, ByteArray(0)) +
                 Iap2Csm.param(0x0009, ByteArray(0)),
@@ -934,8 +957,8 @@ class Iap2SenderSession(
         send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
         send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
         // FFFA/FFF0：真机在 BT 链路也发（旧实现只在隧道突发里发）
-        sendRaw(VirtualIap2Link.MIB3_START_LOCATION_INFORMATION)
-        sendRaw(VirtualIap2Link.MIB3_GPRMC_DATA_STATUS)
+        sendRaw(MIB3_START_LOCATION_INFORMATION)
+        sendRaw(MIB3_GPRMC_DATA_STATUS)
         log(
             "iap2 tx=4e0c/a100/4e0b/4e0a/4e09/fffa/fff0 设备状态问候（真机顺序）" +
                 "（name=$deviceName mac=$bluetoothMac）",
