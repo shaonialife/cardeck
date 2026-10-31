@@ -1,6 +1,7 @@
 package io.github.shaonialife.cardeck.iap2
 
 import io.github.shaonialife.cardeck.airplay.VirtualIap2Link
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import java.io.IOException
 import java.security.SecureRandom
@@ -210,11 +211,21 @@ class Iap2SenderSession(
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
 
         // ---- 识别 ----
-        send(Iap2MessageIds.START_IDENTIFICATION)
+        // 原生链：0x1D00 发起 / 0x1D01 解析接受 / 0x1D02 应答全部在 Rust
+        // 固件真身内完成（链路就绪即自动触发）；会话层只从镜像事件取
+        // 0x1D01 本体做身份文本/EA 协议表提取。引擎路径（JVM 单测）：
+        // 保留旧发送序列。
+        if (!channel.runsNative) {
+            send(Iap2MessageIds.START_IDENTIFICATION)
+        }
         val identification = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         logIdentification(identification)
-        send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
-        log("iap2 tx=0x1d02 identification-accepted")
+        if (!channel.runsNative) {
+            send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
+            log("iap2 tx=0x1d02 identification-accepted")
+        } else {
+            log("iap2 0x1d01 handled natively (0x1d02 sent by rust)")
+        }
 
         // EA 协议解析（启动时机见下方 MFi 完成后——2026-10-11 DiPlay 实测：
         // 认证前发 0xEA00 会让测试台状态机停摆，不再回 0xAA01；奥迪对此不敏感）
@@ -230,6 +241,25 @@ class Iap2SenderSession(
         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
+        // 挑战长度终局判定（固件逻辑，Rust 真身）：对端证书 X.509 版本号
+        // → 20B/32B/16B。证书不可解析（返回 -1）时回落 legacyCar/记忆基线。
+        // 这一步取代了「按车机记忆试探」的原始形态——长度由对端证书本身决定。
+        val certSize =
+            if (NativeBridge.ensureLoaded()) {
+                NativeBridge
+                    .nativeMfiChallengeSizeForCertificate(certificate.body, false)
+                    .also {
+                        log(
+                            if (it > 0) {
+                                "iap2 固件判定挑战长度=${it}B（证书版本推导，Rust 真身）"
+                            } else {
+                                "iap2 固件无法解析对端证书——回落记忆/基线顺序"
+                            },
+                        )
+                    }
+            } else {
+                -1
+            }
         // 挑战长度按接收端身份选择（2026-10-11 奥迪字节级实测修正）：
         //  - 真车系（Audi/Delphi MIB 等）：**20B 首试**。真 iPhone 实录（carplay-wifi-extractor
         //    client）与 catplay 发送端都用 20B；奥迪对 20B 秒答。32B 先行会导致车机
@@ -237,7 +267,7 @@ class Iap2SenderSession(
         //    32B→20B 的会话全部卡死，20B→（记忆命中）的会话全部秒通。
         //  - 测试台 DiPlay（Carlinkit AuthV3 EC 身份）：**只接受精确 32B**，长度不符直接断链。
         // 全部无应答也不中止——我们不校验签名（0xAA05 自报），由 0x5702 是否应答判定放行。
-        runMfiChallenge(deadline, prefer20First = legacyCar, receiverKey = identityText)
+        runMfiChallenge(deadline, prefer20First = legacyCar, receiverKey = identityText, certSize = certSize)
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 authentication-succeeded（自报）")
 
@@ -606,20 +636,50 @@ class Iap2SenderSession(
         deadline: Long,
         prefer20First: Boolean = false,
         receiverKey: String,
+        certSize: Int = -1,
     ) {
-        val baselineLengths =
+        val baselineLengths0 =
             if (prefer20First) {
                 listOf(MFI_ATTEMPTS[1].first, MFI_ATTEMPTS[0].first, MFI_ATTEMPTS[2].first)
             } else {
                 MFI_ATTEMPTS.map { it.first }
             }
+        // 固件判定（对端证书版本推导）优先：命中时判定长度排首，**记忆的
+        // 「成功档」不再参与排序**（2026-10-27 用户定下「不用记忆或轮换测试」；
+        // 2026-10-30 装机首测：判定 20B 被记忆 32B 覆盖——已修正）。
+        // 唯一例外 = **链路级硬拒证据**（rejected 集）：对端真的断过链的长度
+        // 不能再当首选（判定 20B 首发即遭 DiPlay 断链——Apple 规则对真车
+        // 成立，但模拟器/非标 auth 芯片可偏离；硬拒是链路级事实，优先于
+        // 固件规则，否则该接收端永久 20B 死循环）。判定未命中（-1）时
+        // 维持旧版全流程。
         val windowOf = MFI_ATTEMPTS.associate { it.first to it.second }
         val memory = MfiLengthMemory.load(context, receiverKey)
-        val order = MfiLengthMemory.orderAttempts(baselineLengths, memory)
-        if (!memory.isEmpty) {
+        val certWins =
+            certSize in MFI_ATTEMPTS.map { it.first } && certSize !in memory.rejected
+        val baselineLengths =
+            if (certWins) {
+                listOf(certSize) + baselineLengths0.filter { it != certSize }
+            } else {
+                baselineLengths0
+            }
+        val order =
+            if (certWins) {
+                baselineLengths
+            } else {
+                MfiLengthMemory.orderAttempts(baselineLengths, memory)
+            }
+        if (certWins) {
+            log("iap2 MFi 固件定序 ${order.joinToString("/")}B（证书判定 ${certSize}B 首位）")
+        } else if (!memory.isEmpty) {
+            val why =
+                if (certSize in memory.rejected) {
+                    "判定 ${certSize}B 曾被该接收端链路级拒收，降位"
+                } else {
+                    "证书不可解析"
+                }
             log(
                 "iap2 MFi 按车机记忆（$receiverKey）：${MfiLengthMemory.describe(memory)}" +
-                    " → 本轮顺序 ${order.joinToString("/")}B",
+                    "（$why）→ 本轮顺序 ${order.joinToString("/")}B",
             )
         }
         for ((position, size) in order.withIndex()) {

@@ -45,7 +45,7 @@ class BtLinkReplayTest {
     ) {
         val tag = "${fixture.car}#${round.index}(${round.outcome})"
         val stream = ScriptedCarStream(round.rx)
-        val channel = Iap2LinkChannel(stream, name = "replay-${fixture.name}") { }
+        val channel = Iap2LinkChannel(stream, name = "replay-${fixture.name}", useNativeEngine = false) { }
         val endpointSeen = CountDownLatch(1)
         val session =
             Iap2SenderSession(

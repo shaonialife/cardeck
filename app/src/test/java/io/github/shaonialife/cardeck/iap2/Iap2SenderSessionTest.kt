@@ -19,8 +19,8 @@ class Iap2SenderSessionTest {
     @Test
     fun fullBringUpAgainstMockAccessory() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory = MockAccessory(accessoryChannel)
 
         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
@@ -57,8 +57,8 @@ class Iap2SenderSessionTest {
     @Test
     fun lateStartSessionAfterPhaseOneTriggersEndpointUpdate() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory = MockAccessory(accessoryChannel, shape = MockAccessory.Shape.AUDI_9310, lateStartSession = true)
 
         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
@@ -108,8 +108,8 @@ class Iap2SenderSessionTest {
     @Test
     fun newProtocolCarWithoutCredentialsKeepsLinkForLateStartSession() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory =
             MockAccessory(
                 accessoryChannel,
@@ -165,8 +165,8 @@ class Iap2SenderSessionTest {
     @Test
     fun sparseDeclarationsStillSendWifiRequest() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory = MockAccessory(accessoryChannel, shape = MockAccessory.Shape.AUDI_3315)
 
         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
@@ -201,8 +201,8 @@ class Iap2SenderSessionTest {
     @Test
     fun fullDeclarationsWithoutOldProtocolSkipWifiRequest() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory = MockAccessory(accessoryChannel, shape = MockAccessory.Shape.BMW_ID9)
 
         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
@@ -261,8 +261,8 @@ class Iap2SenderSessionTest {
     @Test
     fun nulPaddedAddressesAreStrippedCompletely() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory = MockAccessory(accessoryChannel, padAddresses = true)
 
         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
@@ -297,8 +297,8 @@ class Iap2SenderSessionTest {
     @Test
     fun slowWifiConfigurationTriggersResends() {
         val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone", useNativeEngine = false)
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory", useNativeEngine = false)
         val accessory = MockAccessory(accessoryChannel, slowWifi = true)
 
         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
