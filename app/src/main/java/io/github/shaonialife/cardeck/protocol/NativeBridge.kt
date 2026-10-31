@@ -84,6 +84,16 @@ object NativeBridge {
     /** 事件汇：每条完整会话消息（含被 Rust handler 消费的）镜像给 Kotlin。 */
     external fun nativeSessionSetEventSink(sink: EventSink)
 
+    /**
+     * 启动 Phase-1 编排线程（识别→MFi→问候→WiFi→CarPlay 会话，全固件真身）。
+     * 通道创建后立即调；结果经 EventSink：-1=WiFi 凭据、-2=端点、-3=Phase-1 完成。
+     */
+    external fun nativeSessionFlowStart(
+        handle: Long,
+        deviceName: String,
+        bluetoothMac: String,
+    )
+
     /** 事件回调：msgId = iAP2 消息 ID（0x1D01/0x5703/0x4301…），bytes = 完整 40 40 帧。 */
     interface EventSink {
         fun onEvent(

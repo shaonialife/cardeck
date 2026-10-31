@@ -30,10 +30,34 @@ class Iap2LinkChannel(
 ) : Closeable {
     val isAlive: Boolean get() = !terminated
 
+    /** 编排事件：WIFI=-1、ENDPOINT=-2、PHASE1_DONE=-3（Rust session_flow 发）。 */
+    data class FlowEvent(
+        val id: Int,
+        val bytes: ByteArray,
+    )
+
+    /** 启动原生 Phase-1 编排线程（识别→MFi→问候→WiFi→端点，全固件真身）。 */
+    fun startFlow(
+        deviceName: String,
+        bluetoothMac: String,
+    ) {
+        check(handle != 0L) { "flow start on dead channel" }
+        NativeBridge.nativeSessionFlowStart(handle, deviceName, bluetoothMac)
+    }
+
+    /** 取下一个编排事件；超时返回 null。 */
+    fun pollFlowEvent(timeoutMillis: Long): FlowEvent? =
+        try {
+            flowEvents.poll(timeoutMillis, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            null
+        }
+
     /** true = 原生会话（识别链 Rust 端到端）；false = JVM 单测引擎路径。 */
     val runsNative: Boolean get() = useNativeEngine
     private val lock = Object()
     private val controls = LinkedBlockingQueue<ByteArray?>()
+    private val flowEvents = LinkedBlockingQueue<FlowEvent>()
     private val readyLatch = CountDownLatch(1)
 
     @Volatile
@@ -98,8 +122,11 @@ class Iap2LinkChannel(
                         log(
                             "LINK msg: id=0x${"%04x".format(msgId)} len=${bytes.size}",
                         )
-                        if (msgId == 0x1D00 || msgId == 0x1D02) return // Rust 端到端，会话层无感
-                        controls.offer(bytes)
+                        when (msgId) {
+                            0x1D00, 0x1D02 -> return // Rust 端到端，会话层无感
+                            -1, -2, -3 -> flowEvents.offer(FlowEvent(msgId, bytes))
+                            else -> controls.offer(bytes)
+                        }
                     }
                 },
             )
