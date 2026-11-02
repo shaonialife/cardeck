@@ -27,7 +27,7 @@ plugins {
 //    已装用户可直接覆盖升级。
 //  - CI（`.github/workflows/android-ci.yml`）传 `-Pcardeck.buildNumber=<run_number>`
 //    时，构建号**顶替第 4 位**（0.1.28.57），无需往仓库写提交。
-val appVersionName = "0.1.28.13"
+val appVersionName = "0.1.28.24"
 val versionParts =
     appVersionName.split(".").map { part ->
         part.toIntOrNull() ?: error("appVersionName 必须是数字点分（收到 \"$part\"）")
@@ -37,18 +37,6 @@ check(versionParts.size == 4) {
 }
 val versionBase = versionParts[0] * 10_000 + versionParts[1] * 100 + versionParts[2]
 val appVersionCode = versionBase * 100_000 + versionParts[3]
-
-/**
- * 对外展示版本：第 4 位为 0（正式版）时只取前三段，否则四段全显。
- * 经 `BuildConfig.DISPLAY_VERSION` 暴露给 UI（首页底部版本信息等对外的位置）；
- * 诊断类展示（日志导出、桥 hello）仍用完整 VERSION_NAME（含 flavor 后缀）。
- */
-val displayVersionName =
-    if (versionParts[3] == 0) {
-        versionParts.take(3).joinToString(".")
-    } else {
-        appVersionName
-    }
 
 /**
  * 预发布构建号（CI 每次推送传 `-Pcardeck.buildNumber=<run_number>`）。
@@ -76,6 +64,23 @@ val effectiveVersionName =
         "${versionParts.take(3).joinToString(".")}.$buildNumber"
     }
 val effectiveVersionCode = versionBase * 100_000 + (buildNumber ?: versionParts[3])
+
+/**
+ * 对外展示版本：第 4 位为 0（正式版）时只取前三段，否则四段全显。
+ * CI 构建号（[buildNumber]）顶替第 4 位时展示同样跟随——否则界面版本
+ * 会永远停在 [appVersionName] 静态值，与系统应用信息里的版本脱节
+ * （0.1.28.20 装机时界面仍显示 0.1.28.16 的教训，2026-11-02）。
+ * 经 `BuildConfig.DISPLAY_VERSION` 暴露给 UI（首页底部版本信息等对外的位置）；
+ * 诊断类展示（日志导出、桥 hello）仍用完整 VERSION_NAME（含 flavor 后缀）。
+ */
+val displayVersionName =
+    if (buildNumber != null) {
+        effectiveVersionName
+    } else if (versionParts[3] == 0) {
+        versionParts.take(3).joinToString(".")
+    } else {
+        appVersionName
+    }
 
 /**
  * 发布签名配置：从仓库外的 `keystore.properties` 读取（已在 .gitignore 排除）。

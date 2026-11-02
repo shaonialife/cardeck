@@ -1,7 +1,5 @@
 package io.github.shaonialife.cardeck.iap2
 
-import java.io.ByteArrayOutputStream
-
 /**
  * iAP2 控制会话（CSM）分帧与 TLV 参数体编解码。
  *
@@ -23,20 +21,6 @@ object Iap2Csm {
         override fun equals(other: Any?): Boolean = other is Frame && other.messageId == messageId && other.body.contentEquals(body)
 
         override fun hashCode(): Int = messageId * 31 + body.contentHashCode()
-    }
-
-    fun encode(
-        messageId: Int,
-        body: ByteArray = ByteArray(0),
-    ): ByteArray {
-        require(messageId in 0..0xFFFF) { "messageId must fit u16" }
-        require(body.size <= MAX_FRAME_BYTES - HEADER_BYTES) { "body too large" }
-        val out = ByteArray(HEADER_BYTES + body.size)
-        writeU16(out, 0, START)
-        writeU16(out, 2, out.size)
-        writeU16(out, 4, messageId)
-        body.copyInto(out, HEADER_BYTES)
-        return out
     }
 
     /** 增量解析器：喂入任意分片的 CSM 字节流，弹出完整帧。 */
@@ -88,72 +72,6 @@ object Iap2Csm {
         override fun hashCode(): Int = id * 31 + value.contentHashCode()
     }
 
-    fun param(
-        id: Int,
-        value: ByteArray,
-    ): ByteArray {
-        require(id in 0..0xFFFF) { "paramId must fit u16" }
-        val out = ByteArray(4 + value.size)
-        writeU16(out, 0, out.size)
-        writeU16(out, 2, id)
-        value.copyInto(out, 4)
-        return out
-    }
-
-    fun u8(
-        id: Int,
-        value: Int,
-    ): ByteArray = param(id, byteArrayOf(value.toByte()))
-
-    fun u16(
-        id: Int,
-        value: Int,
-    ): ByteArray = param(id, byteArrayOf((value ushr 8).toByte(), value.toByte()))
-
-    fun u32(
-        id: Int,
-        value: Long,
-    ): ByteArray =
-        param(
-            id,
-            byteArrayOf(
-                (value ushr 24).toByte(),
-                (value ushr 16).toByte(),
-                (value ushr 8).toByte(),
-                value.toByte(),
-            ),
-        )
-
-    fun string(
-        id: Int,
-        value: String,
-    ): ByteArray {
-        val nul: Char = 0.toChar()
-        require(nul !in value) { "NUL-terminated string must not contain U+0000" }
-        return param(id, value.encodeToByteArray() + byteArrayOf(0))
-    }
-
-    fun u16List(
-        id: Int,
-        values: IntArray,
-    ): ByteArray {
-        val out = ByteArray(values.size * 2)
-        values.forEachIndexed { index, value ->
-            out[index * 2] = (value ushr 8).toByte()
-            out[index * 2 + 1] = value.toByte()
-        }
-        return param(id, out)
-    }
-
-    fun group(
-        id: Int,
-        vararg children: ByteArray,
-    ): ByteArray {
-        val output = ByteArrayOutputStream()
-        children.forEach(output::write)
-        return param(id, output.toByteArray())
-    }
-
     fun parseParams(body: ByteArray): List<Param> {
         val params = ArrayList<Param>()
         var offset = 0
@@ -170,15 +88,6 @@ object Iap2Csm {
         bytes: ByteArray,
         offset: Int,
     ): Int = ((bytes[offset].toInt() and 0xFF) shl 8) or (bytes[offset + 1].toInt() and 0xFF)
-
-    private fun writeU16(
-        bytes: ByteArray,
-        offset: Int,
-        value: Int,
-    ) {
-        bytes[offset] = (value ushr 8).toByte()
-        bytes[offset + 1] = value.toByte()
-    }
 }
 
 fun Iap2Csm.Param.asString(): String? =

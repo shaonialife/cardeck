@@ -1,18 +1,30 @@
 package io.github.shaonialife.cardeck.airplay
 
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 
 /**
- * AirPlay 计时服务（NTP over RTCP，对照 catplay clock/timing_server.rs + rtcp_timesync.rs）。
+ * AirPlay 计时服务（timing UDP 泵——**字节域已移交 Rust 固件逆向实现**，
+ * Kotlin 只剩 socket 编排）。
  *
- * 初始 SETUP 通告本端口（timingPort）；车机（媒体时钟主）向它发 32 字节 timesync 请求，
- * 我们按 NTP 语义应答：t1=回显请求 t3（客户端发送时刻）、t2=本地接收时刻、t3=本地发送时刻。
- * 缺失时序：此前通告 timingPort=0，车机无法与我们同步媒体时钟——屏幕流 SETUP 被 400 的
- * 头号嫌疑（catplay 真车实现始终绑定真实端口）。
+ * 协议真相（固件直切，docs/FIRMWARE-LINK-AUDIT.md §10.35/§10.36/§10.39）：
+ * - 双变体：经典 NTP 48B（[0x23]=LI0/VN4/Mode3）+ RTCP 32B
+ *   （[80 D2 00 07] 请求 / [80 D3 00 07] 应答）——`fw::airplay::ntp`
+ * - 应答：origin=请求 transmit、receive=到达（SocketGetPacketUpTicks）、
+ *   transmit=发送前（mach_absolute_time）、stratum=1、precision=
+ *   `1-bitlen(tps)`（fw: _NTPClockCreate @0x19293f574-b4）、refID="XNU1"
+ * - 时间换算：秒 = upTicks/tps + epoch（NTP 1900 纪元偏移）、
+ *   分数 = 余<<32/tps（fw: @0x192867a70-aa0）——宿主 tps = 10⁹
+ *   （System.nanoTime 纳秒直接作 upTicks）；**ntpFromNanos 保留为
+ *   AudioSender 的 RTP 时间戳格式化垫片**（同一固件公式 @0x192867a7c-84
+ *   的 Kotlin 算术形，非独立协议决策）
  *
- * 线格式（大端）：[0x80][pt][length=7][rtp_ts=0][t1(8)][t2(8)][t3(8)]，
- * pt：0xD2 请求 / 0xD3 应答；时间 = NTP 64 位（秒<<32 | 2^32 分数），取自单调时钟。
+ * 宿主分工（M5.2 战役架构）：UDP socket/线程 = 本类；字节校验/应答构造
+ * = `NativeBridge.nativeAirplayTimingRespond`（纯函数，Rust 侧有全量测试）。
+ *
+ * 旧 catplay 对照实现（32B 硬编码 version/pt 校验、t2==t3、无 1900 纪元）
+ * 已删除——那不是固件语义。
  */
 class TimingServer(
     private val log: (String) -> Unit = {},
@@ -65,7 +77,16 @@ class TimingServer(
                 return // socket closed
             }
             val request = buffer.copyOfRange(0, packet.length)
-            val response = buildResponse(request, System.nanoTime())
+            val arrivalNanos = System.nanoTime()
+            // fw: 应答构造 = __NTPClockServerProcessPacket @0x1928677bc 直切
+            // （48B/32B 双变体、精确消费、错误码域——null = 非法请求）
+            val response =
+                NativeBridge.nativeAirplayTimingRespond(
+                    request,
+                    arrivalNanos,
+                    System.nanoTime(),
+                    System.currentTimeMillis() / 1000L,
+                )
             if (response == null) {
                 unexpected++
                 if (unexpected <= 5) {
@@ -87,39 +108,12 @@ class TimingServer(
     }
 
     companion object {
-        private const val PT_TIMESYNC_REQUEST: Byte = 0xD2.toByte()
-        private const val PT_TIMESYNC_RESPONSE: Byte = 0xD3.toByte()
-        private const val PACKET_BYTES = 32
-
         /**
-         * 构造 timesync 应答；非 timesync 请求返回 null。
-         * [nowNanos]：单调时钟当前值（System.nanoTime 语义，可为任意起点——NTP 差值计算只用相对量）。
+         * 单调纳秒 → NTP 64 位（秒<<32 | 分数），大端 8 字节。
+         * fw: `秒 = upTicks/tps + epoch`、`分数 = 余<<32/tps`
+         * （@0x192867a70-aa0 直切；epoch 由调用方语义决定——RTP 域取 0 基准，
+         * NTP 线域走 Rust 侧 [NativeBridge.nativeAirplayTimingRespond]）。
          */
-        fun buildResponse(
-            request: ByteArray,
-            nowNanos: Long,
-        ): ByteArray? {
-            if (request.size < PACKET_BYTES) return null
-            val version = (request[0].toInt() and 0xFF) shr 6
-            if (version != 2) return null
-            if (request[1] != PT_TIMESYNC_REQUEST) return null
-            val length = ((request[2].toInt() and 0xFF) shl 8) or (request[3].toInt() and 0xFF)
-            if (length != PACKET_BYTES / 4 - 1) return null
-
-            val response = ByteArray(PACKET_BYTES)
-            response[0] = (2 shl 6).toByte()
-            response[1] = PT_TIMESYNC_RESPONSE
-            response[2] = 0
-            response[3] = (PACKET_BYTES / 4 - 1).toByte()
-            // rtp_ts(4..8) = 0
-            System.arraycopy(request, 24, response, 8, 8) // t1 = 请求的 t3（ntp_xmit 回显）
-            val now = ntpFromNanos(nowNanos)
-            System.arraycopy(now, 0, response, 16, 8) // t2 = 接收时刻
-            System.arraycopy(now, 0, response, 24, 8) // t3 = 发送时刻
-            return response
-        }
-
-        /** 单调纳秒 → NTP 64 位（秒<<32 | (纳秒分数 * 2^32 / 1e9)），大端 8 字节。 */
         fun ntpFromNanos(nanos: Long): ByteArray {
             val secs = Math.floorDiv(nanos, 1_000_000_000L)
             val fracNanos = Math.floorMod(nanos, 1_000_000_000L)

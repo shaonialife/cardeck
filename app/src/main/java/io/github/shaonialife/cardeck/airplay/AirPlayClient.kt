@@ -9,9 +9,9 @@ import io.github.shaonialife.cardeck.audio.AudioTuning
 import io.github.shaonialife.cardeck.iap2.Iap2Csm
 import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
-import io.github.shaonialife.cardeck.iap2.ReceiverProfile
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.TcpLiveness
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import io.github.shaonialife.cardeck.util.DeviceIdentity
 import java.io.IOException
 import java.net.Inet6Address
@@ -34,12 +34,6 @@ class AirPlayClient(
     initialEndpoint: Iap2SenderSession.CarPlayEndpoint,
     private val log: (String) -> Unit,
     private val context: Context? = null,
-    /**
-     * 车机链路代际（蓝牙侧 0x1D01 画像判定，见 [ReceiverProfile.linkGenerationOf]）。
-     * 2026-10-23 二次定谳后仅用于日志——marker 协商策略全代际统一（不完成链路协商
-     * 车机 ~10s 拆链；切屏靠协商完成后的 modesChanged 重申）。
-     */
-    private val linkGeneration: ReceiverProfile.LinkGeneration? = null,
     /**
      * 配对窗口内的端点刷新器（每轮重试前调用，必须非阻塞）：返回并入 mDNS 新结果后的
      * 端点，null = 无新信息。Audi MIB3 的 `_airplay._tcp` 常在首次解析之后才上线，
@@ -120,6 +114,21 @@ class AirPlayClient(
      */
     @Volatile
     var pairingForbidden: Boolean = false
+
+    /** pair-setup M6 取得的接收端静态身份（fw: 配对库源，verify FindPeerEx 用）。 */
+    var setupReceiverIdentity: ReceiverIdentity? = null
+
+    /** pair-setup SRP 密码（车机侧展示的 PIN；null = Rust 回落 "3939"）。 */
+    var setupCodeOverride: String? = null
+
+    /**
+     * M5.2 Rust 会话句柄（runPairing 成功后存活——runSetup 沿用同一加密会话，
+     * fw: apsession 生命周期跨 control setup）。0 = 无 Rust 会话（走旧路径）。
+     */
+    private var controlSessionHandle: Long = 0L
+
+    /** Rust info 事件全量（runSetup 的 displays/HID/features 源）。 */
+    private var rustInfoEvent: org.json.JSONObject? = null
         private set
 
     /** 本轮是否真正开始过配对（TCP 连上过接收端）。DiPlay 断链 hack 的启用条件。 */
@@ -163,7 +172,7 @@ class AirPlayClient(
      * 先按 pre-HomeKit 车机走 `et=NONE`，若 SETUP 被拒且此前没试过配对，
      * 就补做一次 pair-setup/pair-verify 再 SETUP。TXT features 判断错误时不至于直接失败。
      */
-    fun retryWithPairing(windowMillis: Long = 30_000): PairVerifyClient.ControlKeys? {
+    fun retryWithPairing(windowMillis: Long = 30_000): ControlKeys? {
         pairingUnsupported = false
         close()
         log("AIRPLAY: 明文 SETUP 未通过——尝试加密升级（补做 HomeKit 配对）")
@@ -222,7 +231,7 @@ class AirPlayClient(
         return true
     }
 
-    fun runPairing(windowMillis: Long = PAIRING_WINDOW_MILLIS): PairVerifyClient.ControlKeys? {
+    fun runPairing(windowMillis: Long = PAIRING_WINDOW_MILLIS): ControlKeys? {
         pairingInProgress = true
         try {
             return runPairingLoop(windowMillis)
@@ -231,7 +240,7 @@ class AirPlayClient(
         }
     }
 
-    private fun runPairingLoop(windowMillis: Long): PairVerifyClient.ControlKeys? {
+    private fun runPairingLoop(windowMillis: Long): ControlKeys? {
         val identity = loadOrCreateIdentity()
         log("AIRPLAY: 控制器身份 pairingId=${identity.pairingId}")
         // 车机 AirPlay 窗口是「用户点车机上的手机图标 / 收到 ctrl 邀请后才开」的
@@ -259,139 +268,175 @@ class AirPlayClient(
                 continue
             }
             attemptedPairing = true
-            val transport = TlvTransport { path, body -> postPairing(path, body) }
-            try {
-                val setupStatus =
-                    try {
-                        PairSetupClient(identity, transport, log).run()
-                        null
-                    } catch (error: IOException) {
-                        val message = error.message.orEmpty()
-                        val forbidden = message.contains("403")
-                        if (forbidden) {
-                            pairSetupRejected = true
-                            pairingForbidden = true
+            // M5.2 会话泵：info → 配对全交换（M1-M6/M1-M4、CSeq、头集、密钥派生）
+            // 全在 Rust（fw: apsession_ensureConnectedInternal 直切）；
+            // Kotlin 只剩 TCP 读写 + 事件消费。
+            // peerKnown = fw: isPeerKnown——**我方配对库存有对端 LTPK** 的分支
+            // 语义。本会话 setup 完成（done）或 403（车机视 iAP2 信任为已配对）
+            // 才算已知；endpoint.publicKey 是车机自己的身份（0x4301 参数 4），
+            // 不是「车机已配对我们」的证据——误当 peerKnown 会跳过 pair-setup，
+            // 车机验 M3 签名无记录 → M4 空 type5（16:40 真机 121 次循环实证）。
+            val peerKnown =
+                if (setupReceiverIdentity != null || pairingForbidden) 1 else 0
+            // 配对码注入（§10.49：PIN 流接收端——features bit7/9 的车机走
+            // 「/pair-pin-start → 车机屏 PIN → 用户输入」固件流）。宿主数据
+            // 初值通路：files/pair_pin.txt 存在即读，**每次尝试都重读**——
+            // 车机屏弹出配对码后 adb 写入文件，下一次尝试即携带
+            // （adb: run-as io.github.shaonialife.cardeck sh -c 'echo -n 482613 > files/pair_pin.txt'）。
+            // 纯平台 IO，配对协议全在 Rust。null = 空透传（Rust 决定
+            // pin-start 或常量码回落）。
+            if (setupCodeOverride == null) {
+                runCatching {
+                    val dir = context?.filesDir ?: return@runCatching
+                    val pinFile = java.io.File(dir, "pair_pin.txt")
+                    if (pinFile.isFile) {
+                        val pin = pinFile.readText().trim()
+                        if (pin.isNotEmpty()) {
+                            setupCodeOverride = pin
+                            log("AIRPLAY: 已载入配对码注入（files/pair_pin.txt，${pin.length} 位）")
                         }
-                        val unsupported = PAIRING_UNSUPPORTED_STATUS.any { message.contains(it) }
-                        log(
-                            "AIRPLAY: pair-setup " +
-                                when {
-                                    forbidden -> "被 403 拒绝（车机不接受匿名配对——iAP2 已完成信任）→ 转已配对快路径"
-                                    unsupported -> "不被支持（$message）——该接收端是 pre-HomeKit 老车机，转明文会话"
-                                    else -> "失败（$message）"
-                                },
-                        )
-                        if (unsupported) {
-                            pairingUnsupported = true
-                            close()
-                            return null
-                        }
-                        if (forbidden) "403" else "failed"
                     }
-                // 403 后旧连接的状态机不可用：换全新连接走快路径
-                if (setupStatus == "403") {
-                    close()
-                    if (!ensureConnected(2_000)) continue
-                    val fastPathTransport = TlvTransport { path, body -> postPairing(path, body) }
-                    val receiverStaticKey = endpoint.publicKey?.let(::hexToBytes)
-                    val keys = PairVerifyClient(identity, fastPathTransport, log).run(receiverStaticKey)
-                    cipher = ControlCipher(keys.phoneReadKey, keys.phoneWriteKey)
-                    log("AIRPLAY: 控制通道加密已启用（已配对快路径）")
-                    // 认证缺口探针：iPhone 在 pair-verify 之后做两轮 /fp-setup（我们缺失）
-                    runCatching { probeFpSetup() }
+                }
+            }
+            val handle =
+                NativeBridge.nativeAirplayCreate(
+                    FLAGS_AIRPLAY_SENDER,
+                    identity.pairingId.toByteArray(),
+                    identity.privateKey,
+                    (android.os.Build.MODEL ?: "CarDeck").toByteArray(),
+                    peerKnown,
+                    setupCodeOverride?.toByteArray(),
+                )
+            if (handle == 0L) {
+                log("AIRPLAY: ⚠ 会话创建失败（so 未加载？）")
+                return null
+            }
+            try {
+                val keys = pumpPairingSession(handle, attempt)
+                if (keys != null) {
+                    // 句柄已存 controlSessionHandle——会话跨 runSetup 存活，不销毁
                     return keys
                 }
-                val receiverStaticKey = endpoint.publicKey?.let(::hexToBytes)
-                val keys = PairVerifyClient(identity, transport, log).run(receiverStaticKey)
-                // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
-                cipher = ControlCipher(keys.phoneReadKey, keys.phoneWriteKey)
-                log("AIRPLAY: 控制通道加密已启用")
-                // 认证缺口探针（见 probeFpSetup 注释）
-                runCatching { probeFpSetup() }
-                return keys
-            } catch (error: IOException) {
-                val message = error.message.orEmpty()
-                // verify/认证段的 403 与 pair-setup 403 同源（车机信任已建立），
-                // 见 pairingForbidden 注释：标记后主控不再断 BT / 不降级明文
-                if (message.contains("403")) pairingForbidden = true
-                log("AIRPLAY: 配对第 $attempt 次尝试失败 - $message")
-                if (PAIRING_UNSUPPORTED_STATUS.any { message.contains(it) }) {
-                    pairingUnsupported = true
-                    log("AIRPLAY: 接收端不提供 HomeKit 配对通道——停止重试，转明文会话（et=NONE）")
-                    close()
-                    return null
+            } finally {
+                // 失败路径才销毁（成功路径句柄移交 controlSessionHandle）
+                if (controlSessionHandle != handle) {
+                    NativeBridge.nativeAirplayDestroy(handle)
                 }
-                // 403 退避（真机抓包：车机首连被拒后需 18~20s 才进入可接受状态，
-                // 期间高频重试除徒增车机负载外可能一直重置其就绪状态机）；
-                // 其余失败维持快速轮询等端口开放
-                Thread.sleep(pairingRetryBackoffMs(message))
             }
+            // 403 退避（真机抓包：车机首连被拒后需 18~20s 才进入可接受状态）；
+            // 其余失败维持快速轮询等端口开放（连接策略层节奏，固件配对层单次）
+            if (pairingForbidden) Thread.sleep(pairingRetryBackoffMs("403"))
         }
         log("AIRPLAY: 配对最终失败（接收端 RTSP 无应答）")
         return null
     }
 
     /**
-     * /fp-setup 探针（2026-10-25，奥迪 8015/3315 不切屏排查）。
-     *
-     * **背景**：iPhone sysdiagnose（真车成功会话）显示 pair-verify 之后还有两轮
-     * `/fp-setup`：33B → **711B**（内含 607B MFi 证书 + 64B 挑战 + 64B 签名，
-     * iPhone 用 4 张 Apple MFi 根证书验签）→ 785B → 133B。车机首轮 403 正是拒在
-     * 这一步（`mfiAuthentication_AuthenticateEndpoint → 200403 Forbidden →
-     * Stage 1 failed → Activation Failed`）。我们从未发过这一步，SETUP/RECORD/
-     * 推流却全 200——车机很可能因此永不把会话当作「已认证 CarPlay」去显示。
-     *
-     * **本函数只是探针**：真实第 2 轮要用 Apple MFi 私钥对车机挑战签名，我们无法伪造。
-     * 目标 = 确认车机是否暴露 `/fp-setup`、接受哪种请求形态、返回什么。
-     * 按 catplay 接收端解析（`FairPlaySession::setup`：请求 16B、mode 在 `[14]`、
-     * 应答 142B、应答 mode 在 `[13]`）逐个 mode 试，全部打日志。
+     * 单连接上的会话泵：发 info/配对 M1，读循环喂 Rust，事件回调收尾。
+     * Rust 侧决策（fw: orchestrator）：403 → reconnectRequired（返回后由外层
+     * 重连重试）；完成 → ControlKeys（Control 双钥，fw: CreateEncryptionKeysForContext）。
      */
-    fun probeFpSetup() {
-        if (cipher == null) {
-            log("FP-SETUP: 跳过（未配对无加密通道）")
-            return
-        }
-        for (mode in 0..3) {
-            // 候选 A：FPLY + version + 01 + 01 + 000000 + len(0x10) + 0000 + mode + 00
-            val candidate =
-                byteArrayOf(
-                    0x46,
-                    0x50,
-                    0x4C,
-                    0x59,
-                    0x03,
-                    0x01,
-                    0x01,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x10,
-                    0x00,
-                    0x00,
-                    mode.toByte(),
-                    0x00,
-                )
-            try {
-                val (statusLine, body) = request("POST", "/fp-setup", candidate, timeoutMillis = 4_000)
-                log(
-                    "FP-SETUP: mode=$mode 请求 16B → [$statusLine] resp=${body.size}B" +
-                        if (body.isNotEmpty()) {
-                            " head=${body.take(32).joinToString(" ") { "%02x".format(it) }}"
-                        } else {
-                            ""
-                        },
-                )
-                if (statusLine.contains("200") && body.size >= 16) {
-                    log("FP-SETUP: ✓ 车机暴露 /fp-setup（mode=$mode）——可作为认证缺口修复的落点")
-                    return
+    private fun pumpPairingSession(
+        handle: Long,
+        attempt: Int,
+    ): ControlKeys? {
+        val client = socket ?: return null
+        client.soTimeout = 10_000
+        val input = client.getInputStream()
+        val output = client.getOutputStream()
+
+        fun drainAndWrite() {
+            // 泵出站 = 裸 RTSP 字节（Rust 已组好），直写 socket 不走 post() 的
+            // 协议组包路径（fw: HTTPConnection 写循环）
+            NativeBridge.nativeAirplayTakeOutbound(handle)?.let { bytes ->
+                synchronized(rtspWriteLock) {
+                    output.write(bytes)
+                    output.flush()
                 }
-            } catch (error: IOException) {
-                log("FP-SETUP: mode=$mode 失败 - ${error.message}")
+                log("AIRPLAY: pump tx ${bytes.size}B")
             }
         }
-        log("FP-SETUP: 四种 mode 均未得到 200——车机可能不暴露该端点（或需要特定期望形态）")
+        // fw: fetchInitialInfo 先行——配对 M1 等 info 事件后再发（Rust 会话机
+        // 按 ensureConnectedInternal 顺序推进，Kotlin 泵只搬字节）
+        NativeBridge.nativeAirplayInfo(handle)
+        drainAndWrite()
+        var pairingStarted = false
+        val buf = ByteArray(16 * 1024)
+        while (!cancelled) {
+            val n =
+                try {
+                    input.read(buf)
+                } catch (error: IOException) {
+                    log("AIRPLAY: 配对读断开（第 $attempt 次尝试）- ${error.message}")
+                    return null
+                }
+            if (n < 0) {
+                log("AIRPLAY: 配对连接被对端关闭（第 $attempt 次尝试）")
+                return null
+            }
+            val event = NativeBridge.nativeAirplayOnBytes(handle, buf.copyOf(n)) ?: continue
+            if (event.isEmpty()) continue
+            log("AIRPLAY: pump ev=$event")
+            drainAndWrite()
+            val json = org.json.JSONObject(event)
+            when (json.optString("type")) {
+                "info" -> {
+                    // info 已回复 → 顺序流转配对（fw: ensureConnectedInternal）
+                    if (!pairingStarted) {
+                        pairingStarted = true
+                        rustInfoEvent = json
+                        log("AIRPLAY: info deviceID=${json.optString("deviceID")}")
+                        NativeBridge.nativeAirplayStartPairing(handle)
+                        drainAndWrite()
+                    }
+                }
+                "pinRequired" -> {
+                    // fw: PerformSetup pending（§10.49）——/pair-pin-start 已发，
+                    // 车机屏应显示配对码；v1 无输入 UI，把码填进设备配置的
+                    // 配对码（setupCodeOverride）后重连，Rust 即直发 setup M1
+                    log("AIRPLAY: ⌨ /pair-pin-start 已发——请看车机屏幕上的配对码，填入设备配对码配置后重连")
+                    return null
+                }
+                "reconnectRequired" -> {
+                    // fw: 403 = 信任已建（SavePeer）→ 外层换新连接重试
+                    pairSetupRejected = true
+                    pairingForbidden = true
+                    log("AIRPLAY: pair-setup 被 403 拒绝（车机不接受匿名配对——iAP2 已完成信任）→ 转已配对快路径")
+                    return null
+                }
+                "done" -> {
+                    // fw: setup M6 产物（SavePeer 内容）+ Control 双钥
+                    json.optString("identifier", "").takeIf { it.isNotEmpty() }?.let { ident ->
+                        val pub = json.optString("pubkey", "")
+                        setupReceiverIdentity =
+                            ReceiverIdentity(
+                                ident,
+                                if (pub.isEmpty()) ByteArray(0) else hexToBytes(pub) ?: ByteArray(0),
+                            )
+                    }
+                    val write = hexToBytes(json.getString("writeKey")) ?: ByteArray(0)
+                    val read = hexToBytes(json.getString("readKey")) ?: ByteArray(0)
+                    // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
+                    cipher = ControlCipher(read, write)
+                    log("AIRPLAY: 配对完成（第 $attempt 次尝试），控制通道加密已启用")
+                    // M5.2：会话句柄存活跨 runSetup（fw: apsession 生命周期——
+                    // 控制建立/流 SETUP/事件通道全走同一加密会话）
+                    controlSessionHandle = handle
+                    // 认证缺口探针：iPhone 在 pair-verify 之后做两轮 /fp-setup（Stage C 移植中）
+                    return ControlKeys(write, read, ByteArray(0))
+                }
+                "error" -> {
+                    log("AIRPLAY: 会话事件错误（第 $attempt 次尝试）- ${json.optString("message")}")
+                    return null
+                }
+            }
+        }
+        return null
     }
+
+    // 单连接上的 pair-verify 尝试（原 runVerifyAttempt）：**已整体移入 Rust 会话泵**
+    // （M5.2：M1-M4/头集/密钥派生 = fw::airplay::session，Kotlin 只剩 TCP 泵）。
+    // 行为见 [pumpPairingSession] / [handleEvent]。
 
     /** 拉取并解析 /info（注意：接收端在活跃会话期间可能不应答）。 */
     fun fetchInfo(timeoutMillis: Int = 5_000): Map<*, *>? {
@@ -781,167 +826,171 @@ class AirPlayClient(
      * enabledFeatures=[]（视频管线未启用），随后的屏幕流 SETUP 被 400。
      * 清单对照 catplay（真车验证的发送端，含 viewAreas/uiContext 等视频必需项）。
      */
+    /**
+     * Rust 控制建立路径（M5.2 §10.25 换装）：nativeAirplaySetTimingPort →
+     * nativeAirplayControlSetup → 泵至 controlSetup 事件 → SetupInfo 组装
+     * （displays/HID 源 = Rust info 事件全解析）。
+     * 流 SETUP（'stup' /）由后续批接入（AudioSender 换装同批）。
+     */
+
+    /** ANNOUNCE 参数装配（fw: sdpsession_sendAnnounce @0x22779ddd4 宿主注入域——
+     *  uuid = 传输会话 UUID 首 8B BE、地址 = 本端 socket、键/IV = 随机 16B
+     *  base64（KeyHolder 数据面真身待接）、音频位 15 = 48kHz lpcm 16-bit
+     *  立体声（fw::airplay::asbd 表）、latency = 装机校准初值）。 */
+    private fun buildAnnounceParams(socket: java.net.Socket?): String {
+        val ia = (socket?.localSocketAddress as? java.net.InetSocketAddress)?.address
+        val ip = ia?.hostAddress?.replace("%.*".toRegex(), "") ?: "0.0.0.0"
+        val ip6 = ia is java.net.Inet6Address
+        val uuidU64 =
+            runCatching {
+                java.util.UUID
+                    .randomUUID()
+                    .toString()
+                    .replace("-", "")
+                    .take(16)
+                    .toLong(16)
+            }.getOrDefault(0L)
+        val rnd = java.security.SecureRandom()
+
+        fun b64(n: Int): String {
+            val b = ByteArray(n)
+            rnd.nextBytes(b)
+            return java.util.Base64
+                .getEncoder()
+                .encodeToString(b)
+        }
+        val params = org.json.JSONObject()
+        params.put("uuidU64", uuidU64)
+        params.put("localIp", ip)
+        params.put("ip6", ip6)
+        params.put("deviceName", android.os.Build.MODEL ?: "CarDeck")
+        params.put("audioFormatBit", 15)
+        params.put("authType", 8)
+        params.put("aesKeyB64", b64(16))
+        params.put("aesIvB64", b64(16))
+        // fw: 流字典 LatencyMin/LatencyMax（Int64）——初值装机校准
+        params.put("latencyMin", 512)
+        params.put("latencyMax", 2048)
+        return params.toString()
+    }
+
+    /** Rust 会话全连接序（fw: ensureConnectedInternal B 会话序直切——
+     *  control 'stup' → 流 'stup'（恒建对 Main=100/Alt=101，§10.38）→
+     *  'annc'（§10.41）→ 'rcrd' → recorded。事件泵 = OnBytes/TakeOutbound
+     *  单循环；无 Kotlin 回退（连接逻辑唯一来源 = 固件 Rust）。 */
+    private fun runSetupRust(handle: Long): SetupInfo? {
+        val socket = socket ?: return null
+        NativeBridge.nativeAirplaySetTimingPort(handle, timingServer.port)
+        val input = socket.getInputStream()
+        val output = socket.getOutputStream()
+
+        fun drainAndWrite() {
+            NativeBridge.nativeAirplayTakeOutbound(handle)?.let { bytes ->
+                synchronized(rtspWriteLock) {
+                    output.write(bytes)
+                    output.flush()
+                }
+                log("AIRPLAY: setup tx ${bytes.size}B")
+            }
+        }
+
+        // fw: requestControlSetupWithResponse——'stup' POST /setup
+        NativeBridge.nativeAirplayControlSetup(handle)
+        drainAndWrite()
+
+        var controlJson: org.json.JSONObject? = null
+        var streamIdx = 0
+        val buf = ByteArray(16 * 1024)
+        val deadline = System.currentTimeMillis() + 30_000
+        while (System.currentTimeMillis() < deadline && !cancelled) {
+            val n =
+                try {
+                    input.read(buf)
+                } catch (error: java.net.SocketTimeoutException) {
+                    continue
+                } catch (error: IOException) {
+                    log("AIRPLAY: Rust 连接序读断开 - ${error.message}")
+                    return null
+                }
+            if (n < 0) return null
+            val event = NativeBridge.nativeAirplayOnBytes(handle, buf.copyOf(n)) ?: continue
+            drainAndWrite()
+            if (event.isEmpty()) continue
+            val json = org.json.JSONObject(event)
+            when (json.optString("type")) {
+                "controlSetup" -> {
+                    controlJson = json
+                    // fw: 流序 SETUP→ANNOUNCE（sdpsession 域）——恒建对 Main/Alt
+                    NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":100}")
+                    drainAndWrite()
+                }
+                "streamSetup" -> {
+                    streamIdx++
+                    if (streamIdx == 1) {
+                        NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":101}")
+                        drainAndWrite()
+                    } else {
+                        // 流 SETUP 齐 → ANNOUNCE（§10.41 SDP 体）
+                        NativeBridge.nativeAirplayAnnounce(handle, buildAnnounceParams(socket))
+                        drainAndWrite()
+                    }
+                }
+                "announced" -> {
+                    NativeBridge.nativeAirplayRecord(handle)
+                    drainAndWrite()
+                }
+                "recorded" -> {
+                    val root = rustInfoEvent
+                    val displays = root?.optJSONArray("displays")
+                    val display = displays?.optJSONObject(0)
+                    val cj = controlJson
+                    if (cj == null) {
+                        log("AIRPLAY: recorded 但缺 controlSetup 事件")
+                        return null
+                    }
+                    val info =
+                        SetupInfo(
+                            eventPort = cj.optInt("eventPort"),
+                            timingPort = cj.optInt("timingPort"),
+                            keepAlivePort = cj.optInt("keepAlivePort").takeIf { it != 0 },
+                            enabledFeatures = emptyList(),
+                            displayWidth = (display?.optLong("widthPixels") ?: 1080L).toInt(),
+                            displayHeight = (display?.optLong("heightPixels") ?: 2320L).toInt(),
+                            displayUuid = display?.optString("uuid").orEmpty(),
+                            maxFps = (display?.optLong("maxFPS") ?: 30L).toInt(),
+                            hidDeviceUuids = emptyList(),
+                            hidDescriptors = emptyMap(),
+                            keepAliveSendStatsAsBody = false,
+                        )
+                    log(
+                        "AIRPLAY: ✓ 连接序完成（Rust 全链）eventPort=${info.eventPort} " +
+                            "timingPort=${info.timingPort} 流=$streamIdx " +
+                            "display=${info.displayWidth}x${info.displayHeight}",
+                    )
+                    return info
+                }
+                "error" -> {
+                    log("AIRPLAY: Rust 连接序错误 - ${json.optString("message")}")
+                    return null
+                }
+            }
+        }
+        log("AIRPLAY: Rust 连接序超时（phase=stream$streamIdx）")
+        return null
+    }
+
+    /** 连接入口——纯 Rust 驱动（Kotlin 旧路径已删：连接逻辑唯一来源 = 固件）。 */
     fun runSetup(): SetupInfo? {
-        // 计时端口：catplay 真车实现始终绑定真实 UDP timing server 通告给车机
-        // （媒体时钟同步源）；timingPort=0 曾是我们的屏幕流 400 头号嫌疑。
+        // 计时端口：车机（媒体时钟主）轮询我方 UDP timing server（§10.39）
         if (!timingServer.start()) {
             log("AIRPLAY: 计时服务未启动（继续，但媒体时钟无法同步）")
         }
-        val deviceId = setupDeviceId()
-        val body = buildSessionSetupBody(deviceId, timingServer.port, encrypted = cipher != null)
-        log(
-            "AIRPLAY: 初始 SETUP body=${body.size}B timingPort=${timingServer.port} " +
-                "deviceID=$deviceId 加密=${if (cipher != null) "是" else "否（et=NONE）"}",
-        )
-        val (statusLine, responseBody) =
-            try {
-                // 请求 URI 用相对路径 `/setup`（catplay AirPlayRtspClient::initial_setup 同款）：
-                // 部分老固件（210.81 时代）只认相对 URI，发绝对 `rtsp://host:port/` 会 404/400。
-                request(
-                    "SETUP",
-                    "/setup",
-                    body,
-                    contentType = "application/x-apple-binary-plist",
-                )
-            } catch (error: IOException) {
-                log("AIRPLAY: SETUP 失败 - ${error.message}")
-                return null
-            }
-        if (!statusLine.contains("200")) {
-            log("AIRPLAY: SETUP 应答 [$statusLine]（自报 deviceID=$deviceId）")
-            if (statusLine.contains("403")) {
-                // 403 的两类成因按可能性排序：设备过滤（WinPlay 等「只接受指定
-                // iPhone」）最常见，其次是接收端不接受的配对/信任状态。把本机
-                // 蓝牙地址直接打出来，用户对照接收端设置即可自查。
-                log(
-                    "AIRPLAY: 403 排查——接收端若启用了设备过滤，请在接收端选择本机蓝牙地址 " +
-                        "$deviceId" +
-                        if (deviceId == DeviceIdentity.PLACEHOLDER_MAC) {
-                            "（当前是占位值：未能解析真实蓝牙 MAC，Shizuku 是否就绪？）"
-                        } else {
-                            ""
-                        },
-                )
-            }
+        val handle = controlSessionHandle
+        if (handle == 0L) {
+            log("AIRPLAY: 无 Rust 会话（配对未完成？）")
             return null
         }
-        val root =
-            try {
-                BinaryPlist.parse(responseBody)
-            } catch (error: IllegalArgumentException) {
-                log("AIRPLAY: SETUP 应答 plist 解析失败（${responseBody.size} 字节）")
-                null
-            } as? Map<*, *>
-        if (root == null) {
-            log("AIRPLAY: SETUP 应答不是字典")
-            return null
-        }
-        // 拉取主显示屏参数（跟随接收端屏幕方向；横屏车机应推横屏画面，触摸坐标也按此对齐）
-        // 这一路**不能静默失败**：/info 挂掉意味着显示屏几何、HID 设备（触摸）、音频能力
-        // 全部退回写死值。2026-10-20 宝马 iD9 就是在这里静默失败，日志只剩
-        // `hidDevices uuids=[]` / `displayUuid=null` 两个结果，看不到原因。
-        var infoRoot: Map<*, *>? = null
-        val infoMap = loadInfoWithDiagnostics()
-        infoRoot = infoMap
-        val display = (infoMap?.get("displays") as? List<*>)?.firstOrNull() as? Map<*, *>
-        if (display == null) {
-            log(
-                "AIRPLAY: 未取得 /info displays → 显示屏参数退回手机分辨率兜底" +
-                    "（车机侧可能是小画面/黑边）；HID 设备为空 → 车机不会发 hidSendReport（触摸不可用）",
-            )
-        }
-        // /info 全量转储：找奥迪私有的数据流 UUID（type-130 的 clientTypeUUID 候选）、
-        // HID 设备描述（触摸）、以及任何我们没实现的能力声明
-        // uuid 原样保留（奥迪发字符串 "0"/"1"，DiPlay 用整数——hidSetInputMode 原样回传）
-        val parsedHidUuids = ArrayList<String>()
-        // uuid → HID 描述符（媒体键记录需按下标取 Usage，触摸记录不需要但一并留存）
-        val parsedHidDescriptors = HashMap<String, ByteArray>()
-        infoRoot?.let { root ->
-            val skipped = setOf("displays")
-            val summary =
-                root.entries.joinToString("; ") { (key, value) ->
-                    if (key in skipped) "$key=[${(value as? List<*>)?.size ?: "?"}项]" else "$key=${value.toString().take(200)}"
-                }
-            log("AIRPLAY: /info 字段: $summary")
-            // displays 已在 logInfoSummary 里逐条打印（含键值明细），此处不再重复
-            // 音频能力逐条打印（整行 /info 被 take(200) 截断，audioFormats 恰好断在中间）：
-            // 决定 audioType 只能靠这里——奥迪 type=100 到底声明了 compatibility 还是 media
-            (root["audioFormats"] as? List<*>)?.forEachIndexed { index, entry ->
-                val format = entry as? Map<*, *> ?: return@forEachIndexed
-                val output = (format["audioOutputFormats"] as? Number)?.toLong() ?: 0L
-                val input = (format["audioInputFormats"] as? Number)?.toLong() ?: 0L
-                log(
-                    "AIRPLAY: audioFormat[$index] type=${format["type"]} audioType=${format["audioType"]} " +
-                        "output=0x${output.toString(16)} input=0x${input.toString(16)}" +
-                        "（PCM44.1k/48k stereo=" +
-                        "${if ((output and (1L shl 11)) != 0L) "✓" else "✗"}" +
-                        "${if ((output and (1L shl 15)) != 0L) "✓" else "✗"}，" +
-                        "AAC-LC 44.1k=${if ((output and (1L shl 22)) != 0L) "✓" else "✗"}）",
-                )
-            }
-            (root["audioLatencies"] as? List<*>)?.forEachIndexed { index, entry ->
-                val latency = entry as? Map<*, *> ?: return@forEachIndexed
-                log(
-                    "AIRPLAY: audioLatency[$index] type=${latency["type"]} audioType=${latency["audioType"]} " +
-                        "in=${latency["inputLatencyMicros"]} out=${latency["outputLatencyMicros"]}",
-                )
-            }
-            for (hidKey in listOf("hidDevices", "hids", "hid")) {
-                (root[hidKey] as? List<*>)?.forEachIndexed { index, h ->
-                    log("AIRPLAY: /info $hidKey[$index]=$h")
-                    if (h is Map<*, *>) {
-                        // 奥迪实测：uuid 是字符串 "0"/"1"（13:38 诊断 uuidClass=String）；
-                        // DiPlay 是整数。统一转字符串，hidSetInputMode/hidSendReport 原样回传
-                        val uuid =
-                            when (val raw = h["uuid"]) {
-                                is Number -> raw.toString()
-                                is String -> raw
-                                else -> null
-                            }
-                        if (uuid != null) parsedHidUuids += uuid
-                        (h["hidDescriptor"] as? ByteArray)?.let { descriptor ->
-                            log(
-                                "AIRPLAY: hidDescriptor[$index] ${descriptor.size}B hex=" +
-                                    descriptor.take(96).joinToString(" ") { "%02x".format(it) },
-                            )
-                            // 媒体键（Consumer Control）的 Usage 数组顺序只能从描述符得到：
-                            // Array 报告的字节是「下标」而非 Usage ID（见 ConsumerKeys 注释）
-                            if (uuid != null) parsedHidDescriptors[uuid] = descriptor
-                        }
-                    }
-                }
-            }
-        }
-        log("AIRPLAY: hidDevices 解析结果 uuids=$parsedHidUuids")
-        val info =
-            SetupInfo(
-                eventPort = portOf(root["eventPort"]),
-                timingPort = portOf(root["timingPort"]),
-                keepAlivePort = root["keepAlivePort"]?.let(::portOf)?.takeIf { it != 0 },
-                enabledFeatures = (root["enabledFeatures"] as? List<*>)?.map { it.toString() }.orEmpty(),
-                displayWidth = ((display?.get("widthPixels") as? Long) ?: 1080L).toInt(),
-                displayHeight = ((display?.get("heightPixels") as? Long) ?: 2320L).toInt(),
-                // /info displays[0] 的显示屏 UUID（真实 iPhone 会把它回填进屏幕流 SETUP；
-                // 键名以小写 "uuid" 为准，大写 "UUID" 兜底）
-                displayUuid =
-                    uuidText(
-                        display?.get("uuid")
-                            ?: display?.get("UUID")
-                            ?: display?.get("displayUUID"),
-                    ),
-                maxFps = ((display?.get("maxFPS") as? Long) ?: 30L).toInt(),
-                hidDeviceUuids = parsedHidUuids,
-                hidDescriptors = parsedHidDescriptors,
-                // 奥迪 MMI 3315 声明 true：屏幕流 keepAlive 用 opcode=5 带 bplist 统计体
-                keepAliveSendStatsAsBody = (infoRoot?.get("keepAliveSendStatsAsBody") as? Boolean) == true,
-            )
-        log(
-            "AIRPLAY: ✓ SETUP 完成 eventPort=${info.eventPort} timingPort=${info.timingPort} " +
-                "keepAlive=${info.keepAlivePort ?: "无"} features=${info.enabledFeatures} " +
-                "display=${info.displayWidth}x${info.displayHeight}@${info.maxFps} " +
-                "displayUuid=${info.displayUuid}",
-        )
-        return info
+        return runSetupRust(handle)
     }
 
     /**
@@ -2748,43 +2797,10 @@ class AirPlayClient(
         return responseBody
     }
 
-    /**
-     * 配对请求（pair-setup / pair-verify）：Apple 客户端与 catplay PairingHelperTx 同款头。
-     * carplay 真车实测（catplay TX 方向工作于真实车机）：
-     *  - Content-Type: application/pairing+tlv8
-     *  - X-Apple-HKP: 2（HomeKit 配对 v2，Apple 客户端的标识头）
-     *  - X-Apple-PD: 1（Pair-Derive，pair-verify 专用）
-     * 2026-10-11：此前发默认 application/octet-stream 且无这两个头，奥迪对
-     * pair-setup/pair-verify 全部回 403（HTTP 层拒绝，未进入 TLV 解析）。
-     */
-    private fun postPairing(
-        path: String,
-        body: ByteArray,
-    ): ByteArray {
-        val extra =
-            buildList {
-                add("X-Apple-HKP" to "2")
-                if (path.endsWith("pair-verify")) add("X-Apple-PD" to "1")
-            }
-        val (statusLine, responseBody) =
-            request(
-                "POST",
-                path,
-                body,
-                contentType = "application/pairing+tlv8",
-                extraHeaders = extra,
-            )
-        // 诊断（真车 403 排查）：请求长度 + 应答状态行/长度/头部字节
-        val headHex = responseBody.take(16).joinToString(" ") { "%02x".format(it) }
-        log(
-            "AIRPLAY: $path req=${body.size}B -> [$statusLine] resp=${responseBody.size}B" +
-                if (responseBody.isNotEmpty()) " head=[$headHex]" else "",
-        )
-        if (!statusLine.contains("200")) {
-            throw IOException("POST $path 应答 [$statusLine]")
-        }
-        return responseBody
-    }
+    // 配对请求（原 postPairing）：**已移入 Rust**（M5.2 汇编级定谳：固件头集 =
+    // X-Apple-Client-Name/HKP/PD 等，fw::airplay::plist_message 构建）。
+    // 旧实现的经验值（CT=application/pairing+tlv8、X-Apple-HKP=2）存档于
+    // audit §10.5 对照清单，装机整测时证伪。
 
     private fun request(
         method: String,
@@ -3139,51 +3155,6 @@ class AirPlayClient(
             return@runCatching "02:" + (0 until 5).joinToString(":") { "%02X".format(digest[it]) }
         }.getOrNull()
 
-    /**
-     * 构造会话级 SETUP 报文体（拆出来是为了单测：deviceID 一旦退回写死假值，
-     * WinPlay 这类按设备过滤的接收端会直接 403，且现象是 45 秒后才断开）。
-     */
-    internal fun buildSessionSetupBody(
-        deviceId: String,
-        timingPort: Int,
-        /** false = 未配对/未加密会话：必须显式带 `et=NONE`（catplay do_initial_setup 同款）。 */
-        encrypted: Boolean = true,
-    ): ByteArray {
-        val fields =
-            linkedMapOf<String, Any?>(
-                "deviceID" to deviceId,
-                "macAddress" to "aa:bb:cc:dd:ee:ff",
-                "name" to "iPhone",
-                "model" to "iPhone14,2",
-                "osName" to "iPhone OS",
-                "osBuildVersion" to "19A404",
-                "osVersion" to "15.0.2",
-                // iPhone 自己的 AirPlay 版本（catplay 实证值）；此前误用车机的 320.17.7
-                "sourceVersion" to SENDER_SOURCE_VERSION,
-                "timingPort" to timingPort.toLong(),
-                "sessionUUID" to
-                    java.util.UUID
-                        .randomUUID()
-                        .toString()
-                        .uppercase(),
-                "sessionCorrelationUUID" to
-                    java.util.UUID
-                        .randomUUID()
-                        .toString()
-                        .uppercase(),
-                "statsCollectionEnabled" to false,
-                "updateSessionRequest" to false,
-                "keepAliveLowPower" to true,
-                "features" to CONTROLLER_FEATURES,
-            )
-        if (!encrypted) {
-            // AirPlayEncryptionType::NONE = 1<<0（catplay 未走 /pair-setup 时的降级值）。
-            // 缺这个键时严格接收端可能把会话当成「加密但无密钥」而拒绝。
-            fields["et"] = 1L
-        }
-        return BinaryPlist.encode(fields)
-    }
-
     private fun typeName(value: Any?): String =
         when (value) {
             null -> "null"
@@ -3299,3 +3270,35 @@ class AirPlayClient(
  * 其余失败（端口未开等）保持快速轮询等邀请。
  */
 internal fun pairingRetryBackoffMs(failureMessage: String): Long = if (failureMessage.contains("403")) 5_000L else 500L
+
+/**
+ * 配对产物密钥（fw: `_coreUtilsKeyHolder_CreateEncryptionKeysForContext`
+ * @0x22773e938——Control-Salt 族 HKDF-SHA512 双钥；sharedSecret 沿用旧接缝
+ * 恒空数组，音频路径按 null 语义处理）。原 PairVerifyClient.ControlKeys，
+ * M5.2 起 PairingClients.kt 全域移入 Rust（fw::airplay::session），类型随迁。
+ */
+data class ControlKeys(
+    val phoneWriteKey: ByteArray,
+    val phoneReadKey: ByteArray,
+    val sharedSecret: ByteArray,
+)
+
+/**
+ * 配对库对端身份（fw: `_PairingSessionSavePeer` 入库内容——setup M6 的
+ * identifier + 长期公钥；verify 的 FindPeerEx 取用）。原
+ * PairSetupClient.ReceiverIdentity，随 M5.2 类型迁址。
+ */
+data class ReceiverIdentity(
+    val identifier: String,
+    val publicKey: ByteArray,
+)
+
+/** 控制器长期身份（ed25519 seed + 配对 ID；原 PairingClients.kt，M5.2 类型随迁）。 */
+data class ControllerIdentity(
+    val pairingId: String,
+    val privateKey: ByteArray,
+    val publicKey: ByteArray,
+)
+
+/** fw: session+0x64 发送端主形态（createAirPlayPairingSession @0x2277AD69C）。 */
+const val FLAGS_AIRPLAY_SENDER: Int = 0xC

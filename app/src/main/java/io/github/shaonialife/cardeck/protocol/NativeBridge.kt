@@ -179,4 +179,261 @@ object NativeBridge {
         negotiatedMfi4: Boolean,
         authVerMajor: Int = 0,
     ): Int
+
+    // ---- 配对族（fw::pairing，协议 100% 在 Rust；Kotlin 只剩 RTSP 传输）----
+    // fw 溯源：verify = _VerifyClientExchange @0x192948D78、
+    //          setup = _SetupClientExchange @0x192944724、
+    //          派生 = _PairingSessionDeriveKey @0x19286D644。
+
+    /** 创建 pair-verify 会话并构建 M1（fw: state1）。flags=0xC 主形态。返回句柄，0=失败。 */
+    external fun nativePairingVerifyCreate(
+        flags: Int,
+        identifier: ByteArray,
+        privKey32: ByteArray,
+    ): Long
+
+    /** M1 出站体。 */
+    external fun nativePairingVerifyM1(handle: Long): ByteArray?
+
+    /** 处理 M2（验签对端身份 + 备好 M3）。[peerStaticPub] 传 null = 配对库缺项（兼容跳过验签）。0=成功。 */
+    external fun nativePairingVerifyM2(
+        handle: Long,
+        m2: ByteArray,
+        peerStaticPub: ByteArray?,
+    ): Int
+
+    /** M3 出站体（M2 成功后可用）。 */
+    external fun nativePairingVerifyM3(handle: Long): ByteArray?
+
+    /** 处理 M4（解密终报）。0=交换完成。 */
+    external fun nativePairingVerifyM4(
+        handle: Long,
+        m4: ByteArray,
+    ): Int
+
+    /** fw: _PairingSessionDeriveKey——Control/Events/DataStream salt-info 表。 */
+    external fun nativePairingVerifyDeriveKey(
+        handle: Long,
+        salt: ByteArray,
+        info: ByteArray,
+    ): ByteArray?
+
+    /** 创建 pair-setup 会话并构建 M1（fw: state1；extra = fw: type 0x1F 域，0=不带）。 */
+    external fun nativePairingSetupCreate(
+        flags: Int,
+        extra: Long,
+        identifier: ByteArray,
+        privKey32: ByteArray,
+    ): Long
+
+    /** M1 出站体。 */
+    external fun nativePairingSetupM1(handle: Long): ByteArray?
+
+    /** 处理 M2（SRP 启动 + 备好 M3）。0=成功。 */
+    external fun nativePairingSetupM2(
+        handle: Long,
+        m2: ByteArray,
+        password: ByteArray,
+    ): Int
+
+    /** M3 出站体。 */
+    external fun nativePairingSetupM3(handle: Long): ByteArray?
+
+    /** 处理 M4（服务器证明 + 备好 M5）。0=成功。 */
+    external fun nativePairingSetupM4(
+        handle: Long,
+        m4: ByteArray,
+    ): Int
+
+    /** M5 出站体。 */
+    external fun nativePairingSetupM5(handle: Long): ByteArray?
+
+    /** 处理 M6 → `[accIdentifier][0x00][accPublicKey(32)]`；null=失败。 */
+    external fun nativePairingSetupM6(
+        handle: Long,
+        m6: ByteArray,
+    ): ByteArray?
+
+    /** 销毁会话。 */
+    external fun nativePairingDestroy(handle: Long)
+
+    // ---- 配对编排决策（fw: apsession_ensureConnectedInternal 配对段——
+    //      isPeerKnown 分支 + 单连接单次顺序流；重试节奏归宿主连接策略层）----
+
+    /** 创建编排会话。[peerKnown] = 配对库有对端记录。返回句柄，0=失败。 */
+    external fun nativePairingFlowCreate(peerKnown: Int): Long
+
+    /** 下一步动作：1=Setup、2=ReconnectThenVerify、3=Verify、4=PlaintextFallback、5=Done、0=非法。 */
+    external fun nativePairingFlowNextAction(handle: Long): Int
+
+    /** setup 交换结果反馈（403=信任已建；unsupported=无配对通道）。 */
+    external fun nativePairingFlowOnSetupResult(
+        handle: Long,
+        forbidden403: Int,
+        unsupported: Int,
+    )
+
+    /** verify 交换结果反馈。 */
+    external fun nativePairingFlowOnVerifyResult(
+        handle: Long,
+        ok: Int,
+    )
+
+    /** 销毁编排会话。 */
+    external fun nativePairingFlowDestroy(handle: Long)
+
+    // ---- AirPlay RTSP 会话泵（M5.2 架构裁定：协议帧不过 Kotlin 边界——
+    //      会话序/CSeq/头集/TLV8/密钥派生全在 Rust；Kotlin 只剩 TCP 三原语 +
+    //      泵 + 平台动作消费。fw: apsession_ensureConnectedInternal 直切）----
+
+    /** 创建会话。[clientName]/[setupCode] = **UTF-8 字节数组**（2026-11-02
+     *  真机定谳：jstring 通路在荣耀 ROM 上 GetStringUTFChars 越界进 dalvik
+     *  守护页 tombstone_25——桥面统一走 bytes）；[setupCode] = pair-setup
+     *  SRP 密码（车机侧 PIN，null 回落 3939）；[peerKnown] = 配对库有对端
+     *  记录。返回句柄，0=失败。 */
+    external fun nativeAirplayCreate(
+        flags: Int,
+        identifier: ByteArray,
+        privateKey: ByteArray,
+        clientName: ByteArray?,
+        peerKnown: Int,
+        setupCode: ByteArray?,
+    ): Long
+
+    /** 发起 'info'（裸 GET /info）。出站经 [nativeAirplayTakeOutbound] 取。 */
+    external fun nativeAirplayInfo(handle: Long): String?
+
+    /** 注入认证类型（fw: APSKeyHolderGetAuthenticationType；8 = MFiSAP——
+     *  'mfi ' 认证循环 Rust 内化，须在 controlSetup 前调用）。 */
+    external fun nativeAirplaySetAuthType(
+        handle: Long,
+        authType: Int,
+    )
+
+    /** 注入身份键（fw: 'stup' deviceID=本端 MAC 字符串/sessionCorrelationUUID=
+     *  BootUUID/osName/osVersion——宿主等价数据初值，audit §10.34）。 */
+    external fun nativeAirplaySetIdentity(
+        handle: Long,
+        deviceId: String?,
+        correlationUuid: String?,
+        osName: String?,
+        osVersion: String?,
+    )
+
+    /** 发起配对 M1（决策 = orchestrator：isPeerKnown ? verify : setup）。
+     *  返回事件 JSON（空 = 无事件；{"type":"pinRequired"} = /pair-pin-start
+     *  已发，车机应显示配对码，等 [nativeAirplayProvidePin]）。 */
+    external fun nativeAirplayStartPairing(handle: Long): String?
+
+    /** 注入车机展示的配对码（fw: PerformSetup param_2 非 0 形态——PIN 只进
+     *  SRP 掩蔽从不上线）。[pin] = UTF-8 字节数组。返回事件 JSON。 */
+    external fun nativeAirplayProvidePin(
+        handle: Long,
+        pin: ByteArray,
+    ): String?
+
+    /** 泵入口：注入入站字节（可 null = 纯轮询），推进状态机。返回事件 JSON：
+     *  ""（继续等）/ info / send / reconnectRequired / done / error。 */
+    external fun nativeAirplayOnBytes(
+        handle: Long,
+        bytes: ByteArray?,
+    ): String?
+
+    /** 取走出站缓冲（null = 无）。泵每轮写完即清。 */
+    external fun nativeAirplayTakeOutbound(handle: Long): ByteArray?
+
+    /** 销毁会话。 */
+    external fun nativeAirplayDestroy(handle: Long)
+
+    // ---- M5.2 控制面原语（fw: §10.25 换装——协议逻辑全在 Rust）----
+
+    /** 发控制建立（'stup' POST /setup，体/键域全 Rust：et 映射/布尔门控/
+     *  sourceVersion 字面量）。出站经 [nativeAirplayTakeOutbound]。 */
+    external fun nativeAirplayControlSetup(handle: Long): String?
+
+    /** 注入我方 timing 端口（宿主 UDP 计时服务启动后、控制建立前）。 */
+    external fun nativeAirplaySetTimingPort(
+        handle: Long,
+        port: Int,
+    )
+
+    /** 发流级 SETUP（'stup' URL=/，每调用恰 1 条流——固件
+     *  setupStreamCreatingResponseInternal @0x2276c5250）。[streamJson] =
+     *  {"streamType":N,"audioType":"media"?,...,"timestampInfo":{...}?}；
+     *  五路音频 streamType = 100/101/103/106/107（Main/Alt/Buffered/Aux/OOB，
+     *  fw: APCarPlayAudioFormatsCreate @0x2277d33f8）。 */
+    external fun nativeAirplayStreamSetup(
+        handle: Long,
+        streamJson: String,
+    ): String?
+
+    /** 发 keep-alive（'keep' 空体 POST /feedback；宿主按 10s 泵）。 */
+    external fun nativeAirplayKeepAlive(handle: Long): String?
+
+    /** 创建事件通道（Events 双钥；两数组空 = 明文形态）。 */
+    external fun nativeAirplayEventCreate(
+        handle: Long,
+        writeKey: ByteArray,
+        readKey: ByteArray,
+    ): Int
+
+    /** 事件通道泵：注入字节，返回事件 JSON 数组
+     *  [{"type":"command","cseq":N,"body":{...}},{"type":"reply","status":200}]。 */
+    external fun nativeAirplayEventOnBytes(
+        handle: Long,
+        bytes: ByteArray?,
+    ): String?
+
+    /** 事件通道发 'comm' 命令（JSON 体 → plist）。 */
+    external fun nativeAirplaySendCommand(
+        handle: Long,
+        bodyJson: String,
+    ): String?
+
+    /** 取走事件通道出站（应答/命令帧；null = 无）。 */
+    external fun nativeAirplayEventTakeOutbound(handle: Long): ByteArray?
+
+    /** 发 ANNOUNCE（'annc'，SDP 文本体——fw: _sdpsession_sendAnnounce
+     *  @0x22779ddd4 直切）。[paramsJson] = {"uuidU64":N,"localIp":"..",
+     *  "ip6":B,"deviceName":"..","audioFormatBit":N,"authType":N,
+     *  "aesKeyB64":"..","aesIvB64":"..","latencyMin":N,"latencyMax":N}。
+     *  audioFormatBit = APAudioFormat 位枚举（fw::airplay::asbd 表）。
+     *  回复经泵 {"type":"announced"}。 */
+    external fun nativeAirplayAnnounce(
+        handle: Long,
+        paramsJson: String,
+    ): String?
+
+    /** 发 RECORD（'rcrd'，空体——fw: Stage2StartTransaction
+     *  @0x2276cf518 直切）。回复经泵 {"type":"recorded"}。 */
+    external fun nativeAirplayRecord(handle: Long): String?
+
+    /** timing UDP 服务器态应答（车机轮询我方 timingPort——fw:
+     *  __NTPClockServerProcessPacket @0x1928677bc 直切；纯函数）。
+     *  [epochSecsUnix] = 当前 Unix 秒（内部 + NTP 1900 纪元偏移）。
+     *  返回 null = 请求非法。 */
+    external fun nativeAirplayTimingRespond(
+        packet: ByteArray,
+        arrivalNanos: Long,
+        transmitNanos: Long,
+        epochSecsUnix: Long,
+    ): ByteArray?
+
+    /** timing 客户端态请求构造（轮询车机 timingPeerInfo 端口——fw:
+     *  _NTPClockClientSendRequest @0x19293fe94 模板直切）。
+     *  [rtcp] = true → 32B RTCP 变体，false → 48B 经典 NTP。 */
+    external fun nativeAirplayTimingRequest(
+        rtcp: Boolean,
+        nowNanos: Long,
+        epochSecsUnix: Long,
+    ): ByteArray
+
+    /** timing 客户端态偏移观测（秒；fw: __NTPClockClientProcessResponse
+     *  + 偏移公式 @0x1929402d0 直切——未除 2 固件语义）。
+     *  NaN = 响应非法。 */
+    external fun nativeAirplayTimingObserve(
+        response: ByteArray,
+        arrivalNanos: Long,
+        epochSecsUnix: Long,
+    ): Double
 }

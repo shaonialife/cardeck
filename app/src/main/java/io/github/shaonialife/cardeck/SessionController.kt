@@ -6,7 +6,7 @@ import android.net.Network
 import android.os.SystemClock
 import android.view.KeyEvent
 import io.github.shaonialife.cardeck.airplay.AirPlayClient
-import io.github.shaonialife.cardeck.airplay.PairVerifyClient
+import io.github.shaonialife.cardeck.airplay.ControlKeys
 import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioProfileMemory
 import io.github.shaonialife.cardeck.audio.AudioSender
@@ -19,7 +19,6 @@ import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.capture.HiddenDisplaySource
 import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
-import io.github.shaonialife.cardeck.iap2.ReceiverProfile
 import io.github.shaonialife.cardeck.input.ConsumerKeys
 import io.github.shaonialife.cardeck.input.HidNavigation
 import io.github.shaonialife.cardeck.input.TouchReports
@@ -436,26 +435,7 @@ object SessionController {
      * 8 秒自杀一次，把车机侧邀请窗口反复清零（真 iPhone 实录要约 21 秒才邀请）。
      */
 
-    /** 本轮蓝牙会话判定的链路代际缓存（0x1D01 画像回调写入；null=未识别）。 */
-    @Volatile
-    private var senderLinkGenerationCache: ReceiverProfile.LinkGeneration? = null
-
-    /**
-     * BT 侧 0x1D01 的接收端身份原文（name/model/manufacturer；包含匹配时小写化）。
-     * 车型分派用：半移交「拆 BT」只对已验证车型开（见 [detachBtForMib3Handoff]）。
-     */
-    @Volatile
-    private var btReceiverIdentity: String = ""
-
     private fun knownCarHotspotSsid(): String? = boundCarSsid ?: lastCarWifiSsid
-
-    /**
-     * 本轮蓝牙会话判定的车机链路代际（0x1D01 画像，CLASSIC_MIB3 / EVENT_LINK）。
-     * 会话对象未建或尚未识别时回退 EVENT_LINK（0.1.13 前兼容行为）——
-     * 错把 MIB3 当 EVENT_LINK 只是协商无应答后静默，反向会挂死车机。
-     */
-    private fun senderLinkGeneration(): ReceiverProfile.LinkGeneration =
-        senderLinkGenerationCache ?: ReceiverProfile.LinkGeneration.EVENT_LINK
 
     /**
      * 最近一次 0x5703 的热点密码（仅内存，不落盘）。
@@ -527,11 +507,6 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "车机回连") },
                     onLinkClosed = ::onSenderLinkClosed,
                     knownCarSsid = ::knownCarHotspotSsid,
-                    onGeneration = { g ->
-                        senderLinkGenerationCache = g
-                        appendLog("IAPLINK: 代际缓存更新 → $g（AirPlay 阶段布防分派用）")
-                    },
-                    onIdentity = { identity -> btReceiverIdentity = identity },
                     targetProvider = targetProvider,
                 )
             bluetoothClient =
@@ -543,11 +518,6 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     onLinkClosed = ::onSenderLinkClosed,
                     knownCarSsid = ::knownCarHotspotSsid,
-                    onGeneration = { g ->
-                        senderLinkGenerationCache = g
-                        appendLog("IAPLINK: 代际缓存更新 → $g（AirPlay 阶段布防分派用）")
-                    },
-                    onIdentity = { identity -> btReceiverIdentity = identity },
                     targetProvider = targetProvider,
                 )
             ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
@@ -676,9 +646,6 @@ object SessionController {
         // shell 兜底存下的系统网络（connect-network）自动 forget 还原：无互联网热点
         // 被系统当默认网会挤掉移动数据。失败只记日志（用户可到 WLAN 手动删）。
         cleanupShellFallbackNetwork()
-        // 代际缓存随会话清零：读取侧有 `?: EVENT_LINK` 兜底，语义不变；留着的话
-        // 跨车换连（奥迪→本田）存在读到上一辆缓存的理论窗口（2026-10-23 审阅）。
-        senderLinkGenerationCache = null
         if (hadProjection) {
             // Android 14+：MediaProjection 与保活服务（mediaProjection FGS 类型）绑定，
             // 停服务会连带失效授权——下次连接需重新点「申请投屏权限」
@@ -1780,8 +1747,7 @@ object SessionController {
     }
 
     /**
-     * MIB3 无线移交拆 BT（0x1D01 画像=CLASSIC_MIB3 才做；在 armMib3 发出 DETECT 后、
-     * RECORD 之前触发）：真 iPhone 的 BT 在车机 SYN 与首帧视频之前就已落下
+     * 无线移交拆 BT（WiFi 隧道 iAP2 会话建成后、RECORD 之前触发）：真 iPhone 的 BT 在车机 SYN 与首帧视频之前就已落下
      * （sysdiagnose 2026-10-16：50.015 拆 BT → 50.023 车 SYN → 50.098 首帧）。
      * 我们此前 BT 全程保持——车机 HMI 卡在「半移交」态：会话健康但永不切屏、连接
      * 入口置灰直到重启车机。仅控制通道虚拟链形态做（TCP 隧道形态的 DiPlay 见
@@ -1790,22 +1756,12 @@ object SessionController {
      * 防御性正确（防车机回连挂上第二条链）；onEnded/下一轮 startConnection 会重启。
      */
     fun detachBtForMib3Handoff() {
-        if (senderLinkGeneration() != ReceiverProfile.LinkGeneration.CLASSIC_MIB3) return
-        // 车型白名单（2026-10-26 6318 定谳）：半移交「拆 BT」的依据全部来自 8015 系
-        // （AUDI 5163/5810：sysdiagnose + 0.1.28.8 实测车机配合重开协商）。6318
-        // （AUDI 3260）实测**不适用**——拆 BT 后车机照样配合到 0xAA01 证书，却在
-        // MFi 挑战后 180ms 拆掉整条 AirPlay 会话（EVENT reset → 六档音频全败 →
-        // 推流中止），此前的成功历史全部在「不拆 BT」形态。白名单外一律不拆
-        // （保留蓝牙双链），验证过的车型再进白名单。
-        // 空格/下划线归一化后匹配（identity 实际形态如 "Audi_MMI_6318 AUDI 3260
-        // DELPHI"——分隔符形态随机型而异，见 tunnelMfiBaselineFor 的漏判教训）
-        val identity = btReceiverIdentity.lowercase().replace(" ", "").replace("_", "")
-        if (!identity.contains("audi5163") && !identity.contains("audi5810")) {
-            appendLog(
-                "IAPLINK: 移交拆 BT 跳过——车型不在白名单（identity=${btReceiverIdentity.take(40)}），保留蓝牙双链",
-            )
-            return
-        }
+        // 2026-11-02 清理（用户令：车型特调全清，行为统一）：代际画像闸与
+        // 车型白名单（audi5163/5810）拆除——唯一触发条件 = 结构性协议状态
+        // （WiFi 隧道 iAP2 会话建成，onMib3HandoffReady），对齐真 iPhone
+        // sysdiagnose 时序（BT 在车机 SYN 与首帧视频之前落下）。历史车型
+        // 分歧（6318 拆 BT 后 AirPlay 被车机拆）归 M5 固件对照重审，不在
+        // Kotlin 侧做车型分支。
         if (!btHandoffDone.compareAndSet(false, true)) return
         btHandoffActive = true
         appendLog(
@@ -2532,17 +2488,6 @@ object SessionController {
                     null -> "未知（按需配对）"
                 },
         )
-        // 车机画像（信号收口点）：mDNS 侧信号到达——era 判定 + 依据一行可解释
-        appendLog(
-            ReceiverProfile.describe(
-                ReceiverProfile.classify(
-                    ReceiverProfile.Signals(
-                        features = endpoint.advertisedFeatures,
-                        srcvers = endpoint.sourceVersion,
-                    ),
-                ),
-            ),
-        )
         // 先绑网络再解析端点：mDNS 组播跟随 bindProcessToNetwork 的网络，解析放前面
         // 只会拿到旧网络的结果（此前靠 resolveEndpointHost 内部重试掩盖，白等数秒）。
         // 绑定完成后再并行做三件事：ctrl 广播针对新网络重注册、后台发现 _airplay._tcp、
@@ -2615,9 +2560,6 @@ object SessionController {
                             resolvedEndpoint,
                             log = { line -> appendLog(line) },
                             context = context.applicationContext,
-                            // 链路代际：蓝牙侧 0x1D01 画像已判定（CLASSIC_MIB3/EVENT_LINK），
-                            // AirPlay 阶段的 MIB3 布防据此分派 marker 策略（2026-10-23 分代重构）
-                            linkGeneration = senderLinkGeneration(),
                             endpointRefresher = { current -> enrichEndpointFromBrowser(current, source) },
                             retryTick = { attempt ->
                                 // 配对重试期间车机仍可能没探测到 ctrl（Bonjour 漏掉首次公告）：
@@ -2696,7 +2638,7 @@ object SessionController {
                     // 用户看到的就是「连不上」。
                     val noPairing =
                         AirPlayFeatures.supportsPairing(client.currentEndpoint.advertisedFeatures) == false
-                    var keys: PairVerifyClient.ControlKeys? =
+                    var keys: ControlKeys? =
                         if (noPairing) {
                             client.skipPairing("TXT features 未声明 HK_PAIRING_AND_ENCRYPT")
                             client.reconnect()

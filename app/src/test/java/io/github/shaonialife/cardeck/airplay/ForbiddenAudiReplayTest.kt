@@ -3,6 +3,7 @@ package io.github.shaonialife.cardeck.airplay
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.BeforeClass
 import org.junit.Test
 import java.io.BufferedInputStream
 import java.io.InputStream
@@ -25,6 +26,26 @@ import kotlin.concurrent.thread
  *  3. 12s 窗口内 2~4 轮尝试、不产出密钥（对 403 车机没有可成功的路径）。
  */
 class ForbiddenAudiReplayTest {
+    companion object {
+        /**
+         * 配对协议在 Rust（fw::pairing，2026-11-02 起）——回放循环需要宿主
+         * dylib。按仓库相对路径找 cargo 产物；找不到则跳过（assume），
+         * CI 无 Rust 构建时不至于误报。
+         */
+        @JvmStatic
+        @BeforeClass
+        fun loadNativeProtocolLib() {
+            val candidates =
+                listOf(
+                    "../../cardeck-protocol/target/debug/libcardeck_protocol.dylib",
+                    "../../cardeck-protocol/target/release/libcardeck_protocol.dylib",
+                )
+            val lib = candidates.firstOrNull { java.io.File(it).isFile }
+            org.junit.Assume.assumeTrue("宿主 dylib 不存在，跳过（先 cargo build）", lib != null)
+            System.load(java.io.File(lib!!).absolutePath)
+        }
+    }
+
     @Test
     fun `首连 403 窗口 - 标记 forbidden 并按 5s 退避重试`() {
         val server = ServerSocket(0, 16, InetAddress.getLoopbackAddress())
@@ -61,10 +82,23 @@ class ForbiddenAudiReplayTest {
                                         .find(head)
                                         ?.groupValues
                                         ?.get(1) ?: "1"
-                                out.write(
-                                    "HTTP/1.1 403 Forbidden\r\nCSeq: $cseq\r\nContent-Length: 0\r\n\r\n"
-                                        .toByteArray(Charsets.ISO_8859_1),
-                                )
+                                if (head.startsWith("GET /info")) {
+                                    // M5.2 泵协议：info 先行（fw: fetchInitialInfo）——
+                                    // 回最小合法 bplist（空字典），让会话推进到配对段
+                                    out.write(
+                                        (
+                                            "HTTP/1.1 200 OK\r\nCSeq: $cseq\r\n" +
+                                                "Content-Length: ${EMPTY_BPLIST.size}\r\n\r\n"
+                                        ).toByteArray(Charsets.ISO_8859_1),
+                                    )
+                                    out.write(EMPTY_BPLIST)
+                                } else {
+                                    // 配对段恒 403（本测试钉的就是 403 窗口重试策略）
+                                    out.write(
+                                        "HTTP/1.1 403 Forbidden\r\nCSeq: $cseq\r\nContent-Length: 0\r\n\r\n"
+                                            .toByteArray(Charsets.ISO_8859_1),
+                                    )
+                                }
                                 out.flush()
                             }
                         } catch (_: Exception) {
@@ -86,7 +120,7 @@ class ForbiddenAudiReplayTest {
                 sourceVersion = null,
                 ipAddresses = listOf("127.0.0.1"),
             )
-        val client = AirPlayClient(endpoint, log = {}, context = null)
+        val client = AirPlayClient(endpoint, log = { println("AIRPLAY-TEST: $it") }, context = null)
         val keys =
             try {
                 client.runPairing(windowMillis = 12_000)
@@ -138,3 +172,50 @@ class ForbiddenAudiReplayTest {
         }
     }
 }
+
+/** 最小合法 bplist00（空字典，plist crate 序列化常量）——info 步回复体。 */
+private val EMPTY_BPLIST =
+    byteArrayOf(
+        98,
+        112,
+        108,
+        105,
+        115,
+        116,
+        48,
+        48,
+        0xD0.toByte(),
+        8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        9,
+    )

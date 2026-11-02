@@ -2,13 +2,12 @@ package io.github.shaonialife.cardeck.bt
 
 import android.content.Context
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
-import io.github.shaonialife.cardeck.iap2.ReceiverProfile
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import io.github.shaonialife.cardeck.util.DeviceIdentity
 
 /**
  * BT 控制会话核心流程（Server/Client 共用，此前两份近乎复制）：
- * 构建发送端会话 → Phase 1 交付端点 → 保活泵（阻塞直至链路断开）。
+ * 构建发送端会话 → 会话循环阻塞保活。协议逻辑 100% 在 Rust 引擎；
  * socket 封装 / activeChannel 登记 / 生命周期收尾由两条路径各自处理。
  */
 internal fun Iap2LinkChannel.runSenderSession(
@@ -21,11 +20,9 @@ internal fun Iap2LinkChannel.runSenderSession(
     onLinkClosed: () -> Unit = {},
     /** 本进程已知的车机热点 SSID（无新凭据时沿用，避免每轮拆链）。 */
     knownCarSsid: () -> String? = { null },
-    /** 0x1D01 画像判定的链路代际（CLASSIC_MIB3/EVENT_LINK），Phase 1 完成后回调。 */
-    onGeneration: (ReceiverProfile.LinkGeneration) -> Unit = {},
-    /** 0x1D01 识别完成时回调身份原文（车型分派用，如半移交拆 BT 白名单）。 */
-    onIdentity: ((String) -> Unit)? = null,
 ) {
+    // fw-engine：会话循环阻塞至链路关闭；端点/凭据经回调即时上抛
+    // （无 Kotlin 超时——协议推进由 Rust 编排泵驱动，活性由链路状态机管）
     val session =
         Iap2SenderSession(
             this,
@@ -33,19 +30,10 @@ internal fun Iap2LinkChannel.runSenderSession(
             resolveBluetoothMac(context, log),
             DeviceIdentity.deviceName(context),
             onWifiCredentials,
-            onIdentity,
             onEndpointUpdate,
             knownCarSsid,
-            // MFi 挑战长度按车机身份持久化（省掉 20B 静默 6 秒的试探）
-            context.applicationContext,
         )
-    val endpoint = session.run(timeoutMillis)
-    onGeneration(session.linkGeneration)
-    onEndpoint(endpoint)
-    // Phase 2 过渡：保持控制通道存活记录配件消息；AirPlay 配对由 onEndpoint 回调发起
-    session.pumpIncomingForever()
-    // 链路断开（保活泵退出）：通知主控释放「会话处理中」——否则车机拆链后重连带来的
-    // 新端点会被僵尸轮次堵门（2026-10-22 奥迪 3315 真机定谳，见 SessionController.onSenderLinkClosed）
+    session.run()
     onLinkClosed()
 }
 

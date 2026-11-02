@@ -1,14 +1,14 @@
 package io.github.shaonialife.cardeck.airplay
 
-import org.junit.Assert.assertArrayEquals
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
 
-/** 计时服务：NTP 编码往返 + 请求应答构造（对照 catplay rtcp_timesync.rs 的线格式）。 */
+/**
+ * 计时服务：NTP 编码往返（AudioSender RTP 时间戳垫片）。
+ * 协议字节域（请求校验/应答构造/偏移公式）已移交 Rust 固件逆向实现
+ * （`fw::airplay::ntp` / `fw::airplay::timing`，测试随 Rust 侧）。
+ */
 class TimingServerTest {
     @Test
     fun ntpEncodingRoundTrips() {
@@ -18,52 +18,8 @@ class TimingServerTest {
             val secs = packed shr 32
             val fracNanos = ((packed and 0xFFFF_FFFFL) * 1_000_000_000L) shr 32
             val back = secs * 1_000_000_000L + fracNanos
-            // 分数位定点化有截断：catplay 同款测试允许 ±1ns
+            // 分数位定点化有截断：允许 ±1ns（fw: 分数 = 余<<32/tps 截断语义）
             assertTrue("nanos=$nanos back=$back", Math.abs(back - nanos) <= 1)
         }
-    }
-
-    @Test
-    fun respondsToTimesyncRequestEchoingT3() {
-        val request = ByteArray(32)
-        request[0] = (2 shl 6).toByte()
-        request[1] = 0xD2.toByte()
-        request[2] = 0
-        request[3] = 7
-        val clientNanos = 987_654_321L
-        val packed = ByteBuffer.wrap(TimingServer.ntpFromNanos(clientNanos)).long
-        for (index in 0 until 8) {
-            request[24 + index] = (packed ushr (8 * (7 - index))).toByte()
-        }
-
-        val response = TimingServer.buildResponse(request, nowNanos = 5_000_000_000L)
-        assertNotNull(response)
-        response!!
-        assertEquals(32, response.size)
-        assertEquals((2 shl 6).toByte(), response[0])
-        assertEquals(0xD3.toByte(), response[1])
-        assertEquals(7, ((response[2].toInt() and 0xFF) shl 8) or (response[3].toInt() and 0xFF))
-        // t1 = 回显请求的 t3
-        assertArrayEquals(request.copyOfRange(24, 32), response.copyOfRange(8, 16))
-        // t2 = t3 = 本地 5s 的 NTP 编码
-        val expected = TimingServer.ntpFromNanos(5_000_000_000L)
-        assertArrayEquals(expected, response.copyOfRange(16, 24))
-        assertArrayEquals(expected, response.copyOfRange(24, 32))
-    }
-
-    @Test
-    fun rejectsNonTimesyncPackets() {
-        assertNull(TimingServer.buildResponse(ByteArray(8), 0))
-        assertNull(TimingServer.buildResponse(ByteArray(32), 0)) // 全零：version=0
-
-        val badVersion = ByteArray(32)
-        badVersion[0] = (3 shl 6).toByte()
-        badVersion[1] = 0xD2.toByte()
-        assertNull(TimingServer.buildResponse(badVersion, 0))
-
-        val responsePt = ByteArray(32)
-        responsePt[0] = (2 shl 6).toByte()
-        responsePt[1] = 0xD3.toByte() // 应答类型不该被再应答
-        assertNull(TimingServer.buildResponse(responsePt, 0))
     }
 }

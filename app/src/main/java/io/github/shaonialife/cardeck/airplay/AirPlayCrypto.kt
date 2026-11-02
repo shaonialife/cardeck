@@ -7,46 +7,29 @@ import org.bouncycastle.crypto.modes.ChaCha20Poly1305
 import org.bouncycastle.crypto.modes.SICBlockCipher
 import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.params.HKDFParameters
 import org.bouncycastle.crypto.params.KeyParameter
 import org.bouncycastle.crypto.params.ParametersWithIV
-import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.X25519PublicKeyParameters
-import org.bouncycastle.crypto.signers.Ed25519Signer
 import java.security.SecureRandom
 
-/** AirPlay 配对与控制通道密码学原语（BouncyCastle 轻量 API，独立实现）。 */
+/**
+ * AirPlay 流/控制通道密码学原语（BouncyCastle 轻量 API）+ 本机身份密钥生成。
+ *
+ * 配对协议原语（X25519/ed25519 签名/配对 nonce）已于 2026-11-02 移交 Rust
+ * （fw::pairing，8B nonce=ChaCha 64x64 固件变体；Kotlin 旧的 12B RFC 补零
+ * 形态与固件不相容，已随 Srp6aClient/Tlv8 一并删除）。
+ * 本文件只剩：身份 seed 生成（持久化）、流层 HKDF/SHA512、
+ * 流/控制通道 AEAD（nonce64=12B RFC——流层形态，与配对域分立）。
+ */
 object AirPlayCrypto {
     private const val MAC_BITS = 128
     private const val NONCE_SIZE = 12
     private val random = SecureRandom()
 
-    class X25519KeyPair(
-        val privateKey: ByteArray,
-        val publicKey: ByteArray,
-    )
-
     class Ed25519KeyPair(
         val privateKey: ByteArray,
         val publicKey: ByteArray,
     )
-
-    fun x25519Generate(): X25519KeyPair {
-        val privateKey = X25519PrivateKeyParameters(random)
-        return X25519KeyPair(privateKey.encoded, privateKey.generatePublicKey().encoded)
-    }
-
-    fun x25519Shared(
-        privateKeyRaw: ByteArray,
-        peerPublicKeyRaw: ByteArray,
-    ): ByteArray {
-        val privateKey = X25519PrivateKeyParameters(privateKeyRaw, 0)
-        val peerPublicKey = X25519PublicKeyParameters(peerPublicKeyRaw, 0)
-        val shared = ByteArray(X25519PrivateKeyParameters.SECRET_SIZE)
-        privateKey.generateSecret(peerPublicKey, shared, 0)
-        return shared
-    }
 
     fun ed25519Generate(): Ed25519KeyPair {
         val privateKey = Ed25519PrivateKeyParameters(random)
@@ -54,30 +37,6 @@ object AirPlayCrypto {
     }
 
     fun ed25519PublicKey(privateKeyRaw: ByteArray): ByteArray = Ed25519PrivateKeyParameters(privateKeyRaw, 0).generatePublicKey().encoded
-
-    fun ed25519Sign(
-        privateKeyRaw: ByteArray,
-        data: ByteArray,
-    ): ByteArray {
-        val signer = Ed25519Signer()
-        signer.init(true, Ed25519PrivateKeyParameters(privateKeyRaw, 0))
-        signer.update(data, 0, data.size)
-        return signer.generateSignature()
-    }
-
-    fun ed25519Verify(
-        publicKeyRaw: ByteArray,
-        data: ByteArray,
-        signature: ByteArray,
-    ): Boolean =
-        try {
-            val signer = Ed25519Signer()
-            signer.init(false, Ed25519PublicKeyParameters(publicKeyRaw, 0))
-            signer.update(data, 0, data.size)
-            signer.verifySignature(signature)
-        } catch (_: Exception) {
-            false
-        }
 
     fun hkdfSha512(
         inputKeyMaterial: ByteArray,
@@ -160,14 +119,6 @@ object AirPlayCrypto {
             nonce[index] = value.toByte()
             value = value ushr 8
         }
-        return nonce
-    }
-
-    /** 配对消息 nonce：4 字节零 + 8 字节 ASCII 标签。 */
-    fun nonceLabel(label: String): ByteArray {
-        val nonce = ByteArray(NONCE_SIZE)
-        val ascii = label.toByteArray(Charsets.US_ASCII)
-        ascii.copyInto(nonce, 4, 0, minOf(ascii.size, 8))
         return nonce
     }
 }
