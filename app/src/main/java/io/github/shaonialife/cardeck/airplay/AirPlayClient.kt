@@ -556,6 +556,7 @@ class AirPlayClient(
         input: java.io.InputStream,
         output: java.io.OutputStream,
     ) {
+        sessionPumpHandle = handle
         Thread({
             val buf = ByteArray(16 * 1024)
             while (!cancelled && sessionPumpHandle == handle) {
