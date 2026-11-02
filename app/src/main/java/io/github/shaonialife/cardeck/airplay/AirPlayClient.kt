@@ -2218,6 +2218,50 @@ class AirPlayClient(
                         ),
                 ),
             )
+        // §10.60：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）。
+        // connectionId 本端生成并**随请求携带**（fw: 调用方流字典原样并入
+        // @0x2276c5428；DataStream 解密钥两侧同值域），Rust 尊重调用方值并回带。
+        var controlPortFromEv = 0
+        if (sessionPumpHandle != 0L) {
+            val connIdJson = connectionId.toString()
+            val spfJson = spfValue?.let { ",\"spf\":$it" } ?: ""
+            val ev =
+                rustStreamSetupWait(
+                    "{\"streamType\":${profile.streamType},\"streamConnectionID\":\"" + connIdJson +
+                        "\",\"audioFormat\":${profile.formatBit},\"audioType\":\"${profile.audioType}\"" +
+                        ",\"audioLatencyMs\":${profile.latencyMs},\"input\":false" +
+                        ",\"supportsRTPPacketRedundancy\":false" +
+                        ",\"supportsHighAccuracyTimestamps\":${tuning.highAccuracyTimestamps}" +
+                        spfJson + "}",
+                    timeoutMs = 8_000,
+                ) ?: run {
+                    log("AIRPLAY: 音频流协商失败（Rust 泵超时/断开）")
+                    return null
+                }
+            val dataPort = ev.optInt("dataPort")
+            if (dataPort == 0) {
+                log("AIRPLAY: 音频流被拒绝（ev=$ev）")
+                return null
+            }
+            controlPortFromEv = ev.optInt("controlPort")
+            log(
+                "AIRPLAY: ✓ 音频流协商成功（Rust）type=${profile.streamType} " +
+                    "dataPort=$dataPort controlPort=$controlPortFromEv connId=$connectionId",
+            )
+            // 音量探测/抬升待 Rust 'gsp'/'spp' 原语（GET/SET_PARAMETER）——跳过不影响主链路
+            return AudioStreamInfo(
+                streamConnectionId = connectionId,
+                dataPort = dataPort,
+                controlPort = controlPortFromEv,
+                streamKey =
+                    AirPlayCrypto.hkdfSha512(
+                        sharedSecret,
+                        "DataStream-Salt$connectionId".toByteArray(Charsets.US_ASCII),
+                        "DataStream-Output-Encryption-Key".toByteArray(Charsets.US_ASCII),
+                    ),
+                sampleRate = negotiation.sampleRate,
+            )
+        }
         val host = endpoint.ipAddresses.firstOrNull() ?: "receiver"
         val startedAt = SystemClock.uptimeMillis()
         val (statusLine, responseBody) =
