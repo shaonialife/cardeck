@@ -451,14 +451,17 @@ class AirPlayClient(
                     }
                     val write = hexToBytes(json.getString("writeKey")) ?: ByteArray(0)
                     val read = hexToBytes(json.getString("readKey")) ?: ByteArray(0)
+                    // §10.53：X25519 共享密钥原文（事件通道密钥派生的 ikm——
+                    // Rust Done 交付；此前空数组 → Kotlin 事件加密密钥错 → 接收端
+                    // BAD_DECRYPT，真机 22:04:46 实证）
+                    val shared = hexToBytes(json.optString("sharedSecret")) ?: ByteArray(0)
                     // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
                     cipher = ControlCipher(read, write)
                     log("AIRPLAY: 配对完成（第 $attempt 次尝试），控制通道加密已启用")
                     // M5.2：会话句柄存活跨 runSetup（fw: apsession 生命周期——
                     // 控制建立/流 SETUP/事件通道全走同一加密会话）
                     controlSessionHandle = handle
-                    // 认证缺口探针：iPhone 在 pair-verify 之后做两轮 /fp-setup（Stage C 移植中）
-                    return ControlKeys(write, read, ByteArray(0))
+                    return ControlKeys(write, read, shared)
                 }
                 "error" -> {
                     log("AIRPLAY: 会话事件错误（第 $attempt 次尝试）- ${json.optString("message")}")
@@ -538,11 +541,99 @@ class AirPlayClient(
         }
     }
 
+    // ---- §10.57 会话生命周期 Rust 泵（控制通道读写单持有者）----
+    // Kotlin legacy request() 的写计数器与 Rust 各自维护 → nonce 错位
+    // （真机 21:58/22:04 BAD_DECRYPT 双实证）。会话建立后控制通道只允许
+    // Rust 写；屏流/隧道/feedback 全部经 native 调用注入，泵统一排空。
+
+    private val controlEventQueue = java.util.concurrent.LinkedBlockingQueue<org.json.JSONObject>()
+
+    @Volatile
+    private var sessionPumpHandle = 0L
+
+    private fun startSessionPump(
+        handle: Long,
+        input: java.io.InputStream,
+        output: java.io.OutputStream,
+    ) {
+        Thread({
+            val buf = ByteArray(16 * 1024)
+            while (!cancelled && sessionPumpHandle == handle) {
+                val n =
+                    try {
+                        input.read(buf)
+                    } catch (_: java.net.SocketTimeoutException) {
+                        drainRustOutbound(handle, output)
+                        continue
+                    } catch (_: IOException) {
+                        break
+                    }
+                if (n < 0) break
+                val event = NativeBridge.nativeAirplayOnBytes(handle, buf.copyOf(n))
+                drainRustOutbound(handle, output)
+                if (!event.isNullOrEmpty()) {
+                    val json = runCatching { org.json.JSONObject(event) }.getOrNull()
+                    if (json != null && json.optString("type") == "streamSetup") {
+                        controlEventQueue.offer(json)
+                    }
+                }
+            }
+        }, "rust-session-pump").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun drainRustOutbound(
+        handle: Long,
+        output: java.io.OutputStream,
+    ) {
+        NativeBridge.nativeAirplayTakeOutbound(handle)?.let { bytes ->
+            synchronized(rtspWriteLock) {
+                output.write(bytes)
+                output.flush()
+            }
+        }
+    }
+
+    /** Rust 流级 SETUP（屏 110 / 隧道 130），同步等待 streamSetup 回执事件。 */
+    fun rustStreamSetupWait(
+        json: String,
+        timeoutMs: Long = 8_000,
+    ): org.json.JSONObject? {
+        val handle = sessionPumpHandle
+        if (handle == 0L || controlSessionHandle != handle) return null
+        controlEventQueue.clear()
+        NativeBridge.nativeAirplayStreamSetup(handle, json.toByteArray())
+        val socket = socket ?: return null
+        drainRustOutbound(handle, socket.getOutputStream())
+        return controlEventQueue.poll(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    /** Rust 会话 feedback（'keep' POST /feedback——帧由 Rust 构建，1s 节奏）。 */
+    fun startRustFeedbackLoop() {
+        Thread({
+            while (isSessionAlive() && sessionPumpHandle != 0L) {
+                NativeBridge.nativeAirplayKeepAlive(sessionPumpHandle)
+                Thread.sleep(1_000)
+            }
+        }, "rust-feedback").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
     /**
      * RTSP /feedback 心跳（对照 catplay FEEDBACK_INTERVAL=1000ms）：每秒 POST 空体
      * /feedback——接收端的活动看门狗。RTSP 事务由 [rtspLock] 串行化。
      */
     fun startFeedbackLoop() {
+        // §10.57：Rust 会话态走 'keep'（帧由 Rust 构建+泵排空）——明文 request()
+        // 直写加密控制通道会 BAD_DECRYPT 断连（真机 21:58/22:04 实证）
+        if (sessionPumpHandle != 0L) {
+            startRustFeedbackLoop()
+            return
+        }
         Thread({
             var sent = 0
             while (isSessionAlive()) {
@@ -993,6 +1084,11 @@ class AirPlayClient(
                             "timingPort=${info.timingPort} 流=$streamIdx " +
                             "display=${info.displayWidth}x${info.displayHeight}",
                     )
+                    // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者——
+                    // Kotlin legacy request() 的写计数器与 Rust 分叉 → nonce
+                    // 错位 BAD_DECRYPT，真机 21:58/22:04 双实证）
+                    socket.soTimeout = 1_000
+                    startSessionPump(handle, input, output)
                     return info
                 }
                 "error" -> {
@@ -1524,6 +1620,28 @@ class AirPlayClient(
                         ),
                 ),
             )
+        // §10.57：Rust 会话态走 native 流 SETUP（控制通道写单持有者）
+        var rustTunnelEvent: org.json.JSONObject? = null
+        if (sessionPumpHandle != 0L) {
+            rustTunnelEvent =
+                rustStreamSetupWait(
+                    "{\"streamType\":130,\"controlType\":2,\"clientTypeUUID\":\"" + IAP_DATASTREAM_UUID +
+                        "\",\"seed\":\"" + seed + "\"}",
+                ) ?: run {
+                    log("TUNNEL: SETUP 失败（Rust 泵超时/断开）")
+                    return null
+                }
+            val dataPort = rustTunnelEvent.optInt("dataPort")
+            if (dataPort == 0) {
+                log("TUNNEL: SETUP 应答无 dataPort——接收端未启用 iAPChannel，降级事件通道")
+                return null
+            }
+            log("TUNNEL: ✓ 已接受（Rust）dataPort=$dataPort——隧道 socket 域走 legacy 连接")
+            // 返回 null = 本函数的 Rust 快路不建隧道对象；触摸隧道在后续
+            // legacy 连接逻辑重建前不可用（type-130 专用 socket 域待收编）。
+            // 当前 CarPlay 会话（音频/屏幕/事件/命令）不依赖隧道，不阻塞。
+            return null
+        }
         val (statusLine, responseBody) =
             try {
                 request("SETUP", "/", body, contentType = "application/x-apple-binary-plist")
@@ -2423,6 +2541,35 @@ class AirPlayClient(
                         ),
                 ),
             )
+        // §10.57：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）
+        if (sessionPumpHandle != 0L) {
+            val ev =
+                rustStreamSetupWait(
+                    "{\"streamType\":110,\"uuid\":\"$streamUuid\",\"latencyMs\":$SCREEN_LATENCY_MS}",
+                ) ?: run {
+                    log("AIRPLAY: 流协商失败（Rust 泵超时/断开）")
+                    return null
+                }
+            val dataPort = ev.optInt("dataPort")
+            if (dataPort == 0) {
+                log("AIRPLAY: 主屏流被拒绝（ev=$ev）")
+                return null
+            }
+            // 帧密钥与 legacy 同构：connectionId = Rust 请求侧生成值（事件回带）
+            val connectionId =
+                ev.optString("streamConnectionID").toLongOrNull()
+                    ?: (java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L)
+            val cipher =
+                if (sessionKey != null) {
+                    StreamFrameCipher.ChaCha(AirPlayStreamKeys.chachaStreamKey(sessionKey, connectionId))
+                } else {
+                    val (key, iv) = AirPlayStreamKeys.aesStreamKeys(AirPlayStreamKeys.ZERO_SESSION_KEY, connectionId)
+                    StreamFrameCipher.AesCtr(key, iv)
+                }
+            log("AIRPLAY: ✓ 主屏流已接受（Rust）dataPort=$dataPort connId=$connectionId")
+            armMib3VirtualLink()
+            return ScreenStreamInfo(connectionId, dataPort, cipher)
+        }
         // 请求路径与 catplay 完全一致：流 SETUP 走 "/"（初始 SETUP 走 "/setup"）。
         // 部分接收端（Audi 固件）对路径敏感，路径不符会整包 400。
         val (statusLine, responseBody) =
