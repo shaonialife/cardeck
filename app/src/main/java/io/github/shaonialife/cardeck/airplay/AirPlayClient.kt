@@ -2630,7 +2630,18 @@ class AirPlayClient(
     }
 
     /** RECORD：激活会话（接收端 onSessionActive）。路径用相对 `/`（catplay record() 同款）。 */
-    fun record(): Boolean =
+    fun record(): Boolean {
+        // §10.57：Rust 连接序已含 'rcrd'（recorded 事件 = 接收端已激活）——
+        // legacy record() 的写计数器与 Rust 分叉，直写会 BAD_DECRYPT 拆会话
+        // （真机 22:24:24 实证：视频帧已出、RECORD CSeq=2 即关）
+        if (sessionPumpHandle != 0L) {
+            log("AIRPLAY: RECORD 已由 Rust 连接序完成——跳过 legacy 重复声明")
+            return true
+        }
+        return recordLegacy()
+    }
+
+    private fun recordLegacy(): Boolean =
         try {
             val (statusLine, _) =
                 request(
