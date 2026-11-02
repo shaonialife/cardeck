@@ -2568,7 +2568,10 @@ class AirPlayClient(
                     StreamFrameCipher.AesCtr(key, iv)
                 }
             log("AIRPLAY: ✓ 主屏流已接受（Rust）dataPort=$dataPort connId=$connectionId")
-            armMib3VirtualLink()
+            // 注意：**不可**在此 armMib3VirtualLink()——那是 MIB3 隧道机型的
+            // 移交序列（拆蓝牙+detect）；非隧道机（DiPlay，iAPChannel=false）
+            // 调用即自拆会话（真机 22:28:59 实证：BT 退役 → EVENT reset →
+            // 视频 dataPort REFUSED）。门禁留在 legacy 分支。
             return ScreenStreamInfo(connectionId, dataPort, cipher)
         }
         // 请求路径与 catplay 完全一致：流 SETUP 走 "/"（初始 SETUP 走 "/setup"）。
