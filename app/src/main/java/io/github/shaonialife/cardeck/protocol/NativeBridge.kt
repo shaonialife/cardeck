@@ -314,10 +314,10 @@ object NativeBridge {
      *  BootUUID/osName/osVersion——宿主等价数据初值，audit §10.34）。 */
     external fun nativeAirplaySetIdentity(
         handle: Long,
-        deviceId: String?,
-        correlationUuid: String?,
-        osName: String?,
-        osVersion: String?,
+        deviceId: ByteArray?,
+        correlationUuid: ByteArray?,
+        osName: ByteArray?,
+        osVersion: ByteArray?,
     )
 
     /** 发起配对 M1（决策 = orchestrator：isPeerKnown ? verify : setup）。
@@ -359,12 +359,13 @@ object NativeBridge {
 
     /** 发流级 SETUP（'stup' URL=/，每调用恰 1 条流——固件
      *  setupStreamCreatingResponseInternal @0x2276c5250）。[streamJson] =
+     *  **UTF-8 字节数组**（桥面 bytes 约定，同 create）——
      *  {"streamType":N,"audioType":"media"?,...,"timestampInfo":{...}?}；
      *  五路音频 streamType = 100/101/103/106/107（Main/Alt/Buffered/Aux/OOB，
      *  fw: APCarPlayAudioFormatsCreate @0x2277d33f8）。 */
     external fun nativeAirplayStreamSetup(
         handle: Long,
-        streamJson: String,
+        streamJson: ByteArray,
     ): String?
 
     /** 发 keep-alive（'keep' 空体 POST /feedback；宿主按 10s 泵）。 */
@@ -387,7 +388,7 @@ object NativeBridge {
     /** 事件通道发 'comm' 命令（JSON 体 → plist）。 */
     external fun nativeAirplaySendCommand(
         handle: Long,
-        bodyJson: String,
+        bodyJson: ByteArray,
     ): String?
 
     /** 取走事件通道出站（应答/命令帧；null = 无）。 */
@@ -401,7 +402,7 @@ object NativeBridge {
      *  回复经泵 {"type":"announced"}。 */
     external fun nativeAirplayAnnounce(
         handle: Long,
-        paramsJson: String,
+        paramsJson: ByteArray,
     ): String?
 
     /** 发 RECORD（'rcrd'，空体——fw: Stage2StartTransaction

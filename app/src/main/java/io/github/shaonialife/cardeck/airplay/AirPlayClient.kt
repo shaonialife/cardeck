@@ -361,11 +361,47 @@ class AirPlayClient(
         NativeBridge.nativeAirplayInfo(handle)
         drainAndWrite()
         var pairingStarted = false
+        // §10.49 PIN 流：/pair-pin-start 车机受理后本连接进入「等人输码」
+        // 静默期——读超时（SO_TIMEOUT）不是失败，继续等；期间轮询
+        // pair_pin.txt，文件出现即经 providePin 在**同一连接**上续推 setup
+        // M1（真机 2026-11-02：车机对 /pair-pin-start 5ms 内回 200 空体；
+        // 重连反而丢配对上下文）。
+        var awaitingPin = false
+        var pinWaitLogged = false
+        // §10.50（2026-11-02）：PIN 流 dormant——iPhone 真机 sysdiagnose 实证
+        // DiPlay 走 type 0 常量码流（见 cardeck-protocol §10.50），本等待分支
+        // 仅在 Rust 回 pinRequired 时激活；激活时轮询 files/pair_pin.txt，
+        // 文件出现即经 providePin 在同一连接上续推 setup M1。
         val buf = ByteArray(16 * 1024)
         while (!cancelled) {
             val n =
                 try {
                     input.read(buf)
+                } catch (error: java.net.SocketTimeoutException) {
+                    if (awaitingPin) {
+                        val pin =
+                            context
+                                ?.filesDir
+                                ?.let { dir -> java.io.File(dir, "pair_pin.txt") }
+                                ?.takeIf { f -> f.isFile }
+                                ?.readText()
+                                ?.trim()
+                        if (!pin.isNullOrEmpty()) {
+                            log("AIRPLAY: ⌨ 配对码已注入（${pin.length} 位）——同一连接续推 setup M1")
+                            NativeBridge.nativeAirplayProvidePin(handle, pin.toByteArray())
+                            drainAndWrite()
+                            awaitingPin = false
+                            pinWaitLogged = false
+                        } else {
+                            if (!pinWaitLogged) {
+                                log("AIRPLAY: ⌨ /pair-pin-start 已受理（车机 200）——等待配对码注入（files/pair_pin.txt）")
+                                pinWaitLogged = true
+                            }
+                        }
+                        continue
+                    }
+                    log("AIRPLAY: 配对读超时（第 $attempt 次尝试）- ${error.message}")
+                    return null
                 } catch (error: IOException) {
                     log("AIRPLAY: 配对读断开（第 $attempt 次尝试）- ${error.message}")
                     return null
@@ -386,16 +422,15 @@ class AirPlayClient(
                         pairingStarted = true
                         rustInfoEvent = json
                         log("AIRPLAY: info deviceID=${json.optString("deviceID")}")
-                        NativeBridge.nativeAirplayStartPairing(handle)
+                        // startPairing 返回事件（pinRequired = PIN 流已起，
+                        // setup M1 未发——§10.49）：此前被丢弃，凭它进入等码期
+                        val startEv = NativeBridge.nativeAirplayStartPairing(handle)
+                        if (startEv?.contains("pinRequired") == true) {
+                            awaitingPin = true
+                            log("AIRPLAY: ⌨ PIN 流启动——等待车机屏配对码 / pair_pin.txt 注入")
+                        }
                         drainAndWrite()
                     }
-                }
-                "pinRequired" -> {
-                    // fw: PerformSetup pending（§10.49）——/pair-pin-start 已发，
-                    // 车机屏应显示配对码；v1 无输入 UI，把码填进设备配置的
-                    // 配对码（setupCodeOverride）后重连，Rust 即直发 setup M1
-                    log("AIRPLAY: ⌨ /pair-pin-start 已发——请看车机屏幕上的配对码，填入设备配对码配置后重连")
-                    return null
                 }
                 "reconnectRequired" -> {
                     // fw: 403 = 信任已建（SavePeer）→ 外层换新连接重试
@@ -781,8 +816,11 @@ class AirPlayClient(
         )
 
     fun assertModes(): Boolean {
-        val body =
-            BinaryPlist.encode(
+        // §10.56：命令走**事件通道**（DiPlay 同款——命令双向都在事件通道
+        // POST /command；控制通道明文直写会绕过 Rust 会话加密 → 接收端
+        // BAD_DECRYPT 断连，真机 2026-11-02 实证）
+        val sent =
+            postEventCommand(
                 linkedMapOf(
                     "type" to "modesChanged",
                     "params" to
@@ -801,20 +839,8 @@ class AirPlayClient(
                         ),
                 ),
             )
-        return try {
-            val (statusLine, _) =
-                request(
-                    "POST",
-                    "/command",
-                    body,
-                    contentType = "application/x-apple-binary-plist",
-                )
-            log("AIRPLAY: modesChanged（声明持有主屏/主音频资源）[$statusLine]")
-            statusLine.contains("200")
-        } catch (error: IOException) {
-            log("AIRPLAY: modesChanged 失败 - ${error.message}")
-            false
-        }
+        log("AIRPLAY: modesChanged（声明持有主屏/主音频资源）[事件通道] ok=$sent")
+        return sent
     }
 
     /**
@@ -921,17 +947,17 @@ class AirPlayClient(
                 "controlSetup" -> {
                     controlJson = json
                     // fw: 流序 SETUP→ANNOUNCE（sdpsession 域）——恒建对 Main/Alt
-                    NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":100}")
+                    NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":100}".toByteArray())
                     drainAndWrite()
                 }
                 "streamSetup" -> {
                     streamIdx++
                     if (streamIdx == 1) {
-                        NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":101}")
+                        NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":101}".toByteArray())
                         drainAndWrite()
                     } else {
                         // 流 SETUP 齐 → ANNOUNCE（§10.41 SDP 体）
-                        NativeBridge.nativeAirplayAnnounce(handle, buildAnnounceParams(socket))
+                        NativeBridge.nativeAirplayAnnounce(handle, buildAnnounceParams(socket).toByteArray())
                         drainAndWrite()
                     }
                 }
