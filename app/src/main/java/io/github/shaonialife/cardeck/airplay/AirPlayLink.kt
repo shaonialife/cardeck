@@ -942,7 +942,9 @@ class AirPlayLink(
             maxFps = (display?.optLong("maxFPS") ?: 30L).toInt(),
             hidDeviceUuids = emptyList(),
             hidDescriptors = emptyMap(),
-            keepAliveSendStatsAsBody = false,
+            // R3 恢复接线（M5.2 起断链——/info 该键无人读；奥迪 3315 声明 true，
+            // true = keepAlive 帧须携统计体 opcode=5+bplist）
+            keepAliveSendStatsAsBody = root?.optBoolean("keepAliveSendStatsAsBody", false) ?: false,
         )
     }
 
@@ -1233,7 +1235,7 @@ class AirPlayLink(
      * 车机身份文本（音频档位记忆的键来源）：只用 /info 里稳定的 model + manufacturer，
      * 蓝牙名/固件串会随重连变化，不能进键。
      * R2 修复：读 Rust info 事件（此前 negotiatedInfo 从未赋值 → 恒 "unknown"，
-     * AudioProfileMemory 键退化）。
+     * 档位记忆键退化——该记忆已随 R3 退役）。
      */
     fun receiverIdentity(): String {
         val info = rustInfoEvent

@@ -5,9 +5,9 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.view.Surface
 import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
-import io.github.shaonialife.cardeck.airplay.BinaryPlist
 import io.github.shaonialife.cardeck.airplay.StreamFrameCipher
 import io.github.shaonialife.cardeck.net.TcpLiveness
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.io.ByteArrayOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -509,6 +509,8 @@ class VideoSender(
          *
          * 拆成纯函数是为了单测：帧格式一旦写错（opcode/body 长度字段/统计体键名），
          * 接收端会静默忽略而不报错——现象仍是 10 秒后被拆链，排查成本极高。
+         * R3：统计体 bplist 在 Rust（nativeAirplayKeepAliveStatsBody，键名/
+         * 类型钉 fw::airplay::screen 测试）。
          */
         internal fun buildKeepAliveFrame(
             withStats: Boolean,
@@ -518,16 +520,8 @@ class VideoSender(
         ): ByteArray {
             val body =
                 if (withStats) {
-                    // 字段名对照 catplay ScreenSenderStats（serde camelCase）
-                    BinaryPlist.encode(
-                        linkedMapOf(
-                            "txUsageAvg" to bytesPerSecond,
-                            "encoderCurrentFPS" to framesPerSecond.toLong(),
-                            "sentFramesAvg" to frames.toLong(),
-                            "queuedFramesAvg" to 0L,
-                            "lossAvg" to 0.0,
-                        ),
-                    )
+                    NativeBridge.nativeAirplayKeepAliveStatsBody(frames, bytesPerSecond, framesPerSecond)
+                        ?: ByteArray(0)
                 } else {
                     ByteArray(0)
                 }

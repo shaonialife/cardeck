@@ -508,7 +508,6 @@ class MainActivity : AppCompatActivity() {
             .apply()
         // 声音只剩一个模式：通路协商（AAC-LC 优先，不行自动退 PCM）在会话内自动完成，
         // 不再有「兼容档」这种人工分支。
-        SessionController.audioPreferCompat = false
         if (!enabled) {
             log("MODE: 本次连接仅推视频（未开启车机侧声音）")
             startConnectionNow()

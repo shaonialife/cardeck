@@ -1,8 +1,8 @@
 package io.github.shaonialife.cardeck.video
 
-import io.github.shaonialife.cardeck.airplay.BinaryPlist
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.BeforeClass
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -14,6 +14,8 @@ import java.nio.ByteOrder
  * 10.2s 整轮会话被 reset（视频/事件通道都健康）。catplay 在视频持续推流时**仍每秒**
  * 向屏幕数据口写一条 keepAlive 帧——这是接收端屏幕上独立的存活信号。
  * 帧格式写错时接收端静默忽略、现象仍是「10 秒断开」，所以必须有单测锁住。
+ * R3：统计体 bplist 在 Rust（nativeAirplayKeepAliveStatsBody）——带体用例
+ * 需要宿主 dylib，键名/类型钉在 fw::airplay::screen 测试。
  */
 class VideoKeepAliveFrameTest {
     private fun header(frame: ByteArray) = frame.copyOfRange(0, 128)
@@ -23,6 +25,21 @@ class VideoKeepAliveFrameTest {
             .wrap(header, 0, 4)
             .order(ByteOrder.LITTLE_ENDIAN)
             .int
+
+    companion object {
+        @JvmStatic
+        @BeforeClass
+        fun loadNativeProtocolLib() {
+            val candidates =
+                listOf(
+                    "../../cardeck-protocol/target/debug/libcardeck_protocol.dylib",
+                    "../../cardeck-protocol/target/release/libcardeck_protocol.dylib",
+                )
+            val lib = candidates.firstOrNull { java.io.File(it).isFile }
+            org.junit.Assume.assumeTrue("宿主 dylib 不存在，跳过（先 cargo build）", lib != null)
+            System.load(java.io.File(lib!!).absolutePath)
+        }
+    }
 
     @Test
     fun emptyKeepAliveIsOpcode2HeaderOnly() {
@@ -45,12 +62,11 @@ class VideoKeepAliveFrameTest {
         assertEquals(5, head[4].toInt() and 0xFF)
         val size = bodySize(head)
         assertEquals(frame.size - 128, size)
-
+        // 键名/类型由 Rust 侧测试钉（fw::airplay::screen::stats_body_keys_and_types）；
+        // 此处锁「体确为 bplist00 且长度真实」
         val body = frame.copyOfRange(128, frame.size)
-        val stats = BinaryPlist.parse(body) as Map<*, *>
-        assertEquals(30L, stats["encoderCurrentFPS"])
-        assertEquals(30L, stats["sentFramesAvg"])
-        assertEquals(900_000.0, stats["txUsageAvg"])
+        assertEquals("bplist00", String(body, 0, 8, Charsets.US_ASCII))
+        assertTrue(body.size > 8)
     }
 
     @Test

@@ -7,7 +7,6 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import io.github.shaonialife.cardeck.airplay.AirPlayLink
 import io.github.shaonialife.cardeck.audio.AudioProfile
-import io.github.shaonialife.cardeck.audio.AudioProfileMemory
 import io.github.shaonialife.cardeck.audio.AudioSender
 import io.github.shaonialife.cardeck.audio.AudioTuning
 import io.github.shaonialife.cardeck.bt.BtProfiles
@@ -293,33 +292,6 @@ object SessionController {
     /** 本次会话是否在车机侧播放声音（由「启动连接」弹窗选择）。 */
     @Volatile
     var audioEnabledForSession: Boolean = false
-
-    /**
-     * 「开启声音（兼容档）」：候选里把非 media 档（compatibility 等）排前面。
-     * 2026-10-19 Honda HFT 实测——media 档只声明 44.1k，该车机音频通路只吃得下 48k，
-     * 走默认档会「上线几秒后整车机拆链」。
-     */
-    @Volatile
-    var audioPreferCompat: Boolean = false
-
-    /** 本轮真正用上的音频档位（拆链归因与记忆回写用；null = 本次没有音频）。 */
-    @Volatile
-    private var activeAudioProfile: AudioProfile? = null
-
-    /** 音频档位记忆的键（车机身份文本，见 [AirPlayLink.receiverIdentity]）。 */
-    @Volatile
-    private var activeAudioReceiverKey: String = ""
-
-    /** 音频通道真正开始推流的时刻（uptimeMillis）；0 = 未开始。 */
-    @Volatile
-    private var activeAudioStartedAt: Long = 0L
-
-    /**
-     * 音频「存活窗口」（ms）：超过它才认为该档位可用。
-     * 依据 2026-10-19 实测：拆链发生在音频起流后 6.5s；取 20s 留足车机音频通路初始化
-     * 与首个欠载周期的余量。
-     */
-    private const val AUDIO_PROFILE_PROBE_MS = 20_000L
 
     /** 会话建立互斥（端点交接 → 配对 → 推流全程只允许一条）。 */
     val sessionStarting = AtomicBoolean(false)
@@ -1719,29 +1691,16 @@ object SessionController {
             return false
         }
         return try {
-            // 车机身份 → 只用于「本车机哪些音频档位踩过雷」的持久化记忆。
-            val identity = client.receiverIdentity()
             // 音频封装参数已定案（见 AudioTuning），不再提供切换
             val tuning = AudioTuning.RAW_SPF
-            val entry = AudioProfileMemory.load(context.applicationContext, identity)
-            if (entry.disabled) {
-                // 以前「全部档位都导致拆链」会自动退成只推视频，并要用户去弹窗里手点
-                // 「清除记忆」。现在音频通路已换成 AAC-LC 且实测能稳定跑满 147s，
-                // 旧结论不再可信：用户既然主动选了「开启声音」，就直接清记忆重试。
-                AudioProfileMemory.clearAll(context.applicationContext)
-                appendLog("AUDIO: 本车机（$identity）有「全部档位拆链」的旧记忆，已自动清除并重试")
-            }
-            val candidates = client.audioCandidates(preferCompat = audioPreferCompat)
-            val ordered = AudioProfileMemory.order(candidates, entry)
+            // 候选序 = Rust D7 选择（R3 起 AudioProfileMemory 记忆退役——
+            // 候选位图即车机自报声明，按序重试已覆盖「某档不被接受」场景）
+            val ordered = client.audioCandidates()
             if (ordered.isEmpty()) {
-                appendLog("AUDIO: 没有可用音频档位（候选=${candidates.map { it.label }}）——仅推视频")
+                appendLog("AUDIO: 没有可用音频档位——仅推视频")
                 return false
             }
-            appendLog(
-                "AUDIO: 音频档位候选=${ordered.map { it.label }}" +
-                    "（本车机记忆：${AudioProfileMemory.describe(entry)}；" +
-                    "封装=${tuning.detail}）",
-            )
+            appendLog("AUDIO: 音频档位候选=${ordered.map { it.label }}（封装=${tuning.detail}）")
             // SETUP 失败不会扰动会话（车机只是不接这条流的请求），所以本会话内就把候选
             // 试完，不必等下一次连接。这一点对当前场景很关键：102/AAC-LC 与 100/PCM 是
             // 两条完全不同的通路，前者不被接受时应当立刻退到后者，而不是让用户白连一次。
@@ -1754,15 +1713,6 @@ object SessionController {
                     streamInfo = result
                     break
                 }
-                // SETUP 被拒不等于「车机不兼容」：可能只是资源仲裁/网络抖动，
-                // 不能据此把整台车机的音频判死（置 disabled 只认「拆链」证据）。
-                AudioProfileMemory.recordRejected(
-                    context.applicationContext,
-                    identity,
-                    candidate.key,
-                    ordered.map { it.key }.toSet(),
-                    markExhausted = false,
-                )
                 appendLog("AUDIO: 档位 ${candidate.label} 协商失败——本会话继续试下一档")
             }
             val profile = chosen
@@ -1771,9 +1721,6 @@ object SessionController {
                 appendLog("AUDIO: 全部候选档位协商失败（共 ${ordered.size} 档）——本次仅推视频")
                 return false
             }
-            activeAudioProfile = profile
-            activeAudioReceiverKey = identity
-            activeAudioStartedAt = android.os.SystemClock.uptimeMillis()
             val sender =
                 AudioSender(
                     host = host,
@@ -1795,8 +1742,6 @@ object SessionController {
             sender.onRouteHijackSuspect = { maybeReclaimAudioRoute() }
             if (!sender.start(projection)) {
                 audioSender = null
-                activeAudioProfile = null
-                activeAudioStartedAt = 0L
                 false
             } else {
                 true
@@ -1804,68 +1749,9 @@ object SessionController {
         } catch (error: Exception) {
             appendLog("AUDIO: 通道启动异常 - ${error.message}")
             audioSender = null
-            activeAudioProfile = null
-            activeAudioStartedAt = 0L
             false
         }
     }
-
-    /**
-     * 会话结束时的**音频拆链归因**（2026-10-19 Honda HFT / Alpine 实测新增）。
-     *
-     * 现象：选了「视频+音频」后会话能建立、视频也正常，但音频起流约 6s 后车机把整条
-     * AirPlay 会话拆掉（`EVENT: 读取结束 - Connection reset`），只推视频则稳定。
-     * 车机侧不会告诉我们「哪一档音频不兼容」，只能用存活时间反推：
-     *  - 音频起流后**没跑满** [AUDIO_PROFILE_PROBE_MS] 就整链被拆 → 判该档位不兼容，
-     *    记入本车机名单（全部档位都被判死则置 disabled，下次直接只推视频）；
-     *  - 跑满了 → 记为该档位可用，下次连接直接首选。
-     *
-     * 注意只在「确实起过音频」时归因；纯视频会话结束不做任何记忆改写。
-     */
-    private fun attributeAudioTeardown() {
-        val profile = activeAudioProfile ?: return
-        val startedAt = activeAudioStartedAt
-        val identity = activeAudioReceiverKey
-        val lived = if (startedAt > 0) android.os.SystemClock.uptimeMillis() - startedAt else -1L
-        // 本轮记忆很快失效：下次连接重新按最新记忆选档
-        activeAudioProfile = null
-        activeAudioStartedAt = 0L
-        if (startedAt == 0L || identity.isBlank()) return
-        val ctx = appContext?.applicationContext
-        if (lived >= AUDIO_PROFILE_PROBE_MS) {
-            AudioProfileMemory.recordWorking(ctx, identity, profile.key)
-            appendLog("AUDIO: 档位 ${profile.label} 存活 ${lived / 1000}s——记为本车机可用档位")
-            return
-        }
-        val allKeys = audioCandidateKeys(identity)
-        AudioProfileMemory.recordRejected(ctx, identity, profile.key, allKeys)
-        val after = AudioProfileMemory.load(ctx, identity)
-        appendLog(
-            "AUDIO: ⚠ 档位 ${profile.label} 起流 ${lived / 1000}s 后整条会话被车机拆掉——" +
-                "判定为本车机不兼容档位（已记入名单）。" +
-                if (after.disabled) {
-                    "全部档位均不兼容：下次连接将自动只推视频（车机侧无声音）。"
-                } else {
-                    "下次点「启动连接」会自动换用下一档；也可直接选「开启声音（兼容档）」。"
-                },
-        )
-        uiHintSink?.invoke(
-            if (after.disabled) {
-                "本车机音频不兼容，下次连接将自动只推视频"
-            } else {
-                "该音频档位导致断开，已记录；重连会自动换档"
-            },
-        )
-    }
-
-    /** 该车机上「所有可能用到的档位键」——用于判断是否已全部试穿。 */
-    private fun audioCandidateKeys(identity: String): Set<String> =
-        runCatching {
-            val client = currentClient ?: return@runCatching emptySet()
-            val preferred = client.audioCandidates(preferCompat = audioPreferCompat).map { it.key }
-            val alternate = client.audioCandidates(preferCompat = !audioPreferCompat).map { it.key }
-            (preferred + alternate).toSet()
-        }.getOrDefault(emptySet())
 
     /**
      * modesChanged 资源重申调度（MIB3 控制会话完成事件驱动）。
@@ -2432,9 +2318,6 @@ object SessionController {
                                             // disconnect 一端必遗留（2026-10-23 审阅定谳）。下一轮
                                             // 若走深度兜底会重新登记，语义自洽。
                                             cleanupShellFallbackNetwork()
-                                            // 音频拆链归因：起过音频却很快被拆 → 记下该档位
-                                            // 不兼容，下次连接自动换档（见 attributeAudioTeardown）。
-                                            attributeAudioTeardown()
                                         },
                                     )
                                 // 先连端口（车机看门狗），编码器等 RECORD 后再启动

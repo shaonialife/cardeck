@@ -22,8 +22,8 @@ enum class AudioCodec {
  *    而它真正的媒体通路是 **`type=102`（MainHighAudio）+ `media` + AAC-LC 44.1k**
  *    （`0x400000`，bit22）——真 iPhone 的媒体音频就走这条。
  *
- * 所以候选必须是**跨流类型、跨编码**的多档，失败一档换下一档，并把结论按车机
- * 持久化（[AudioProfileMemory]）。
+ * 所以候选必须是**跨流类型、跨编码**的多档，失败一档换下一档（序 = Rust D7
+ * 选择，session::InfoReply::audio_candidates——R3 起跨会话记忆退役）。
  */
 data class AudioProfile(
     /** audioType 原值（media / compatibility / default …），SETUP 里原样回给车机。 */

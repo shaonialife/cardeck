@@ -397,6 +397,14 @@ object NativeBridge {
     /** 取走事件通道出站（应答/命令帧；null = 无）。 */
     external fun nativeAirplayEventTakeOutbound(handle: Long): ByteArray?
 
+    /** 屏幕流 keepAlive 统计体（bplist，键名/类型钉在 Rust screen 测试）。
+     *  纯函数（无会话态）。 */
+    external fun nativeAirplayKeepAliveStatsBody(
+        frames: Int,
+        bytesPerSecond: Double,
+        fps: Int,
+    ): ByteArray?
+
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
 
     /** 建连接编排决策机（每轮 runFlow 一个；[noPairingHint] = TXT 未声明
