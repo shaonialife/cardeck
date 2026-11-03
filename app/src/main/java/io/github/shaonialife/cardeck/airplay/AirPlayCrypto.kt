@@ -1,13 +1,10 @@
 package io.github.shaonialife.cardeck.airplay
 
-import org.bouncycastle.crypto.digests.SHA512Digest
 import org.bouncycastle.crypto.engines.AESEngine
-import org.bouncycastle.crypto.generators.HKDFBytesGenerator
 import org.bouncycastle.crypto.modes.ChaCha20Poly1305
 import org.bouncycastle.crypto.modes.SICBlockCipher
 import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.HKDFParameters
 import org.bouncycastle.crypto.params.KeyParameter
 import org.bouncycastle.crypto.params.ParametersWithIV
 import java.security.SecureRandom
@@ -18,7 +15,10 @@ import java.security.SecureRandom
  * 配对协议原语（X25519/ed25519 签名/配对 nonce）已于 2026-11-02 移交 Rust
  * （fw::pairing，8B nonce=ChaCha 64x64 固件变体；Kotlin 旧的 12B RFC 补零
  * 形态与固件不相容，已随 Srp6aClient/Tlv8 一并删除）。
- * 本文件只剩：身份 seed 生成（持久化）、流层 HKDF/SHA512、
+ * 流密钥派生（HKDF/SHA512）已于 2026-11-03 移交 Rust（A3——fw::airplay::
+ * stream_keys，`_coreUtilsKeyHolder_CreateEncryptionKeysForStream`
+ * @0x2276c9a20；钥随 streamSetup 事件交付宿主）。
+ * 本文件只剩：身份 seed 生成（持久化，A9 退役域）、
  * 流/控制通道 AEAD（nonce64=12B RFC——流层形态，与配对域分立）。
  */
 object AirPlayCrypto {
@@ -37,27 +37,6 @@ object AirPlayCrypto {
     }
 
     fun ed25519PublicKey(privateKeyRaw: ByteArray): ByteArray = Ed25519PrivateKeyParameters(privateKeyRaw, 0).generatePublicKey().encoded
-
-    fun hkdfSha512(
-        inputKeyMaterial: ByteArray,
-        salt: ByteArray,
-        info: ByteArray,
-        length: Int = 32,
-    ): ByteArray {
-        val generator = HKDFBytesGenerator(SHA512Digest())
-        generator.init(HKDFParameters(inputKeyMaterial, salt, info))
-        val output = ByteArray(length)
-        generator.generateBytes(output, 0, length)
-        return output
-    }
-
-    fun sha512(vararg parts: ByteArray): ByteArray {
-        val digest = SHA512Digest()
-        parts.forEach { digest.update(it, 0, it.size) }
-        val output = ByteArray(digest.digestSize)
-        digest.doFinal(output, 0)
-        return output
-    }
 
     /**
      * AES-128-CTR 密钥流（catplay `AirPlayCipherCodec` / `ScreenFrameCodec` 的 AES 路径）。

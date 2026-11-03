@@ -12,6 +12,10 @@ package io.github.shaonialife.cardeck.airplay
  *
  * 2026-10-19 数据点：奥迪 4xxx（如 4851）可能属于第三类——对它强制
  * pair-setup 必然失败，而 catplay 先用明文 SETUP 起步、屏幕流走 AES 零密钥即可连上。
+ *
+ * **A3 起形态选择与钥派生全在 Rust**（fw: createCryptors 分派
+ * @0x2276c5fd0-6488 + DataStream 双钥 @0x2276c9a20）——本类只是事件交付
+ * 值的载体，实例由 AirPlayLink 按 streamSetup 事件构建。
  */
 sealed class StreamFrameCipher {
     /** 视频帧 ChaCha20-Poly1305 密封（16B tag），keepAlive/config 帧不加密。 */
@@ -24,42 +28,4 @@ sealed class StreamFrameCipher {
         val key: ByteArray,
         val iv: ByteArray,
     ) : StreamFrameCipher()
-}
-
-object AirPlayStreamKeys {
-    /**
-     * ChaCha 流密钥：HKDF-SHA512(shared_secret, "DataStream-Salt<connId>", "DataStream-Output-Encryption-Key")。
-     * 与 catplay `create_chacha_ciphers` / 接收端 ScreenStream 的派生规则一致。
-     */
-    fun chachaStreamKey(
-        sharedSecret: ByteArray,
-        connectionId: Long,
-    ): ByteArray =
-        AirPlayCrypto.hkdfSha512(
-            sharedSecret,
-            "DataStream-Salt$connectionId".toByteArray(Charsets.US_ASCII),
-            "DataStream-Output-Encryption-Key".toByteArray(Charsets.US_ASCII),
-        )
-
-    /** `et=NONE` 时的会话密钥：16 字节全零（catplay ScreenFrameCodec::new 同款）。 */
-    val ZERO_SESSION_KEY: ByteArray = ByteArray(16)
-
-    /**
-     * AES 流密钥/IV（catplay `derive_aes_stream_keys` 逐字节对齐）：
-     *   key = SHA512("AirPlayStreamKey" + connId(十进制) + sessionKey)[0..16]
-     *   iv  = SHA512("AirPlayStreamIV"  + connId(十进制) + sessionKey)[0..16]
-     */
-    fun aesStreamKeys(
-        sessionKey: ByteArray,
-        connectionId: Long,
-    ): Pair<ByteArray, ByteArray> {
-        fun digest(prefix: String): ByteArray =
-            AirPlayCrypto
-                .sha512(
-                    prefix.toByteArray(Charsets.US_ASCII),
-                    connectionId.toString().toByteArray(Charsets.US_ASCII),
-                    sessionKey,
-                ).copyOfRange(0, 16)
-        return digest("AirPlayStreamKey") to digest("AirPlayStreamIV")
-    }
 }

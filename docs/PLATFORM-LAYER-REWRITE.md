@@ -171,6 +171,18 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
       绿，隔离 offender）→ 台架源码定罪。修复后 4E0E 回归，5703+4301 双至
       （失败轮缺的正是这两帧），推流稳定（帧 #1800/keepAlive #60）。
       196 lib 测试全绿
+- [x] **A3 流密钥下沉**（2026-11-03 完成，protocol（A3 Rust 提交）+
+      android-carplay（A3 Kotlin 提交））：数据面跨平台下沉第一刀
+      （docs/CROSS-PLATFORM-DATA-PLAN.md 施工序）。流钥派生全入 Rust
+      （fw::airplay::stream_keys，fw: CreateEncryptionKeysForStream
+      @0x2276c9a20 + createCryptors 分派 @0x2276c5fd0-6488），streamSetup
+      事件携 `cipher`/`streamKey`/`key`+`iv` hex——runAudioStream/
+      runScreenStream 改读事件（交付残缺 = 协议异常即跳过）；删
+      AirPlayStreamKeys + StreamFrameCipherTest（字节钉迁 Rust：python
+      RFC 5869 向量 + 退役 Kotlin bouncycastle 锚双源）；AirPlayCrypto 撤
+      HKDF/SHA512（bouncycastle 三 import 退役，A9 前小口）；startAudioChannel
+      改 paired 布尔闸（currentSharedSecret 只剩配对态标记）。验证：Rust
+      201 全绿；Kotlin compile/JVM/spotless/lint 全绿；装机回归待「安装」
 
 ## 六、收尾状态（2026-11-03）
 

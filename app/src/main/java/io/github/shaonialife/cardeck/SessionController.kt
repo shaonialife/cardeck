@@ -282,7 +282,11 @@ object SessionController {
     @Volatile
     var currentHiddenSource: HiddenDisplaySource? = null
 
-    /** 当前会话的共享密钥与接收端地址：投影授权晚于连接时，动态补启音频用。 */
+    /**
+     * 当前会话的「已配对」标记（配对共享密钥原文）：投影授权晚于连接时，
+     * 动态补启音频的闸。A3 起钥本体不在此派生（流钥随 Rust streamSetup
+     * 应答交付），本字段只剩配对态判定用途。
+     */
     @Volatile
     var currentSharedSecret: ByteArray? = null
 
@@ -724,7 +728,7 @@ object SessionController {
         }
         if (audioSender?.isRunning == true) return
         appendLog("MODE: 会话进行中，动态补启音频通道…")
-        startAudioChannel(context, client, secret, currentAudioHost)
+        startAudioChannel(context, client, secret != null, currentAudioHost)
     }
 
     /**
@@ -1665,17 +1669,18 @@ object SessionController {
     fun startAudioChannel(
         context: Context,
         client: AirPlayLink,
-        sharedSecret: ByteArray?,
+        paired: Boolean,
         host: String?,
     ): Boolean {
         if (!audioEnabledForSession) {
             appendLog("AUDIO: 本次连接未开启车机侧声音（「启动连接」弹窗选择）——仅推视频")
             return false
         }
-        if (sharedSecret == null) {
-            // 明文会话（et=NONE）没有共享密钥可派生 DataStream 输出密钥：
-            // 推出去的 RTP 车机无法解密。宁可不推，也不要制造「有包无声」的假象。
-            appendLog("AUDIO: 明文会话（未配对）无共享密钥——跳过音频通道")
+        if (!paired) {
+            // 明文会话（et=NONE）没有 DataStream 输出密钥域（fw:
+            // createCryptors 属性缺失域 @0x2276c5fd0）：推出去的 RTP 车机
+            // 无法解密。宁可不推，也不要制造「有包无声」的假象。
+            appendLog("AUDIO: 明文会话（未配对）——跳过音频通道")
             return false
         }
         if (host == null) {
@@ -1707,7 +1712,7 @@ object SessionController {
             var chosen: AudioProfile? = null
             var streamInfo: AirPlayLink.AudioStreamInfo? = null
             for (candidate in ordered) {
-                val result = client.runAudioStream(sharedSecret, candidate, tuning)
+                val result = client.runAudioStream(candidate, tuning)
                 if (result != null) {
                     chosen = candidate
                     streamInfo = result
@@ -2040,7 +2045,8 @@ object SessionController {
                         } else {
                             appendLog("AIRPLAY: 明文会话建立（et=NONE + AES-CTR 屏幕流）")
                         }
-                        // 已配对 → 共享密钥 + Events 双钥；明文会话 → null（流加密降级为 AES-CTR）
+                        // 已配对 → Events 双钥；sessionKey 仅作「已配对」闸标记
+                        // （A3 起流钥本体随 Rust streamSetup 应答交付，宿主不持钥）
                         val sessionKey = pairedKeys?.sharedSecret
                         val eventsWrite = pairedKeys?.eventsWriteKey
                         val eventsRead = pairedKeys?.eventsReadKey
@@ -2215,7 +2221,7 @@ object SessionController {
                         appendLog(
                             "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}",
                         )
-                        val screen = client.runScreenStream(sessionKey, setup.displayUuid)
+                        val screen = client.runScreenStream(setup.displayUuid)
                         if (screen != null) {
                             // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
                             // 视频数据端口与 keepAlive 都按它建 socket；IPv6 端点也算
@@ -2370,7 +2376,7 @@ object SessionController {
                             }
                             // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
                             // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
-                            val audioStarted = startAudioChannel(context, client, sessionKey, host)
+                            val audioStarted = startAudioChannel(context, client, sessionKey != null, host)
                             if (audioStarted) {
                                 // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
                                 // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200

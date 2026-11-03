@@ -1100,8 +1100,13 @@ class AirPlayLink(
      * SETUP：协商主音频流（type 100，RTP over UDP）。
      *
      * 线格式与视频同族但传输不同：接收端在应答里开 **UDP** dataPort/controlPort，
-     * 手机把 PCM 帧按 [AudioSender] 的格式发过去。密钥 = HKDF(shared,
-     * "DataStream-Salt<音频 connId>", "DataStream-Output-Encryption-Key")。
+     * 手机把 PCM 帧按 [AudioSender] 的格式发过去。
+     *
+     * **流钥 A3 起随 Rust streamSetup 应答交付**（fw:
+     * `_coreUtilsKeyHolder_CreateEncryptionKeysForStream` @0x2276c9a20——
+     * HKDF-SHA512(shared, "DataStream-Salt<connId>",
+     * "DataStream-Output-Encryption-Key")；事件 `streamKey` 键）——宿主零本地
+     * 派生，未配对会话（无 DataStream 钥域）Rust 不交付 → 本壳跳过。
      *
      * 字段按 catplay 发送端（`StreamDescriptionAudio::new`）对齐：
      *  - `audioLatencyMs` 必填（接收端会读；漏发会让严格实现拆会话）
@@ -1115,7 +1120,6 @@ class AirPlayLink(
      * 格式由候选档给定（Rust D7 选择）；采样率下发给 [AudioSender] 保持一致。
      */
     fun runAudioStream(
-        sharedSecret: ByteArray,
         profile: AudioProfile,
         tuning: AudioTuning = AudioTuning.RAW_SPF,
     ): AudioStreamInfo? {
@@ -1162,6 +1166,13 @@ class AirPlayLink(
                 return null
             }
             controlPortFromEv = ev.optInt("controlPort")
+            // A3 下沉：流钥随应答交付（fw: DataStream-Output-Encryption-Key
+            // @0x2276c9a20）；未交付 = 未配对会话（无 DataStream 钥域）——跳过
+            val streamKey = hexToBytes(ev.optString("streamKey"))
+            if (streamKey == null) {
+                log("AIRPLAY: 流密钥未交付（未配对会话无 DataStream 钥域）——音频跳过")
+                return null
+            }
             log(
                 "AIRPLAY: ✓ 音频流协商成功（Rust）type=${profile.streamType} " +
                     "dataPort=$dataPort controlPort=$controlPortFromEv connId=$connectionId",
@@ -1171,12 +1182,7 @@ class AirPlayLink(
                 streamConnectionId = connectionId,
                 dataPort = dataPort,
                 controlPort = controlPortFromEv,
-                streamKey =
-                    AirPlayCrypto.hkdfSha512(
-                        sharedSecret,
-                        "DataStream-Salt$connectionId".toByteArray(Charsets.US_ASCII),
-                        "DataStream-Output-Encryption-Key".toByteArray(Charsets.US_ASCII),
-                    ),
+                streamKey = streamKey,
                 sampleRate = profile.sampleRate,
             )
         }
@@ -1246,15 +1252,14 @@ class AirPlayLink(
 
     /**
      * SETUP #2：协商主屏视频流（type 110）。streamConnectionID 由客户端指定，
-     * 两端各自按会话加密方式派生流密钥；接收端开 TCP 数据端口并在应答里返回。
+     * 接收端开 TCP 数据端口并在应答里返回。
      *
-     * [sessionKey]：pair-verify 派生的共享密钥；null = 未配对会话（`et=NONE`），
-     * 按 catplay 走 AES-128-CTR + 全零会话密钥。
+     * **帧密钥 A3 起随 Rust streamSetup 应答交付**（fw: createCryptors 内联
+     * 分派 @0x2276c5fd0-6488：配对态 ChaCha（DataStream-Output 钥）；et=NONE
+     * → AES-128-CTR（全零会话钥派生，catplay 对照域））——宿主零本地派生，
+     * 事件 `cipher` 键选择形态、`streamKey`/`key`+`iv` 携钥。
      */
-    fun runScreenStream(
-        sessionKey: ByteArray?,
-        displayUuid: String? = null,
-    ): ScreenStreamInfo? {
+    fun runScreenStream(displayUuid: String? = null): ScreenStreamInfo? {
         val streamUuid =
             displayUuid ?: java.util.UUID
                 .randomUUID()
@@ -1288,12 +1293,35 @@ class AirPlayLink(
             val connectionId =
                 ev.optString("streamConnectionID").toLongOrNull()
                     ?: (java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L)
+            // A3 下沉：封包形态/钥全在 Rust 事件（fw: createCryptors 分派
+            // @0x2276c5fd0-6488）；交付残缺 = 协议异常，本壳不落派生
             val cipher =
-                if (sessionKey != null) {
-                    StreamFrameCipher.ChaCha(AirPlayStreamKeys.chachaStreamKey(sessionKey, connectionId))
-                } else {
-                    val (key, iv) = AirPlayStreamKeys.aesStreamKeys(AirPlayStreamKeys.ZERO_SESSION_KEY, connectionId)
-                    StreamFrameCipher.AesCtr(key, iv)
+                when (ev.optString("cipher")) {
+                    "chacha" ->
+                        StreamFrameCipher.ChaCha(
+                            hexToBytes(ev.optString("streamKey"))
+                                ?: run {
+                                    log("AIRPLAY: ChaCha 流钥交付残缺（ev=$ev）")
+                                    return null
+                                },
+                        )
+                    "aesCtr" -> {
+                        val key =
+                            hexToBytes(ev.optString("key")) ?: run {
+                                log("AIRPLAY: AES 流钥交付残缺（ev=$ev）")
+                                return null
+                            }
+                        val iv =
+                            hexToBytes(ev.optString("iv")) ?: run {
+                                log("AIRPLAY: AES 流 IV 交付残缺（ev=$ev）")
+                                return null
+                            }
+                        StreamFrameCipher.AesCtr(key, iv)
+                    }
+                    else -> {
+                        log("AIRPLAY: 流加密形态未交付（ev=$ev）")
+                        return null
+                    }
                 }
             log("AIRPLAY: ✓ 主屏流已接受（Rust）dataPort=$dataPort connId=$connectionId")
             // 注意：**不可**在此 armMib3VirtualLink()——那是 MIB3 隧道机型的
