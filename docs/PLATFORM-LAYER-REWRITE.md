@@ -195,6 +195,16 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
       64x64(nonce=LE64 c) ≡ RFC(nonce=0000‖LE64 c) 16 字态逐字相同。
       验证：Rust 207 全绿；Kotlin compile/JVM/spotless/lint 全绿；装机
       回归待「安装」（视频帧密封全链真机回归）
+- [x] **A1+A2+A8+A10 音频 RTP 域下沉**（2026-11-04 完成，protocol
+      48c7a4a+0aa396b + android-carplay（本提交））：数据面第三刀。
+      RTP 头/密封（PCM 大端换序内置）/同步包/PT 表全入 Rust
+      （fw::airplay::rtp，纯函数 JNI）；AudioSender 收缩为采集+UDP
+      socket+游标泵；删 AudioSyncPacket/bigEndianS16/ntpFromNanos
+      （TimingServer 只剩 UDP 服务面）。**jboolean ABI 坑出土**：
+      Kotlin Boolean→Rust i32 高位垃圾（AAC 557B 回环抓住）——新 JNI
+      统一 Int 约定。JVM 测试 native 加载 assume 先例（AudioSenderTest/
+      AudioAacPayloadTest）。验证：Rust 213 全绿；JVM 130 全绿 +
+      spotless/lint 绿；装机回归待「安装」（音频域真机回归）
 
 ## 六、收尾状态（2026-11-03）
 

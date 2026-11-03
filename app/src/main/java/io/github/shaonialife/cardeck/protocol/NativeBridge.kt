@@ -433,6 +433,30 @@ object NativeBridge {
         ptsNanos: Long,
     ): ByteArray?
 
+    /** 音频 RTP 密封整包（A1 下沉——fw: cryptor mode 1 @0x227969f68：
+     *  nonce=8B LE 计数入包尾、AAD=头[4..12]；PCM 大端换序包内完成）。
+     *  纯函数。 */
+    external fun nativeAirplayAudioSealPacket(
+        key: ByteArray,
+        seq: Int,
+        timestamp: Int,
+        payloadType: Int,
+        marker: Int,
+        nonceCounter: Long,
+        payload: ByteArray,
+        pcmSwapBe: Int,
+    ): ByteArray?
+
+    /** 音频同步包 20B（A2 下沉——RTCP PT=84/M=1，NTP=up_ticks_to_ntp
+     *  网络序 @0x192867a74-84，与 timing 应答同基）。纯函数。 */
+    external fun nativeAirplayAudioSyncPacket(
+        seq: Int,
+        currentTs: Int,
+        nextTs: Int,
+        uptimeNanos: Long,
+        first: Int,
+    ): ByteArray?
+
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
 
     /** 建连接编排决策机（每轮 runFlow 一个；[noPairingHint] = TXT 未声明

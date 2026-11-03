@@ -5,8 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
-import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
-import io.github.shaonialife.cardeck.airplay.TimingServer
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -16,22 +15,22 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * CarPlay 主音频发送端（手机 → 车机，RTP over UDP）。
  *
- * 线格式（对照 DiPlay `AudioStream.kt` 解密路径与 catplay `rtp_cipher_chacha.rs`）：
+ * 线格式（A1/A2/A8 起字节构造全在 Rust fw::airplay::rtp；本壳 = 采集 +
+ * UDP socket + 游标泵）：
  * ```
  * [RTP 头 12B][ChaCha20-Poly1305 密封的 PCM 负载 + 16B tag][8B LE nonce]
  * ```
- *  - 加密：ChaCha20-Poly1305；AAD = 头 4..12 字节（timestamp+ssrc 的 BE 表示，
- *    catplay 的 "modern AAD"；DiPlay 解密即取同一范围）
- *  - nonce（12B）= 4 字节零 + 尾 8 字节（小端计数，从 0 逐包递增）→ [AirPlayCrypto.nonce64]
- *  - RTP 字段：version=2、PT=流类型（100=PCM 通路 / 102=AAC-LC 通路；
- *    对照 catplay `payload_type = stream_type`）、
- *    SSRC=0（catplay 同款）、timestamp = 累计样本帧数、seq 逐包递增
- *  - **首个音频包置 Marker 位**（规范：RECORD/FLUSH 之后的首包要打标记，接收端据此
- *    切分播放边界；catplay 恒 false，但我们的会话是「RECORD 之后才加入音频流」，
- *    首包标记能帮接收端重新对齐）
+ *  - 加密：ChaCha20-Poly1305；AAD = 头 4..12 字节（catplay "modern AAD"
+ *    对照域，hose 适配器固件锚集成期补）；nonce = 8B LE 计数（fw: cryptor
+ *    mode 1——与 Kotlin 旧 RFC 12B 形态 16 字态逐字等价）
+ *  - RTP 字段：version=2、PT=流类型（fw: getRTPPayloadType @0x2276cb930
+ *    按通道名分派，main=100；102=AAC 通路真车实证）、SSRC=0（真车实证
+ *    非 0 被丢）、timestamp = 累计样本帧数、seq 逐包递增
+ *  - 首个音频包置 Marker 位（catplay 恒 false 对照域——「RECORD 之后才
+ *    加入」形态以首包标记对齐）
  *
  * 旁路：
- *  - **同步包**：[AudioSyncPacket] 每 1 秒发往该流的 `controlPort`，建立 RTP↔NTP 锚点。
+ *  - **同步包**：每 1 秒发往该流的 `controlPort`（Rust 组包），建立 RTP↔NTP 锚点。
  *    （缺了它接收端只能「按到达时刻猜」，严格的实现干脆不排播——2026-10-20 实测）
  *
  * 采集：`AudioPlaybackCapture`（Android 10+）捕获手机端其他应用播放的媒体/导航音频
@@ -58,7 +57,7 @@ class AudioSender(
     private val adtsFrames: Boolean = false,
     /**
      * 该音频流的控制端口（车机在 SETUP 应答里下发）。>0 时每 [SYNC_INTERVAL_MILLIS]
-     * 发一个 [AudioSyncPacket] 建立 RTP↔NTP 锚点；0 = 车机没给（旧车机），只发音频。
+     * 发一个同步包（Rust 组包）建立 RTP↔NTP 锚点；0 = 车机没给（旧车机），只发音频。
      */
     private val controlPort: Int = 0,
 ) {
@@ -79,27 +78,10 @@ class AudioSender(
         /** 同步包发送间隔（规范：每秒一个）。 */
         const val SYNC_INTERVAL_MILLIS = 1_000L
 
-        private const val RTP_HEADER_LEN = 12
-        private const val TAG_SIZE = 16
-        private const val NONCE_SIZE = 8
-
         private const val READ_TIMEOUT_QUIET_MILLIS = 500L
 
         /** 静音前媒体音量的持久化键（进程被杀也不丢恢复目标）。 */
         private const val KEY_SAVED_VOLUME = "audio_saved_media_volume"
-
-        /** 小端 s16 → 大端 s16（每两字节换序）。CarPlay 线格式要求大端样本。 */
-        fun bigEndianS16(source: ByteArray): ByteArray {
-            val out = source.copyOf()
-            var index = 0
-            while (index + 1 < out.size) {
-                val tmp = out[index]
-                out[index] = out[index + 1]
-                out[index + 1] = tmp
-                index += 2
-            }
-            return out
-        }
     }
 
     private val running = AtomicBoolean(false)
@@ -386,8 +368,14 @@ class AudioSender(
                         while (running.get() && !client.isClosed) {
                             val next = timestamp
                             val current = (next - samplesPerPacket).coerceAtLeast(0L)
-                            val ntp = TimingServer.ntpFromNanos(System.nanoTime())
-                            val packet = AudioSyncPacket.build(syncSequence, current, next, ntp, first)
+                            val packet =
+                                NativeBridge.nativeAirplayAudioSyncPacket(
+                                    syncSequence,
+                                    current.toInt(),
+                                    next.toInt(),
+                                    System.nanoTime(),
+                                    first = if (first) 1 else 0,
+                                ) ?: continue
                             client.send(DatagramPacket(packet, packet.size))
                             syncSequence = (syncSequence + 1) and 0xFFFF
                             if (first) {
@@ -558,56 +546,23 @@ class AudioSender(
         }
     }
 
-    /** 组一个 RTP 包：明文 PCM → ChaCha20 密封 → [头][密文+tag][nonce8]。（internal：测试直测） */
+    /** 组一个 RTP 包（A1/A8 下沉：头/密封/大端换序全在 Rust——fw: cryptor
+     *  mode 1 @0x227969f68；本壳只泵游标）。（internal：测试直测） */
     internal fun sealPacket(
         pcm: ByteArray,
         sequence: Int,
         timestamp: Long,
         nonceCounter: Long,
         marker: Boolean = false,
-    ): ByteArray {
-        val header = buildRtpHeader(sequence, timestamp, marker)
-        // AAD = header 的 timestamp+ssrc 段（字节 4..12）——catplay "modern AAD" / DiPlay 解密同款
-        val aad = header.copyOfRange(4, RTP_HEADER_LEN)
-        // 关键：CarPlay 线格式的 LPCM 是**大端** s16 样本——接收端对收到的负载做
-        // byteSwapS16 转回小端再喂 AudioTrack（DiPlay AndroidMediaSink.kt:1687）。
-        // Android 采集是原生小端，因此这里必须换序；漏掉会得到「沙沙声」（2026-10-10 实测）。
-        //
-        // AAC 通路不做换序：AAC 比特流是字节流，不是 16bit 样本序列，换序会直接把
-        // 比特流搅烂（车机解码失败 → 有包无声）。
-        val wirePayload = if (codec == AudioCodec.AAC_LC) pcm else bigEndianS16(pcm)
-        val sealed = AirPlayCrypto.chachaSeal(streamKey, AirPlayCrypto.nonce64(nonceCounter), wirePayload, aad)
-        val wire = ByteArray(RTP_HEADER_LEN + sealed.size + NONCE_SIZE)
-        header.copyInto(wire, 0)
-        sealed.copyInto(wire, RTP_HEADER_LEN)
-        // 尾部 8 字节小端 nonce（与 AirPlayCrypto.nonce64 的低 8 字节一致）
-        for (index in 0 until NONCE_SIZE) {
-            wire[wire.size - NONCE_SIZE + index] =
-                ((nonceCounter ushr (8 * index)) and 0xFF).toByte()
-        }
-        return wire
-    }
-
-    private fun buildRtpHeader(
-        sequence: Int,
-        timestamp: Long,
-        marker: Boolean = false,
-    ): ByteArray {
-        val header = ByteArray(RTP_HEADER_LEN)
-        header[0] = 0x80.toByte() // version=2
-        // PT 跟随流类型（catplay `payload_type = stream_type`）：100=PCM 通路、102=AAC 通路
-        header[1] = ((if (marker) 0x80 else 0) or (streamType.toInt() and 0x7F)).toByte()
-        header[2] = ((sequence ushr 8) and 0xFF).toByte()
-        header[3] = (sequence and 0xFF).toByte()
-        val ts = timestamp.toInt()
-        header[4] = ((ts ushr 24) and 0xFF).toByte()
-        header[5] = ((ts ushr 16) and 0xFF).toByte()
-        header[6] = ((ts ushr 8) and 0xFF).toByte()
-        header[7] = (ts and 0xFF).toByte()
-        header[8] = ((ssrc ushr 24) and 0xFF).toByte()
-        header[9] = ((ssrc ushr 16) and 0xFF).toByte()
-        header[10] = ((ssrc ushr 8) and 0xFF).toByte()
-        header[11] = (ssrc and 0xFF).toByte()
-        return header
-    }
+    ): ByteArray =
+        NativeBridge.nativeAirplayAudioSealPacket(
+            streamKey,
+            sequence,
+            timestamp.toInt(),
+            streamType.toInt(),
+            marker = if (marker) 1 else 0,
+            nonceCounter,
+            pcm,
+            pcmSwapBe = if (codec == AudioCodec.PCM) 1 else 0,
+        ) ?: ByteArray(0)
 }

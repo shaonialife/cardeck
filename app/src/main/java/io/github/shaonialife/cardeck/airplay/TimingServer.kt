@@ -16,9 +16,8 @@ import java.net.DatagramSocket
  *   `1-bitlen(tps)`（fw: _NTPClockCreate @0x19293f574-b4）、refID="XNU1"
  * - 时间换算：秒 = upTicks/tps + epoch（NTP 1900 纪元偏移）、
  *   分数 = 余<<32/tps（fw: @0x192867a70-aa0）——宿主 tps = 10⁹
- *   （System.nanoTime 纳秒直接作 upTicks）；**ntpFromNanos 保留为
- *   AudioSender 的 RTP 时间戳格式化垫片**（同一固件公式 @0x192867a7c-84
- *   的 Kotlin 算术形，非独立协议决策）
+ *   （System.nanoTime 纳秒直接作 upTicks）；A10 起音频域的 NTP 格式化
+ *   亦在 Rust（fw::airplay::rtp::build_sync_packet 同公式）
  *
  * 宿主分工（M5.2 战役架构）：UDP socket/线程 = 本类；字节校验/应答构造
  * = `NativeBridge.nativeAirplayTimingRespond`（纯函数，Rust 侧有全量测试）。
@@ -104,22 +103,6 @@ class TimingServer(
                 s.send(DatagramPacket(response, response.size, packet.address, packet.port))
             } catch (_: Exception) {
             }
-        }
-    }
-
-    companion object {
-        /**
-         * 单调纳秒 → NTP 64 位（秒<<32 | 分数），大端 8 字节。
-         * fw: `秒 = upTicks/tps + epoch`、`分数 = 余<<32/tps`
-         * （@0x192867a70-aa0 直切；epoch 由调用方语义决定——RTP 域取 0 基准，
-         * NTP 线域走 Rust 侧 [NativeBridge.nativeAirplayTimingRespond]）。
-         */
-        fun ntpFromNanos(nanos: Long): ByteArray {
-            val secs = Math.floorDiv(nanos, 1_000_000_000L)
-            val fracNanos = Math.floorMod(nanos, 1_000_000_000L)
-            val frac = (fracNanos.toLong() shl 32) / 1_000_000_000L
-            val packed = (secs shl 32) or (frac and 0xFFFF_FFFFL)
-            return ByteArray(8) { index -> (packed ushr (8 * (7 - index))).toByte() }
         }
     }
 }

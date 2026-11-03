@@ -3,14 +3,49 @@ package io.github.shaonialife.cardeck.audio
 import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.BeforeClass
 import org.junit.Test
 
 /**
- * 音频 RTP 封包回环测试：加密后的线格式必须能被「接收端解密路径」逐字节还原
- * （对照 DiPlay `AudioStream.kt`：AAD=头 4..12、密文=12..n-8、nonce=尾 8B 小端）。
+ * 音频 RTP 封包回环测试（JNI seam）：线格式字节构造已下沉 Rust
+ * （fw::airplay::rtp，字节钉随 Rust 测试）；本测试验证 JNI 面接通 +
+ * 「接收端解密路径」逐字节还原（对照 DiPlay `AudioStream.kt`：AAD=头
+ * 4..12、密文=12..n-8、nonce=尾 8B 小端）。
  */
 class AudioSenderTest {
     private val key = ByteArray(32) { (it * 7 + 1).toByte() }
+
+    companion object {
+        /**
+         * 封包走 JNI（Rust 纯函数）——JVM 测试载宿主 dylib；找不到则跳过
+         * （先 cargo build）。同 ForbiddenAudiReplayTest 先例。
+         */
+        @JvmStatic
+        @BeforeClass
+        fun loadNativeProtocolLib() {
+            val candidates =
+                listOf(
+                    "../../cardeck-protocol/target/debug/libcardeck_protocol.dylib",
+                    "../../cardeck-protocol/target/release/libcardeck_protocol.dylib",
+                )
+            val lib = candidates.firstOrNull { java.io.File(it).exists() }
+            org.junit.Assume.assumeTrue("宿主 dylib 不存在，跳过（先 cargo build）", lib != null)
+            System.load(java.io.File(lib!!).absolutePath)
+        }
+
+        /** 换序是对合运算（接收端 byteSwapS16 的测试内联形）。 */
+        private fun swapS16(source: ByteArray): ByteArray {
+            val out = source.copyOf()
+            var index = 0
+            while (index + 1 < out.size) {
+                val tmp = out[index]
+                out[index] = out[index + 1]
+                out[index + 1] = tmp
+                index += 2
+            }
+            return out
+        }
+    }
 
     private fun sender() =
         AudioSender(
@@ -55,7 +90,7 @@ class AudioSenderTest {
         val decrypted = AirPlayCrypto.chachaOpen(key, nonce, sealed, aad)
         // 线格式为**大端 s16**（接收端会 byteSwapS16 转回小端喂 AudioTrack）：
         // 解密结果应等于原 PCM 换序，换回后与原 PCM 一致。
-        val receiverPcm = AudioSender.bigEndianS16(decrypted) // 接收端 byteSwapS16（换序是对合运算）
+        val receiverPcm = swapS16(decrypted) // 接收端 byteSwapS16（换序是对合运算）
         assertArrayEquals(pcm, receiverPcm)
     }
 

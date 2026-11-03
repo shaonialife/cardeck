@@ -3,6 +3,7 @@ package io.github.shaonialife.cardeck.audio
 import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.BeforeClass
 import org.junit.Test
 
 /**
@@ -15,6 +16,22 @@ import org.junit.Test
  */
 class AudioAacPayloadTest {
     private val key = ByteArray(32) { (it * 11 + 3).toByte() }
+
+    companion object {
+        /** 封包走 JNI（Rust 纯函数）——载宿主 dylib，缺则跳过（先 cargo build）。 */
+        @JvmStatic
+        @BeforeClass
+        fun loadNativeProtocolLib() {
+            val candidates =
+                listOf(
+                    "../../cardeck-protocol/target/debug/libcardeck_protocol.dylib",
+                    "../../cardeck-protocol/target/release/libcardeck_protocol.dylib",
+                )
+            val lib = candidates.firstOrNull { java.io.File(it).exists() }
+            org.junit.Assume.assumeTrue("宿主 dylib 不存在，跳过（先 cargo build）", lib != null)
+            System.load(java.io.File(lib!!).absolutePath)
+        }
+    }
 
     private fun sender(codec: AudioCodec) =
         AudioSender(
@@ -63,46 +80,5 @@ class AudioAacPayloadTest {
         // 字节 1：M(0x80) | PT(102)
         assertEquals(0x80 or 102, first[1].toInt() and 0xFF)
         assertEquals(102, second[1].toInt() and 0xFF)
-    }
-}
-
-/** 同步包（RTCP 0xD4）线格式测试：20 字节、无 SSRC、首包置扩展位。 */
-class AudioSyncPacketTest {
-    private val ntp = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8)
-
-    @Test
-    fun layoutMatchesSpecification() {
-        val packet = AudioSyncPacket.build(0x0102, 44100L, 45124L, ntp, first = false)
-        assertEquals(AudioSyncPacket.SIZE, packet.size)
-        assertEquals(0x80, packet[0].toInt() and 0xFF) // V=2，非首包无 X 位
-        assertEquals(0xD4, packet[1].toInt() and 0xFF) // M=1 + PT=84
-        assertEquals(0x01, packet[2].toInt() and 0xFF) // 序号 BE
-        assertEquals(0x02, packet[3].toInt() and 0xFF)
-        assertEquals(0x00, packet[4].toInt() and 0xFF) // 当前时间戳 BE = 44100
-        assertEquals(0x00, packet[5].toInt() and 0xFF)
-        assertEquals(0xAC, packet[6].toInt() and 0xFF)
-        assertEquals(0x44, packet[7].toInt() and 0xFF)
-        assertArrayEquals(ntp, packet.copyOfRange(8, 16)) // NTP 原样 8 字节
-        assertEquals(0x00, packet[16].toInt() and 0xFF) // 下一包时间戳 BE = 45124
-        assertEquals(0x00, packet[17].toInt() and 0xFF)
-        assertEquals(0xB0, packet[18].toInt() and 0xFF)
-        assertEquals(0x44, packet[19].toInt() and 0xFF)
-    }
-
-    @Test
-    fun firstSyncSetsExtensionBit() {
-        val packet = AudioSyncPacket.build(0, 0, 1024, ntp, first = true)
-        assertEquals(0x90, packet[0].toInt() and 0xFF)
-    }
-
-    @Test
-    fun rejectsWrongNtpLength() {
-        var failed = false
-        try {
-            AudioSyncPacket.build(0, 0, 0, ByteArray(4), first = false)
-        } catch (_: IllegalArgumentException) {
-            failed = true
-        }
-        org.junit.Assert.assertTrue("NTP 必须是 8 字节", failed)
     }
 }
