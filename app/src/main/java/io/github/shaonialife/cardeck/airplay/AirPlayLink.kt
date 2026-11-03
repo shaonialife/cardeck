@@ -1565,19 +1565,24 @@ class AirPlayLink(
         val preferences = context?.getSharedPreferences("airplay_identity", Context.MODE_PRIVATE)
         val storedId = preferences?.getString("pairingId", null)
         val storedPrivate = preferences?.getString("privateKey", null)
+        // A9 下沉：ed25519 密钥域在 Rust（nativePairingIdentityKeyPair——
+        // seed 推导公钥 / null 随机生成）。持久化（平台 KV）留本类。
+        val keyPair =
+            NativeBridge.nativePairingIdentityKeyPair(
+                storedPrivate?.let { Base64.getDecoder().decode(it) },
+            ) ?: throw IllegalStateException("身份密钥生成失败（native）")
+        val privateKey = keyPair.copyOfRange(0, 32)
+        val publicKey = keyPair.copyOfRange(32, 64)
         if (storedId != null && storedPrivate != null) {
-            val privateKey = Base64.getDecoder().decode(storedPrivate)
-            val publicKey = AirPlayCrypto.ed25519PublicKey(privateKey)
             return ControllerIdentity(storedId, privateKey, publicKey)
         }
-        val keyPair = AirPlayCrypto.ed25519Generate()
         val pairingId = UUID.randomUUID().toString()
         preferences
             ?.edit()
             ?.putString("pairingId", pairingId)
-            ?.putString("privateKey", Base64.getEncoder().encodeToString(keyPair.privateKey))
+            ?.putString("privateKey", Base64.getEncoder().encodeToString(privateKey))
             ?.apply()
-        return ControllerIdentity(pairingId, keyPair.privateKey, keyPair.publicKey)
+        return ControllerIdentity(pairingId, privateKey, publicKey)
     }
 
     // ---- 工具 ----

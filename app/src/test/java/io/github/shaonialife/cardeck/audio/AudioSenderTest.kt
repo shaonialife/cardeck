@@ -1,6 +1,6 @@
 package io.github.shaonialife.cardeck.audio
 
-import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.BeforeClass
@@ -87,7 +87,7 @@ class AudioSenderTest {
         val shortNonce = wire.copyOfRange(sealedEnd, wire.size)
         val nonce = ByteArray(12).also { shortNonce.copyInto(it, 4) }
 
-        val decrypted = AirPlayCrypto.chachaOpen(key, nonce, sealed, aad)
+        val decrypted = NativeBridge.nativeAirplayChachaOpen(key, nonce, aad, sealed)!!
         // 线格式为**大端 s16**（接收端会 byteSwapS16 转回小端喂 AudioTrack）：
         // 解密结果应等于原 PCM 换序，换回后与原 PCM 一致。
         val receiverPcm = swapS16(decrypted) // 接收端 byteSwapS16（换序是对合运算）
@@ -99,12 +99,12 @@ class AudioSenderTest {
         val pcm = byteArrayOf(0x34, 0x12, 0x78, 0x56) // 小端样本 0x1234, 0x5678
         val wire = sender().sealPacket(pcm, sequence = 0, timestamp = 0, nonceCounter = 0)
         val decrypted =
-            AirPlayCrypto.chachaOpen(
+            NativeBridge.nativeAirplayChachaOpen(
                 key,
                 ByteArray(12).also { wire.copyOfRange(wire.size - 8, wire.size).copyInto(it, 4) },
-                wire.copyOfRange(12, wire.size - 8),
                 wire.copyOfRange(4, 12),
-            )
+                wire.copyOfRange(12, wire.size - 8),
+            )!!
         // 线上应为大端：0x12 0x34 0x56 0x78
         assertArrayEquals(byteArrayOf(0x12, 0x34, 0x56, 0x78), decrypted)
     }

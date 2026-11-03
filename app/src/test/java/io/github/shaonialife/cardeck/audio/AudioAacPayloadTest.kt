@@ -1,6 +1,6 @@
 package io.github.shaonialife.cardeck.audio
 
-import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.BeforeClass
@@ -49,12 +49,12 @@ class AudioAacPayloadTest {
         val frame = ByteArray(557) { index -> ((index * 37 + 0x21) and 0xFF).toByte() }
         val wire = sender(AudioCodec.AAC_LC).sealPacket(frame, 0, 0, 0)
         val decrypted =
-            AirPlayCrypto.chachaOpen(
+            NativeBridge.nativeAirplayChachaOpen(
                 key,
                 ByteArray(12).also { wire.copyOfRange(wire.size - 8, wire.size).copyInto(it, 4) },
-                wire.copyOfRange(12, wire.size - 8),
                 wire.copyOfRange(4, 12),
-            )
+                wire.copyOfRange(12, wire.size - 8),
+            )!!
         assertArrayEquals(frame, decrypted)
     }
 
@@ -63,12 +63,12 @@ class AudioAacPayloadTest {
         val pcm = byteArrayOf(0x34, 0x12, 0x78, 0x56)
         val wire = sender(AudioCodec.PCM).sealPacket(pcm, 0, 0, 0)
         val decrypted =
-            AirPlayCrypto.chachaOpen(
+            NativeBridge.nativeAirplayChachaOpen(
                 key,
                 ByteArray(12).also { wire.copyOfRange(wire.size - 8, wire.size).copyInto(it, 4) },
-                wire.copyOfRange(12, wire.size - 8),
                 wire.copyOfRange(4, 12),
-            )
+                wire.copyOfRange(12, wire.size - 8),
+            )!!
         assertArrayEquals(byteArrayOf(0x12, 0x34, 0x56, 0x78), decrypted)
     }
 

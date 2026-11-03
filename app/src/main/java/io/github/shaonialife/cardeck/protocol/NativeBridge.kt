@@ -183,6 +183,12 @@ object NativeBridge {
     //          setup = _SetupClientExchange @0x192944724、
     //          派生 = _PairingSessionDeriveKey @0x19286D644。
 
+    /** 身份密钥域（A9——bouncycastle 退役）：[seed32] 传 32B = 从持久化
+     *  seed 推导公钥（ed25519 单向域）；传 null = 随机生成（fw:
+     *  RandomBytes = arc4random 族，/dev/urandom）。返回 64B =
+     *  [seed 32B][publicKey 32B]。纯函数。 */
+    external fun nativePairingIdentityKeyPair(seed32: ByteArray?): ByteArray?
+
     /** 创建 pair-verify 会话并构建 M1（fw: state1）。flags=0xC 主形态。返回句柄，0=失败。 */
     external fun nativePairingVerifyCreate(
         flags: Int,
@@ -466,6 +472,15 @@ object NativeBridge {
         descriptor: ByteArray?,
         report: ByteArray,
     ): String?
+
+    /** 流层 AEAD 解密（A9——bouncycastle 退役；RFC 12B nonce 流层形态，
+     *  测试回环的解密侧用）。null = tag 验证失败。纯函数。 */
+    external fun nativeAirplayChachaOpen(
+        key: ByteArray,
+        nonce12: ByteArray,
+        aad: ByteArray,
+        sealed: ByteArray,
+    ): ByteArray?
 
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
 
