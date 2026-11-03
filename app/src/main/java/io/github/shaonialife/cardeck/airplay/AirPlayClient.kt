@@ -504,26 +504,6 @@ class AirPlayClient(
     // （M5.2：M1-M4/头集/密钥派生 = fw::airplay::session，Kotlin 只剩 TCP 泵）。
     // 行为见 [pumpPairingSession] / [handleEvent]。
 
-    /** 拉取并解析 /info（注意：接收端在活跃会话期间可能不应答）。 */
-    fun fetchInfo(timeoutMillis: Int = 5_000): Map<*, *>? {
-        if (!ensureConnected()) return null
-        return try {
-            val (statusLine, body) = requestInfo(timeoutMillis)
-            log("AIRPLAY: ✓ /info [$statusLine] body=${body.size} 字节")
-            if (body.isEmpty()) return null
-            val root = BinaryPlist.parse(body)
-            if (root is Map<*, *>) {
-                logInfoSummary(root)
-                root
-            } else {
-                null
-            }
-        } catch (error: IOException) {
-            log("AIRPLAY: /info 失败 - ${error.message}")
-            null
-        }
-    }
-
     /**
      * KeepAlive UDP 心跳（对照 catplay KeepAliveClient）：向车机 keepAlivePort 发 4 字节
      * 随机 UDP；协议无应答。**缺失时车机 10s 看门狗拆整轮会话**。
@@ -657,67 +637,14 @@ class AirPlayClient(
      * /feedback——接收端的活动看门狗。RTSP 事务由 [rtspLock] 串行化。
      */
     fun startFeedbackLoop() {
-        // §10.57：Rust 会话态走 'keep'（帧由 Rust 构建+泵排空）——明文 request()
-        // 直写加密控制通道会 BAD_DECRYPT 断连（真机 21:58/22:04 实证）
-        if (sessionPumpHandle != 0L) {
-            startRustFeedbackLoop()
-            return
-        }
-        Thread({
-            var sent = 0
-            while (isSessionAlive()) {
-                try {
-                    val (status, body) = request("POST", "/feedback", ByteArray(0))
-                    sent++
-                    if (sent <= 6 || sent % 30 == 0) {
-                        log("AIRPLAY: feedback #$sent [$status]${if (body.isNotEmpty()) " body=${body.size}B" else ""}")
-                    }
-                    // 车机反馈里带各流状态（收没收到、是否欠载）：音频无声时这是最直接的
-                    // 判据——能区分「车机没收到包」与「收到但不播」（2026-10-17）。
-                    // 前 8 次全打（约覆盖起流后的 8s，正好是 6.5s 拆链看门狗窗口）：
-                    // 音频流的 sampleTime 会不会从 0 往前走，是判断「包有没有被消费」的硬证据。
-                    if (body.isNotEmpty() && (sent <= 8 || sent % 30 == 0)) {
-                        logFeedbackBody(body)
-                    }
-                } catch (_: IOException) {
-                    break // 连接已断（会话结束）
-                }
-                try {
-                    Thread.sleep(1_000)
-                } catch (_: InterruptedException) {
-                    break
-                }
-            }
-        }, "airplay-feedback").apply {
-            isDaemon = true
-            start()
-        }
+        // 'keep' 帧由 Rust 构建+泵排空（§10.57 控制通道单持有者——明文直写
+        // 加密控制通道会 BAD_DECRYPT 断连，真机 21:58/22:04 实证）
+        startRustFeedbackLoop()
     }
 
     /** 解析并打印 /feedback 应答（bplist）。字段对照 catplay `StreamFeedback`：
      *  sr / type / streamConnectionID / sampleTime / timestamp / timestampRawNs
      *  （没有包计数——车机回的是自己侧的播放时钟，可据此判断音频流是否被推进）。 */
-    private fun logFeedbackBody(body: ByteArray) {
-        val root =
-            runCatching { BinaryPlist.parse(body) as? Map<*, *> }.getOrNull()
-        if (root == null) {
-            log("AIRPLAY: feedback body 解析失败（${body.size}B）hex=${body.joinToString("") { "%02x".format(it) }}")
-            return
-        }
-        val streams = root["streams"] as? List<*>
-        if (streams == null) {
-            log("AIRPLAY: feedback 无 streams 键（keys=${root.keys}）全字段=$root")
-            return
-        }
-        streams.forEachIndexed { index, entry ->
-            val stream = entry as? Map<*, *> ?: return@forEachIndexed
-            log(
-                "AIRPLAY: feedback.stream[$index] type=${stream["type"]} sr=${stream["sr"]} " +
-                    "connId=${stream["streamConnectionID"]} sampleTime=${stream["sampleTime"]} " +
-                    "ts=${stream["timestamp"]} tsRawNs=${stream["timestampRawNs"]} 全字段=$stream",
-            )
-        }
-    }
 
     /** 心跳线程的存活判据：RTSP socket 仍连着。 */
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
@@ -730,12 +657,6 @@ class AirPlayClient(
         // 新连接总是从**明文**开始（pair-verify 成功后才切加密）：旧连接的 cipher 必须
         // 清掉，否则重连后的读线程会把明文应答当密文帧解，后续所有请求超时。
         cipher = null
-        synchronized(rtspWriteLock) {
-            readerSocket = null
-            readerThread = null
-            readerGeneration++
-        }
-        failAllPending("控制通道关闭")
         runCatching { iapTunnel?.socket?.close() }
         iapTunnel = null
         iapLink = null
@@ -1107,170 +1028,13 @@ class AirPlayClient(
     }
 
     /**
-     * 拉 `/info` 并做完整取证（状态行 / body 长度 / 解析异常 / 原始 hex）。
-     *
-     * 此前的写法是 `catch (_: Exception) { null }`——车机一拒绝就彻底静默（2026-10-20
-     * 宝马 iD9：`/info 字段` 那行日志根本没出现，只有 `uuids=[]` 和 `displayUuid=null`）。
-     * 会话内被拒时再补一次**独立短连接**探测：接收端的 AirPlay 服务通常允许未绑定
-     * 会话的 `/info`（能力查询），而活跃会话内的 `/info` 反而常被按 455/403 拒掉。
+     * iAP 隧道（type-130 DataStream，对照 DiPlay IapTunnel）：现代 CarPlay 的 iAP2
+     * EA 数据通道——**车机→手机的 iAP2 消息（含触摸 HID）走这条加密 TCP**，
+     * 手机→车机走事件通道 iAPSendMessage 命令（[sendIap]）。
+     * 线格式：ChaCha 帧（2B LE 长度作 AAD + 密文 + 16B tag，nonce=8B LE 计数器，
+     * 密钥 = HKDF(shared, "DataStream-Salt$seed", "DataStream-Output-Encryption-Key")）
+     * ⊃ APTransportPackage（4B BE 总长，32B 头，偏移 16 处 type="comm"）→ body = iAP2 消息。
      */
-    private fun loadInfoWithDiagnostics(): Map<*, *>? {
-        var statusLine = "未请求"
-        var body = ByteArray(0)
-        try {
-            val first = requestInfo()
-            statusLine = first.first
-            body = first.second
-            if (!statusLine.contains("200") || body.isEmpty()) {
-                log("AIRPLAY: /info 首次 [$statusLine] body=${body.size}B → 800ms 后重试一次")
-                Thread.sleep(800)
-                ensureConnected(2_000)
-                val retry = requestInfo(5_000)
-                log("AIRPLAY: /info 重试 [${retry.first}] body=${retry.second.size}B")
-                if (retry.first.contains("200") && retry.second.isNotEmpty()) {
-                    statusLine = retry.first
-                    body = retry.second
-                }
-            }
-        } catch (error: Exception) {
-            log("AIRPLAY: /info 请求异常 - ${error.javaClass.simpleName}: ${error.message}")
-        }
-        parseInfoBody(statusLine, body)?.let { return it }
-        scheduleSideProbe()
-        return null
-    }
-
-    /**
-     * 延后 [delayMillis] 再走侧信道 `/info`。
-     *
-     * 为什么不当场探：会话刚建立的头 20 秒正是最关键取证窗口（车机订阅、每秒 `/command`、
-     * 隧道 CSM）。万一副连接让车机把主会话拆了，我们就丢掉整轮证据。延后探测即使出事，
-     * 也能带着完整日志回来定位。
-     *
-     * 探到 HID 设备就立刻补发 `hidSetInputMode`——触摸可能当场生效（显示屏几何本轮已定，
-     * 改不了，但输入通路可以不重建会话就补上）。
-     */
-    private fun scheduleSideProbe(delayMillis: Long = 25_000) {
-        Thread(
-            {
-                runCatching { Thread.sleep(delayMillis) }
-                val info = probeInfoOnSideConnection() ?: return@Thread
-                val uuids =
-                    (info["hidDevices"] as? List<*>).orEmpty().mapNotNull { entry ->
-                        val hid = entry as? Map<*, *> ?: return@mapNotNull null
-                        when (val raw = hid["uuid"]) {
-                            is Number -> raw.toString()
-                            is String -> raw
-                            else -> null
-                        }
-                    }
-                if (uuids.isEmpty()) {
-                    log("AIRPLAY: 侧信道 /info 成功但车机未声明 HID 设备 → 触摸不走 AirPlay HID 通路")
-                    return@Thread
-                }
-                log("AIRPLAY: 侧信道拿到 HID 设备 $uuids → 补发 hidSetInputMode（触摸可能立即生效）")
-                uuids.forEach { uuid -> runCatching { sendHidSetInputMode(uuid, mode = 0) } }
-            },
-            "info-side-probe",
-        ).apply { isDaemon = true }.start()
-    }
-
-    /** `/info` 报文 → 字典。失败时把原因与原始 hex 落日志，并缓存到 negotiatedInfo。 */
-    private fun parseInfoBody(
-        statusLine: String,
-        body: ByteArray,
-    ): Map<*, *>? {
-        log("AIRPLAY: /info 应答 [$statusLine] body=${body.size}B")
-        if (body.isEmpty()) return null
-        val info =
-            try {
-                val result = BinaryPlist.parseRecovered(body)
-                result.note?.let { log("AIRPLAY: /info $it") }
-                result.value as? Map<*, *>
-            } catch (error: IllegalArgumentException) {
-                log("AIRPLAY: /info plist 解析失败 - ${error.message}")
-                log("AIRPLAY: /info 原始体（${body.size}B）hex=" + hexDump(body, 320))
-                null
-            }
-        if (info == null) return null
-        logInfoSummary(info)
-        negotiatedInfo = info
-        return info
-    }
-
-    /**
-     * 独立短连接探测 `/info`（不加密、不带会话）：会话内被拒时的兜底。
-     *
-     * 只新建一条 TCP，发 `GET /info` 读完一条报文就关闭——不碰控制通道的状态机，
-     * 车机若不认（455/403/超时）只是白跑一趟，不会影响已经跑起来的视频流。
-     */
-    private fun probeInfoOnSideConnection(timeoutMillis: Int = 4_000): Map<*, *>? {
-        val target = endpoint
-        if (target.airPlayPort <= 0) return null
-        val host =
-            activeHost ?: EndpointHosts.candidates(target.ipAddresses).firstOrNull() ?: return null
-        var probe: Socket? = null
-        return try {
-            log("AIRPLAY: /info 侧信道探测 → $host:${target.airPlayPort}（独立短连接，不碰会话）")
-            probe =
-                Socket().apply {
-                    connect(InetSocketAddress(resolveAddress(host), target.airPlayPort), timeoutMillis)
-                    soTimeout = timeoutMillis
-                }
-            val payload = BinaryPlist.encode(linkedMapOf<String, Any?>())
-            val head =
-                "GET /info RTSP/1.0\r\n" +
-                    "CSeq: 1\r\n" +
-                    "User-Agent: AirPlay/$SENDER_SOURCE_VERSION\r\n" +
-                    "Content-Type: application/x-apple-binary-plist\r\n" +
-                    "Content-Length: ${payload.size}\r\n\r\n"
-            probe.getOutputStream().apply {
-                write(head.toByteArray(Charsets.US_ASCII) + payload)
-                flush()
-            }
-            val input = probe.getInputStream()
-            val collected = java.io.ByteArrayOutputStream()
-            val chunk = ByteArray(16 * 1024)
-            var expected = -1
-            while (true) {
-                val count =
-                    try {
-                        input.read(chunk)
-                    } catch (_: java.net.SocketTimeoutException) {
-                        -1
-                    }
-                if (count < 0) break
-                collected.write(chunk, 0, count)
-                val bytes = collected.toByteArray()
-                if (expected < 0) {
-                    val separator = indexOf(bytes, HEAD_SEPARATOR)
-                    if (separator >= 0) {
-                        val (_, contentLength) =
-                            parseRtspHead(String(bytes, 0, separator, Charsets.ISO_8859_1))
-                        expected = separator + HEAD_SEPARATOR.size + contentLength
-                    }
-                }
-                if (expected >= 0 && bytes.size >= expected) break
-            }
-            val bytes = collected.toByteArray()
-            val separator = indexOf(bytes, HEAD_SEPARATOR)
-            if (separator < 0) {
-                log("AIRPLAY: /info 侧信道无有效应答（${bytes.size}B，车机可能只服务已绑定会话）")
-                return null
-            }
-            val headText = String(bytes, 0, separator, Charsets.ISO_8859_1)
-            val (line, contentLength) = parseRtspHead(headText)
-            val bodyStart = separator + HEAD_SEPARATOR.size
-            val infoBody = bytes.copyOfRange(bodyStart, minOf(bodyStart + contentLength, bytes.size))
-            return parseInfoBody("侧信道 $line", infoBody)
-        } catch (error: Exception) {
-            log("AIRPLAY: /info 侧信道失败 - ${error.javaClass.simpleName}: ${error.message}")
-            null
-        } finally {
-            runCatching { probe?.close() }
-        }
-    }
-
     class SetupInfo(
         val eventPort: Int,
         val timingPort: Int,
@@ -1303,14 +1067,6 @@ class AirPlayClient(
         val cipher: StreamFrameCipher,
     )
 
-    /**
-     * iAP 隧道（type-130 DataStream，对照 DiPlay IapTunnel）：现代 CarPlay 的 iAP2
-     * EA 数据通道——**车机→手机的 iAP2 消息（含触摸 HID）走这条加密 TCP**，
-     * 手机→车机走事件通道 iAPSendMessage 命令（[sendIap]）。
-     * 线格式：ChaCha 帧（2B LE 长度作 AAD + 密文 + 16B tag，nonce=8B LE 计数器，
-     * 密钥 = HKDF(shared, "DataStream-Salt$seed", "DataStream-Output-Encryption-Key")）
-     * ⊃ APTransportPackage（4B BE 总长，32B 头，偏移 16 处 type="comm"）→ body = iAP2 消息。
-     */
     inner class IapTunnelClient(
         val socket: Socket,
         private val readKey: ByteArray,
@@ -1578,132 +1334,9 @@ class AirPlayClient(
             log("TUNNEL: 未配对会话没有共享密钥——跳过 iAP 隧道（触摸不可用）")
             return null
         }
-        val host = receiverHost() ?: return null
-        val seed = (System.currentTimeMillis() % 0x7FFF_FFFFL) + 1L
-        val connectionId = java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L
-        // channelID 用「02: 前缀伪 MAC + -RCS-1」形态（参考实现同款）：SHA-256(本机
-        // 持久化 UUID) 前 5 字节、冒号分隔大写。**刻意不用真实蓝牙 MAC**——参考实现
-        // 的 deviceID 用真 MAC 而 channelID 用伪 MAC，二者不对账；真 MAC 去冒号形态
-        // 若被接收端按 MAC 解析会直接失败（2026-10-26 审查 P0）。
-        val channelKey = persistentTunnelChannelMac()
-        val body =
-            BinaryPlist.encode(
-                linkedMapOf(
-                    "streams" to
-                        listOf(
-                            buildMap<String, Any?> {
-                                put("type", 130L)
-                                put("controlType", 2L)
-                                put("clientTypeUUID", IAP_DATASTREAM_UUID)
-                                if (channelKey != null) put("channelID", "$channelKey-RCS-1")
-                                put(
-                                    "clientUUID",
-                                    java.util.UUID
-                                        .randomUUID()
-                                        .toString()
-                                        .uppercase(),
-                                )
-                                put("seed", seed)
-                                put("streamConnectionID", connectionId)
-                                put("wantsDedicatedSocket", true)
-                                put("sendMessageAsIs", true)
-                            },
-                        ),
-                ),
-            )
-        // §10.57：Rust 会话态走 native 流 SETUP（控制通道写单持有者）
-        var rustTunnelEvent: org.json.JSONObject? = null
-        if (sessionPumpHandle != 0L) {
-            rustTunnelEvent =
-                rustStreamSetupWait(
-                    "{\"streamType\":130,\"controlType\":2,\"clientTypeUUID\":\"" + IAP_DATASTREAM_UUID +
-                        "\",\"seed\":\"" + seed + "\"}",
-                ) ?: run {
-                    log("TUNNEL: SETUP 失败（Rust 泵超时/断开）")
-                    return null
-                }
-            val dataPort = rustTunnelEvent.optInt("dataPort")
-            if (dataPort == 0) {
-                log("TUNNEL: SETUP 应答无 dataPort——接收端未启用 iAPChannel，降级事件通道")
-                return null
-            }
-            log("TUNNEL: ✓ 已接受（Rust）dataPort=$dataPort——隧道 socket 域走 legacy 连接")
-            // 返回 null = 本函数的 Rust 快路不建隧道对象；触摸隧道在后续
-            // legacy 连接逻辑重建前不可用（type-130 专用 socket 域待收编）。
-            // 当前 CarPlay 会话（音频/屏幕/事件/命令）不依赖隧道，不阻塞。
-            return null
-        }
-        val (statusLine, responseBody) =
-            try {
-                request("SETUP", "/", body, contentType = "application/x-apple-binary-plist")
-            } catch (error: IOException) {
-                log("TUNNEL: SETUP 失败 - ${error.message}")
-                return null
-            }
-        if (!statusLine.contains("200")) {
-            log("TUNNEL: SETUP 应答 [$statusLine]（响应头：${lastResponseHeadOfRequest()}）")
-            return null
-        }
-        val root =
-            try {
-                BinaryPlist.parse(responseBody) as? Map<*, *>
-            } catch (_: IllegalArgumentException) {
-                null
-            } ?: run {
-                log("TUNNEL: SETUP 应答解析失败")
-                return null
-            }
-        val streams = root["streams"] as? List<*>
-        val stream = streams?.firstOrNull() as? Map<*, *>
-        val dataPort = ((stream?.get("dataPort") as? Long) ?: 0L).toInt() and 0xFFFF
-        if (dataPort == 0) {
-            log("TUNNEL: SETUP 应答无 dataPort（streams=$streams）——接收端未启用 iAPChannel，降级事件通道")
-            return null
-        }
-        val salt = "DataStream-Salt$seed".toByteArray(Charsets.US_ASCII)
-        // 读/写方向各派生一把密钥（参考实现语义：写=Output、读=Input。
-        // 旧实现两方向共用 Output 派生——DiPlay 不从隧道发数据所以从未暴露；
-        // 标准接收端车机→手机方向用 Input 派生，共用一把解不开它的帧）
-        val writeKey =
-            AirPlayCrypto.hkdfSha512(
-                sessionKey,
-                salt,
-                "DataStream-Output-Encryption-Key".toByteArray(Charsets.US_ASCII),
-            )
-        val readKey =
-            AirPlayCrypto.hkdfSha512(
-                sessionKey,
-                salt,
-                "DataStream-Input-Encryption-Key".toByteArray(Charsets.US_ASCII),
-            )
-        val tcp =
-            try {
-                Socket()
-            } catch (error: IOException) {
-                return null
-            }
-        return try {
-            tcp.tcpNoDelay = true
-            tcp.connect(java.net.InetSocketAddress(host, dataPort), 5_000)
-            log(
-                "TUNNEL: ✓ iAP 隧道已建立 $host:$dataPort（seed=$seed 全双工密钥，" +
-                    "形态=${if (modernAuth) "现代认证（iAPChannel 已声明）" else "兼容（半双工）"}）",
-            )
-            val link = obtainIapLink()
-            link.tunnelModernAuth = modernAuth
-            link.tunnelBluetoothMac = setupDeviceId()
-            val client = IapTunnelClient(tcp, readKey = readKey, writeKey = writeKey)
-            // 全双工形态：车机把链路帧放进 comm 包发来（不经事件通道），
-            // 原样喂给虚拟链路引擎（DETECT 回显/SYN 协商/CSM 都在里面）
-            client.onRawBytes = { bytes -> link.onCarBytes(bytes) }
-            client.startReading()
-            iapTunnel = client
-            client
-        } catch (error: IOException) {
-            log("TUNNEL: TCP 连接失败 - ${error.message}")
-            runCatching { tcp.close() }
-            null
-        }
+        // legacy RTSP 直写分支已删（§10.62：连接序后泵恒在——type-130 专用
+        // socket 域的隧道对象重建待数据面收编；当前会话触摸走事件通道）。
+        return null
     }
 
     /**
@@ -1863,47 +1496,9 @@ class AirPlayClient(
     private var controlIapCount = 0
 
     fun postControlIap(frame: ByteArray) {
-        controlIapTx.execute {
-            try {
-                val body =
-                    BinaryPlist.encode(
-                        linkedMapOf(
-                            "type" to "iAPSendMessage",
-                            "params" to linkedMapOf<String, Any?>("data" to frame),
-                        ),
-                    )
-                val (statusLine, reply) =
-                    request(
-                        "POST",
-                        "/command",
-                        body,
-                        contentType = "application/x-apple-binary-plist",
-                    )
-                controlIapCount++
-                val head =
-                    "IAPLINK: tx(控制通道) #$controlIapCount ${frame.size}B [$statusLine]" +
-                        (if (reply.isEmpty()) "" else " resp=${reply.size}B hex=" + hexPrefix(reply))
-                // 节流注意：不能按「应答体非空」放行——奥迪对每次 POST 都回 42B bplist
-                // （1Hz 全命中，曾把这条节流击穿成每秒刷屏）。常态只打前 10 条 + 每 100 条；
-                // 非 200 状态始终打（异常必须可见）
-                if (controlIapCount <= 10 ||
-                    controlIapCount % 100 == 0 ||
-                    !statusLine.contains("200")
-                ) {
-                    log(head)
-                }
-                // 车机可能把链路字节直接塞在应答体里（而不是另发事件通道）：认出来就喂给
-                // 链路引擎，别让它白躺在响应里。
-                if (reply.isNotEmpty() && looksLikeIapLink(reply)) {
-                    log("IAPLINK: 控制通道应答内含链路字节 ${reply.size}B → 喂给链路引擎")
-                    iapLink?.onCarBytes(reply)
-                }
-            } catch (error: IOException) {
-                log("IAPLINK: 控制通道 POST 失败 - ${error.message}")
-                iapLink?.close()
-                iapLink = null
-            }
-        }
+        // MIB3 控制通道直写已退役（§10.62：控制通道写单持有者=Rust，Kotlin
+        // 明文直写加密通道 = BAD_DECRYPT 拆会话）。链路出站走事件通道（sendIap）。
+        log("IAPLINK: 控制通道直写已退役（帧丢弃——出站走事件通道）")
     }
 
     /** 应答体的十六进制前缀（诊断用，截断到 24 字节）。 */
@@ -2106,38 +1701,6 @@ class AirPlayClient(
 
         /** 隧道 APTransportPackage 头长（4B BE 总长 + 12B 保留 + 4B type="comm" + 12B 保留）。 */
         private const val TUNNEL_PACKAGE_HEADER_BYTES = 32
-
-        /** RTSP 报文头结束分隔符与头部字段正则（请求/应答两条重组路径共用，勿再内联）。 */
-        private val HEAD_SEPARATOR = "\r\n\r\n".toByteArray(Charsets.US_ASCII)
-
-        private val CONTENT_LENGTH_REGEX = Regex("Content-Length:\\s*(\\d+)", RegexOption.IGNORE_CASE)
-
-        private val CSEQ_REGEX = Regex("CSeq:\\s*(\\d+)", RegexOption.IGNORE_CASE)
-
-        /** 解析 RTSP 报文头：首行 + Content-Length（两条重组路径共用）。 */
-        fun parseRtspHead(headText: String): Pair<String, Int> {
-            val contentLength =
-                CONTENT_LENGTH_REGEX
-                    .find(headText)
-                    ?.groupValues
-                    ?.get(1)
-                    ?.toIntOrNull() ?: 0
-            val firstLine = headText.lineSequence().firstOrNull() ?: ""
-            return firstLine to contentLength
-        }
-
-        fun indexOf(
-            source: ByteArray,
-            target: ByteArray,
-        ): Int {
-            outer@ for (index in 0..source.size - target.size) {
-                for (offset in target.indices) {
-                    if (source[index + offset] != target[offset]) continue@outer
-                }
-                return index
-            }
-            return -1
-        }
     }
 
     /**
@@ -2252,140 +1815,8 @@ class AirPlayClient(
                 sampleRate = negotiation.sampleRate,
             )
         }
-        val host = endpoint.ipAddresses.firstOrNull() ?: "receiver"
-        val startedAt = SystemClock.uptimeMillis()
-        val (statusLine, responseBody) =
-            try {
-                request(
-                    "SETUP",
-                    "rtsp://$host:${endpoint.airPlayPort}/",
-                    body,
-                    // 8s：奥迪音频 SETUP 实测可能耗时 ~2.7s（车机侧资源仲裁）；异步读线程
-                    // 保证等待期间 feedback 心跳照常发送，长等待不再触发车机看门狗
-                    timeoutMillis = 8_000,
-                    contentType = "application/x-apple-binary-plist",
-                )
-            } catch (error: IOException) {
-                log("AIRPLAY: 音频流协商失败 - ${error.message}")
-                return null
-            }
-        log("AIRPLAY: 音频 SETUP 往返 ${SystemClock.uptimeMillis() - startedAt}ms [$statusLine]")
-        if (!statusLine.contains("200")) {
-            log("AIRPLAY: 音频流协商应答 [$statusLine]")
-            return null
-        }
-        val root =
-            try {
-                BinaryPlist.parse(responseBody) as? Map<*, *>
-            } catch (error: IllegalArgumentException) {
-                null
-            } ?: run {
-                log("AIRPLAY: 音频流协商应答解析失败")
-                return null
-            }
-        val streams =
-            root["streams"] as? List<*> ?: run {
-                log("AIRPLAY: 音频流协商应答缺少 streams")
-                return null
-            }
-        val audio =
-            streams.firstOrNull { entry ->
-                ((entry as? Map<*, *>)?.get("type") as? Long) == profile.streamType
-            } as? Map<*, *> ?: run {
-                log("AIRPLAY: 音频流被拒绝（streams=$streams）")
-                return null
-            }
-        val dataPort = portOf(audio["dataPort"])
-        if (dataPort == 0) {
-            log("AIRPLAY: 音频流未返回 dataPort（$audio）")
-            return null
-        }
-        val streamKey =
-            AirPlayCrypto.hkdfSha512(
-                sharedSecret,
-                "DataStream-Salt$connectionId".toByteArray(Charsets.US_ASCII),
-                "DataStream-Output-Encryption-Key".toByteArray(Charsets.US_ASCII),
-            )
-        log(
-            "AIRPLAY: ✓ 音频流协商成功（type=${profile.streamType} ${negotiation.audioType} " +
-                "format=0x${negotiation.formatBit.toString(16)} ${negotiation.sampleRate}Hz " +
-                "latency=${negotiation.latencyMs}ms）" +
-                "dataPort=$dataPort controlPort=${portOf(audio["controlPort"])} connId=$connectionId" +
-                " 全字段=$audio",
-        )
-        // 音频通路已建好，但「车机在收数据、喇叭没声」还剩一种很常见的原因：
-        // 接收端的 AirPlay 音量处于静音位（-144dB）——真 iPhone 会主动 SET_PARAMETER
-        // volume。这里先查一次（顺带把值记进日志），查到静音位就抬到 -25dB。
-        probeAndFixVolume(host)
-        return AudioStreamInfo(
-            streamConnectionId = connectionId,
-            dataPort = dataPort,
-            controlPort = portOf(audio["controlPort"]),
-            streamKey = streamKey,
-            sampleRate = negotiation.sampleRate,
-        )
-    }
-
-    /**
-     * 查询并纠正接收端音量（AirPlay 的 `GET_PARAMETER`/`SET_PARAMETER` + `volume`）。
-     *
-     * 为什么需要（2026-10-20 Honda 实测）：AAC-LC 通路建好后车机**在实时消费样本**
-     * （`/feedback` 的 `sampleTime` 按 44.1k 走），但喇叭全静音。真 iPhone 在会话里
-     * 会主动下发 `SET_PARAMETER volume`；接收端的 AirPlay 增益若停留在静音位
-     * （-144dB），表现就正好是「数据在流、声音没有」。
-     *
-     * 这里只做两件事：① 把车机当前音量记进日志（这是判断「静音位」的直接证据）；
-     * ② 若确实处于静音位（≤[MUTE_THRESHOLD_DB]），抬到 [SAFE_VOLUME_DB]。
-     * 查询失败/车机不支持都不影响主链路。
-     */
-    private fun probeAndFixVolume(host: String) {
-        val url = "rtsp://$host:${endpoint.airPlayPort}/"
-        val volume: Float? =
-            try {
-                val (status, body) =
-                    request(
-                        "GET_PARAMETER",
-                        url,
-                        "volume".toByteArray(Charsets.US_ASCII),
-                        timeoutMillis = 4_000,
-                        contentType = "text/parameters",
-                    )
-                val text = body.toString(Charsets.UTF_8).trim()
-                log("AIRPLAY: 车机音量查询 $status body=${text.take(160)}")
-                VOLUME_REGEX
-                    .find(text)
-                    ?.groupValues
-                    ?.get(1)
-                    ?.toFloatOrNull()
-            } catch (error: Exception) {
-                log("AIRPLAY: 车机音量查询失败 - ${error.message}（忽略，不影响音频流）")
-                null
-            }
-        // 查得到且不在静音位：尊重车机当前音量，不再覆盖。
-        if (volume != null && volume > MUTE_THRESHOLD_DB) return
-        // 查不到（Honda 实测返回 501 Not Implemented）时也要下发一次：
-        // 原来的实现直接 return，等于整个会话从没设置过接收端音量——若车机 AirPlay
-        // 增益停在静音位，症状就是「数据在流、喇叭无声」，而我们连日志都拿不到。
-        try {
-            val payload = String.format(java.util.Locale.US, "volume: %.6f", SAFE_VOLUME_DB)
-            val (status, body) =
-                request(
-                    "SET_PARAMETER",
-                    url,
-                    payload.toByteArray(Charsets.US_ASCII),
-                    timeoutMillis = 4_000,
-                    contentType = "text/parameters",
-                )
-            log(
-                if (volume == null) {
-                    "AIRPLAY: 车机不支持音量查询 → 仍下发音量 $SAFE_VOLUME_DB dB（$status ${body.size}B）"
-                } else {
-                    "AIRPLAY: 车机音量在静音位（$volume dB）→ 已设为 $SAFE_VOLUME_DB dB（$status ${body.size}B）"
-                },
-            )
-        } catch (error: Exception) {
-            log("AIRPLAY: 设置车机音量失败 - ${error.message}")
-        }
+        // legacy RTSP 直写段已删（§10.62：泵恒在，Rust 快路唯一路径）。
+        return null
     }
 
     /**
@@ -2608,62 +2039,8 @@ class AirPlayClient(
             // 视频 dataPort REFUSED）。门禁留在 legacy 分支。
             return ScreenStreamInfo(connectionId, dataPort, cipher)
         }
-        // 请求路径与 catplay 完全一致：流 SETUP 走 "/"（初始 SETUP 走 "/setup"）。
-        // 部分接收端（Audi 固件）对路径敏感，路径不符会整包 400。
-        val (statusLine, responseBody) =
-            try {
-                request(
-                    "SETUP",
-                    "/",
-                    body,
-                    contentType = "application/x-apple-binary-plist",
-                )
-            } catch (error: IOException) {
-                log("AIRPLAY: 流协商失败 - ${error.message}")
-                return null
-            }
-        if (!statusLine.contains("200")) {
-            log(
-                "AIRPLAY: 流协商应答 [$statusLine]（响应头：${lastResponseHeadOfRequest()}）\n" +
-                    "  ↳ 请求体(${body.size}B)=" + body.joinToString("") { "%02x".format(it) },
-            )
-            return null
-        }
-        val root =
-            try {
-                BinaryPlist.parse(responseBody) as? Map<*, *>
-            } catch (error: IllegalArgumentException) {
-                null
-            } ?: run {
-                log("AIRPLAY: 流协商应答解析失败")
-                return null
-            }
-        val streams =
-            root["streams"] as? List<*> ?: run {
-                log("AIRPLAY: 流协商应答缺少 streams")
-                return null
-            }
-        val screen = streams.firstOrNull() as? Map<*, *>
-        val dataPort = portOf(screen?.get("dataPort"))
-        if (screen == null || dataPort == 0) {
-            log("AIRPLAY: 主屏流被拒绝（streams=$streams）")
-            return null
-        }
-        val cipher =
-            if (sessionKey != null) {
-                StreamFrameCipher.ChaCha(AirPlayStreamKeys.chachaStreamKey(sessionKey, connectionId))
-            } else {
-                val (key, iv) = AirPlayStreamKeys.aesStreamKeys(AirPlayStreamKeys.ZERO_SESSION_KEY, connectionId)
-                StreamFrameCipher.AesCtr(key, iv)
-            }
-        log(
-            "AIRPLAY: ✓ 主屏流协商成功 dataPort=$dataPort connId=$connectionId " +
-                "加密=${if (cipher is StreamFrameCipher.ChaCha) "ChaCha20" else "AES-128-CTR（未配对会话）"}",
-        )
-        // MIB3：屏幕流 SETUP 200 拿到 dataPort 后，真机此时在控制通道发 detect（Frida
-        // 时序：screen SETUP → phone detect on control → HU SYN on control）。见 armMib3VirtualLink。
-        armMib3VirtualLink()
-        return ScreenStreamInfo(connectionId, dataPort, cipher)
+        // legacy RTSP 直写段已删（§10.62）。
+        return null
     }
 
     /** RECORD：激活会话（接收端 onSessionActive）。路径用相对 `/`（catplay record() 同款）。 */
@@ -2814,23 +2191,6 @@ class AirPlayClient(
         return conv(body) as? Map<String, Any?> ?: linkedMapOf()
     }
 
-    /**
-     * `GET /info`（catplay `AirPlayRtspClient::info` 同款）：
-     * body 是**空的 bplist 字典**（不是零长度），Content-Type 必须是
-     * `application/x-apple-binary-plist`。老固件（210.81 时代）对无 body/错
-     * Content-Type 的 /info 会回 400/455，后续 SETUP 直接失败。
-     */
-    private fun requestInfo(timeoutMillis: Int = 10_000): Pair<String, ByteArray> =
-        request(
-            "GET",
-            "/info",
-            BinaryPlist.encode(linkedMapOf<String, Any?>()),
-            timeoutMillis,
-            contentType = "application/x-apple-binary-plist",
-        )
-
-    // ---- RTSP 请求 ----
-
     private fun ensureConnected(timeoutMillis: Int = 5_000): Boolean {
         if (socket?.isConnected == true && socket?.isClosed == false) return true
         // 快照端点与代数：连接期间主控可能换端点（0x4301 晚到），
@@ -2928,302 +2288,8 @@ class AirPlayClient(
         return text
     }
 
-    private fun post(
-        path: String,
-        body: ByteArray,
-    ): ByteArray {
-        val (statusLine, responseBody) = request("POST", path, body)
-        if (!statusLine.contains("200")) {
-            throw IOException("POST $path 应答 [$statusLine]")
-        }
-        return responseBody
-    }
-
-    // 配对请求（原 postPairing）：**已移入 Rust**（M5.2 汇编级定谳：固件头集 =
-    // X-Apple-Client-Name/HKP/PD 等，fw::airplay::plist_message 构建）。
-    // 旧实现的经验值（CT=application/pairing+tlv8、X-Apple-HKP=2）存档于
-    // audit §10.5 对照清单，装机整测时证伪。
-
-    private fun request(
-        method: String,
-        path: String,
-        body: ByteArray,
-        timeoutMillis: Int = 10_000,
-        contentType: String = "application/octet-stream",
-        extraHeaders: List<Pair<String, String>> = emptyList(),
-    ): Pair<String, ByteArray> {
-        val client = socket ?: throw IOException("未连接")
-        val startedAt = SystemClock.uptimeMillis()
-        startReader(client)
-        val queue = java.util.concurrent.LinkedBlockingQueue<Pair<String, ByteArray>>(1)
-        val cseq: Int
-        synchronized(rtspWriteLock) {
-            cseq = ++cSeq
-            // 先登记再写：响应可能在 write 返回前就到达
-            pendingResponses[cseq] = queue
-            try {
-                val head =
-                    "$method $path RTSP/1.0\r\n" +
-                        "CSeq: $cseq\r\n" +
-                        "User-Agent: AirPlay/$SENDER_SOURCE_VERSION\r\n" +
-                        "Content-Type: $contentType\r\n" +
-                        extraHeaders.joinToString("") { "${it.first}: ${it.second}\r\n" } +
-                        "Content-Length: ${body.size}\r\n" +
-                        "\r\n"
-                val plaintext = head.toByteArray(Charsets.US_ASCII) + body
-                val encryption = cipher
-                val wire =
-                    if (encryption != null) {
-                        synchronized(encryption) { encryption.encrypt(plaintext) }
-                    } else {
-                        plaintext
-                    }
-                val output = client.getOutputStream()
-                output.write(wire)
-                output.flush()
-            } catch (error: Throwable) {
-                pendingResponses.remove(cseq)
-                throw error
-            }
-        }
-        val response =
-            try {
-                queue.poll(timeoutMillis.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
-                    ?: throw IOException("RTSP 超时（${timeoutMillis}ms，CSeq=$cseq $method $path）")
-            } catch (error: InterruptedException) {
-                Thread.currentThread().interrupt()
-                throw IOException("RTSP 被中断（CSeq=$cseq $method $path）")
-            } finally {
-                pendingResponses.remove(cseq)
-            }
-        // 慢应答留痕：>1.5s 说明车机在内部仲裁（同类问题排查的第一手证据）
-        val elapsed = SystemClock.uptimeMillis() - startedAt
-        if (elapsed > 1_500) {
-            log("AIRPLAY: 慢应答 ${elapsed}ms（$method $path，CSeq=$cseq）——等待期间心跳未中断")
-        }
-        if (response.first == RTSP_CLOSED_MARK) {
-            throw IOException("控制通道已关闭（CSeq=$cseq $method $path）")
-        }
-        lastRequestCSeq.set(cseq)
-        return response
-    }
-
-    /**
-     * 控制通道读线程：统一收包、解密、按 CSeq 把响应派发给对应请求。
-     *
-     * 为什么必须异步（2026-10-17 实测根因）：奥迪的音频 SETUP 应答要 ~2.7s，此前
-     * 「一条连接一把锁 + 同步读响应」会让 feedback 心跳在这段时间完全停摆；车机对
-     * feedback 有 ~3s 看门狗——音频 SETUP 期间断供即 reset 事件通道并拆掉整轮会话
-     * （日志特征：feedback #1 与 #2 间隔 2.7s、随后 `EVENT: 读取结束 - Connection reset`）。
-     * 改为异步后任何长请求都不再阻塞心跳。
-     */
-
-    /**
-     * 读线程按「加密是否已启用」切分缓冲区：
-     * cipher 从 null 变为非 null 的那一刻（pair-verify 完成），此前的明文残渣必须丢弃——
-     * 若把明文尾巴拼进密文帧解析，ChaCha 帧边界会错位、后续所有应答都解不出来。
-     */
-    private fun readLoop(
-        client: Socket,
-        generation: Int,
-    ) {
-        var cipherPending = ByteArray(0)
-        var buffer = ByteArray(0)
-        var encryptedMode = false
-        try {
-            val input = client.getInputStream()
-            val chunk = ByteArray(8192)
-            while (true) {
-                val count = input.read(chunk)
-                if (count < 0) break
-                val encryption = cipher
-                if (encryption != null && !encryptedMode) {
-                    // 切换点：清掉明文侧残留，之后一律走帧解密
-                    encryptedMode = true
-                    cipherPending = ByteArray(0)
-                }
-                val data =
-                    if (encryption == null) {
-                        chunk.copyOf(count)
-                    } else {
-                        cipherPending += chunk.copyOf(count)
-                        val decrypted =
-                            try {
-                                synchronized(encryption) { encryption.decrypt(cipherPending) }
-                            } catch (error: Exception) {
-                                log("AIRPLAY: 控制通道解密失败 - ${error.message}")
-                                break
-                            }
-                        cipherPending = decrypted.rest
-                        decrypted.data
-                    }
-                if (data.isEmpty()) continue
-                buffer += data
-                while (true) {
-                    val parsed = parseRtspMessage(buffer) ?: break
-                    buffer = parsed.rest
-                    dispatchResponse(parsed.statusLine, parsed.body, parsed.head)
-                }
-            }
-        } catch (_: IOException) {
-        } finally {
-            // 只由「当前」读线程清账：重连会换 socket 与新读线程，旧线程不得误伤新会话
-            if (generation == readerGeneration) {
-                failAllPending("控制通道读线程结束")
-            }
-        }
-    }
-
-    /** 控制通道报文（CSeq 派发用；head 供诊断与请求/应答分类）。 */
-    private class RtspMessage(
-        val statusLine: String,
-        val body: ByteArray,
-        val head: String,
-    ) {
-        val cseq: Int? get() =
-            CSEQ_REGEX
-                .find(head)
-                ?.groupValues
-                ?.get(1)
-                ?.toIntOrNull()
-
-        /** 车机主动发来的请求（首行是 `METHOD /path RTSP/1.0`）；应答首行是 `RTSP/1.0 200 OK`。 */
-        val isRequest: Boolean
-            get() {
-                val tokens = statusLine.split(" ")
-                return tokens.size >= 2 && tokens[1].startsWith("/")
-            }
-    }
-
-    private fun dispatchResponse(
-        statusLine: String,
-        body: ByteArray,
-        head: String,
-    ) {
-        val message = RtspMessage(statusLine, body, head)
-        message.cseq?.let { responseHeads[it] = head }
-        val queue = message.cseq?.let { pendingResponses[it] }
-        if (queue != null) {
-            queue.offer(message.statusLine to message.body)
-            return
-        }
-        // 无匹配：车机可能在控制通道上发自己的请求（须回 200 否则它会拆通道）。
-        // 仅节流留痕，不静默丢弃——此前同步实现会把它错当成前一个请求的应答。
-        unmatchedMessages++
-        if (unmatchedMessages <= 5) {
-            log(
-                "AIRPLAY: 控制通道无匹配报文（#$unmatchedMessages）" +
-                    "[$statusLine] cseq=${message.cseq} request=${message.isRequest} body=${body.size}B",
-            )
-        }
-        if (message.isRequest) {
-            // 复用请求 CSeq 回空应答（与事件通道同一约定）
-            runCatching {
-                val payload =
-                    "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n" +
-                        (message.cseq?.let { "CSeq: $it\r\n" } ?: "") + "\r\n"
-                val encryption = cipher
-                synchronized(rtspWriteLock) {
-                    val out = socket?.getOutputStream() ?: return@runCatching
-                    out.write(
-                        if (encryption != null) {
-                            synchronized(encryption) { encryption.encrypt(payload.toByteArray(Charsets.US_ASCII)) }
-                        } else {
-                            payload.toByteArray(Charsets.US_ASCII)
-                        },
-                    )
-                    out.flush()
-                }
-            }
-        }
-    }
-
-    /** 无匹配报文计数（节流日志用）。 */
-    private var unmatchedMessages = 0
-
-    private fun failAllPending(reason: String) {
-        val waiting = pendingResponses.values.toList()
-        pendingResponses.clear()
-        if (waiting.isEmpty()) return
-        log("AIRPLAY: $reason——唤醒 ${waiting.size} 个待响应请求")
-        waiting.forEach { it.offer(RTSP_CLOSED_MARK to ByteArray(0)) }
-    }
-
-    private fun startReader(client: Socket) {
-        val previous: Socket?
-        synchronized(rtspWriteLock) {
-            if (readerSocket === client && readerThread?.isAlive == true) return
-            previous = readerSocket
-            readerSocket = client
-            val generation = ++readerGeneration
-            readerThread =
-                Thread({ readLoop(client, generation) }, "airplay-rtsp-reader").apply {
-                    isDaemon = true
-                    start()
-                }
-        }
-        // 旧 socket 由本线程持有其输入流：必须关掉（会抛 SocketException 让旧读线程退出），
-        // 否则两个读线程可能阻塞在同一连接上抢包——异步派发后这会导致响应错投
-        if (previous != null && previous !== client) {
-            runCatching { previous.close() }
-        }
-    }
-
-    /** 待响应的 CSeq → 响应队列（异步派发；feedback 不再被长请求饿死）。 */
-    private val pendingResponses =
-        java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.LinkedBlockingQueue<Pair<String, ByteArray>>>()
-
     /** 写侧串行：CSeq 分配 + 加密器写计数 + socket 写必须原子（读侧在独立线程）。 */
     private val rtspWriteLock = Any()
-
-    private var readerThread: Thread? = null
-    private var readerSocket: Socket? = null
-
-    /** 读线程代次：重连后旧线程不得清理新会话的待响应表。 */
-    private var readerGeneration = 0
-
-    /** 最近一次 RTSP 响应头（按 CSeq 存：读线程与请求线程并发，单一字段会错配到别的请求）。 */
-    private val responseHeads = java.util.concurrent.ConcurrentHashMap<Int, String>()
-
-    /** 本线程最近一次 request() 的 CSeq（诊断取响应头用；ThreadLocal 避免并发错配）。 */
-    private val lastRequestCSeq = ThreadLocal<Int>()
-
-    /** 取本线程最近一次请求的响应头（诊断用；读不到返回空串）。 */
-    private fun lastResponseHeadOfRequest(): String =
-        lastRequestCSeq
-            .get()
-            ?.let { responseHeads[it] }
-            ?.replace("\r\n", " | ")
-            .orEmpty()
-
-    /** 解析结果（报文 + 未消费的剩余字节）。 */
-    private class ParsedRtsp(
-        val statusLine: String,
-        val body: ByteArray,
-        val head: String,
-        val rest: ByteArray,
-    )
-
-    /**
-     * 从缓冲区切出完整报文（头 + Content-Length body）。
-     * 只在控制通道读线程里调用（缓冲区是该线程的局部状态，无跨线程共享）。
-     */
-    private fun parseRtspMessage(buffer: ByteArray): ParsedRtsp? {
-        val separatorIndex = indexOf(buffer, HEAD_SEPARATOR)
-        if (separatorIndex < 0) return null
-        val headText = String(buffer, 0, separatorIndex, Charsets.ISO_8859_1)
-        val (statusLine, contentLength) = parseRtspHead(headText)
-        val bodyStart = separatorIndex + HEAD_SEPARATOR.size
-        if (buffer.size - bodyStart < contentLength) return null
-        val responseBody = buffer.copyOfRange(bodyStart, bodyStart + contentLength)
-        val rest =
-            if (buffer.size > bodyStart + contentLength) {
-                buffer.copyOfRange(bodyStart + contentLength, buffer.size)
-            } else {
-                ByteArray(0)
-            }
-        return ParsedRtsp(statusLine, responseBody, headText, rest)
-    }
 
     // ---- 身份持久化 ----
 
