@@ -2296,7 +2296,7 @@ object SessionController {
                                     VideoSender(
                                         host = host,
                                         dataPort = screen.dataPort,
-                                        frameCipher = screen.cipher,
+                                        sessionHandle = client.sessionPumpHandle,
                                         width = streamW,
                                         height = streamH,
                                         targetFps = fps,

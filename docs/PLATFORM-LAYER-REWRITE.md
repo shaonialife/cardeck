@@ -183,6 +183,18 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
       HKDF/SHA512（bouncycastle 三 import 退役，A9 前小口）；startAudioChannel
       改 paired 布尔闸（currentSharedSecret 只剩配对态标记）。验证：Rust
       201 全绿；Kotlin compile/JVM/spotless/lint 全绿；装机回归待「安装」
+- [x] **A5+A4 屏幕帧构造/密封下沉**（2026-11-03 完成，protocol（A5A4 Rust
+      提交）+ android-carplay（A5A4 Kotlin 提交））：数据面第二刀。
+      帧头三构造器 + ScreenCipher 密封态全入 Rust（fw:airplay::screen，
+      sbpd 域 @0x2276b6964/@0x227833f38/@0x227969f68 直切）；VideoSender
+      经 nativeAirplayScreenSealFrame/ScreenBuildConfigHeader/
+      ScreenKeepAliveFrame 泵化——**帧密封态（帧计数器/AES 跨帧密钥流）
+      驻留 Rust 会话，事件面屏幕族不再携钥**（宿主零钥面）。删
+      StreamFrameCipher/Aes128CtrStream/VideoKeepAliveFrameTest；RFC 8439
+      官方 AEAD 向量启用验收（原测试缺 #[test]）。nonce 矛盾定谳：DJB
+      64x64(nonce=LE64 c) ≡ RFC(nonce=0000‖LE64 c) 16 字态逐字相同。
+      验证：Rust 207 全绿；Kotlin compile/JVM/spotless/lint 全绿；装机
+      回归待「安装」（视频帧密封全链真机回归）
 
 ## 六、收尾状态（2026-11-03）
 

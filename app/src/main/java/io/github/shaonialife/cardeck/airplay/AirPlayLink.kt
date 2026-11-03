@@ -520,8 +520,10 @@ class AirPlayLink(
 
     private val controlEventQueue = java.util.concurrent.LinkedBlockingQueue<org.json.JSONObject>()
 
+    /** 屏幕流帧密封消费的会话泵句柄（A4——VideoSender 经它走 Rust 密封态）。 */
     @Volatile
-    private var sessionPumpHandle = 0L
+    var sessionPumpHandle: Long = 0L
+        private set
 
     private fun startSessionPump(
         handle: Long,
@@ -977,8 +979,6 @@ class AirPlayLink(
     class ScreenStreamInfo(
         val streamConnectionId: Long,
         val dataPort: Int,
-        /** 帧加密方式：ChaCha20（已配对）或 AES-128-CTR（未配对会话）。 */
-        val cipher: StreamFrameCipher,
     )
 
     private var sendIapCount = 0
@@ -1293,42 +1293,14 @@ class AirPlayLink(
             val connectionId =
                 ev.optString("streamConnectionID").toLongOrNull()
                     ?: (java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L)
-            // A3 下沉：封包形态/钥全在 Rust 事件（fw: createCryptors 分派
-            // @0x2276c5fd0-6488）；交付残缺 = 协议异常，本壳不落派生
-            val cipher =
-                when (ev.optString("cipher")) {
-                    "chacha" ->
-                        StreamFrameCipher.ChaCha(
-                            hexToBytes(ev.optString("streamKey"))
-                                ?: run {
-                                    log("AIRPLAY: ChaCha 流钥交付残缺（ev=$ev）")
-                                    return null
-                                },
-                        )
-                    "aesCtr" -> {
-                        val key =
-                            hexToBytes(ev.optString("key")) ?: run {
-                                log("AIRPLAY: AES 流钥交付残缺（ev=$ev）")
-                                return null
-                            }
-                        val iv =
-                            hexToBytes(ev.optString("iv")) ?: run {
-                                log("AIRPLAY: AES 流 IV 交付残缺（ev=$ev）")
-                                return null
-                            }
-                        StreamFrameCipher.AesCtr(key, iv)
-                    }
-                    else -> {
-                        log("AIRPLAY: 流加密形态未交付（ev=$ev）")
-                        return null
-                    }
-                }
+            // A4 下沉：封包态驻留 Rust 会话（fw: cryptor 驻留流存储域）——
+            // 事件不再携钥，帧密封经 nativeAirplayScreenSealFrame 在 Rust 完成
             log("AIRPLAY: ✓ 主屏流已接受（Rust）dataPort=$dataPort connId=$connectionId")
             // 注意：**不可**在此 armMib3VirtualLink()——那是 MIB3 隧道机型的
             // 移交序列（拆蓝牙+detect）；非隧道机（DiPlay，iAPChannel=false）
             // 调用即自拆会话（真机 22:28:59 实证：BT 退役 → EVENT reset →
             // 视频 dataPort REFUSED）。门禁留在 legacy 分支。
-            return ScreenStreamInfo(connectionId, dataPort, cipher)
+            return ScreenStreamInfo(connectionId, dataPort)
         }
         // legacy RTSP 直写段已删（§10.62）。
         return null

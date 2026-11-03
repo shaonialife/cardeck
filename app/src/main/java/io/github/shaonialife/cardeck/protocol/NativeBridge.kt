@@ -403,12 +403,31 @@ object NativeBridge {
     /** 取走事件通道出站（应答/命令帧；null = 无）。 */
     external fun nativeAirplayEventTakeOutbound(handle: Long): ByteArray?
 
-    /** 屏幕流 keepAlive 统计体（bplist，键名/类型钉在 Rust screen 测试）。
-     *  纯函数（无会话态）。 */
-    external fun nativeAirplayKeepAliveStatsBody(
+    /** 屏幕流 keepAlive **整帧**（128B 头 + 可选统计体；A5 下沉——fw:
+     *  @0x2276b6964 分派 + params[14]@124 统计体长 f32）。明文。纯函数。 */
+    external fun nativeAirplayScreenKeepAliveFrame(
+        withStats: Boolean,
         frames: Int,
         bytesPerSecond: Double,
         fps: Int,
+    ): ByteArray?
+
+    /** VideoConfig 头（128B；A5 下沉——fw: @0x227833f38 最小形态；
+     *  Encrypted 位由会话封包态判定）。 */
+    external fun nativeAirplayScreenBuildConfigHeader(
+        handle: Long,
+        bodyLen: Int,
+        width: Int,
+        height: Int,
+    ): ByteArray?
+
+    /** VideoFrame 密封整帧（128B 头 + 密封载荷；A4 下沉——fw:
+     *  cryptor 变换 @0x227969f68，帧计数器/AES 密钥流驻留会话态）。
+     *  null = 无封包态（未 SETUP/被拒），宿主跳帧。 */
+    external fun nativeAirplayScreenSealFrame(
+        handle: Long,
+        payload: ByteArray,
+        uptimeNanos: Long,
     ): ByteArray?
 
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----

@@ -4,8 +4,6 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.view.Surface
-import io.github.shaonialife.cardeck.airplay.AirPlayCrypto
-import io.github.shaonialife.cardeck.airplay.StreamFrameCipher
 import io.github.shaonialife.cardeck.net.TcpLiveness
 import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.io.ByteArrayOutputStream
@@ -16,12 +14,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * CarPlay 主屏视频发送端（Phase 2-C2）。
  *
- * 线格式（对照 DiPlay ScreenStream.kt）：
+ * 线格式（A5+A4 起帧头/密封全在 Rust，fw:airplay::screen——本类只做
+ * AnnexB→NAL 切分/SPS level 补丁/H.264 avcC 标准封装 + socket 泵）：
  *  - 每条消息 = 128 字节头 + body；头部 = [0..3] u32LE body 长度、[4] opcode、
- *    [8..15] NTP 32.32 LE 发送时间；整头作帧加密 AAD，其余字节为零
- *  - opcode 1 = VideoConfig：明文 avcC 记录（looksLikeAvcC 判定）
- *  - opcode 0 = VideoFrame：ChaCha20-Poly1305 密封的「4 字节 BE 长度前缀 NAL 序列」，
- *    nonce = nonce64(帧计数)，计数按帧顺序从 0 递增
+ *    [8..15] NTP 32.32 LE 发送时间（fw: sbpd 域 @0x2276b70ac）
+ *  - opcode 1 = VideoConfig：明文 avcC 记录（H.264 标准封装）
+ *  - opcode 0 = VideoFrame：密封的「4 字节 BE 长度前缀 NAL 序列」——
+ *    ChaCha（nonce=8B LE 帧计数，fw: cryptor+0x110）/ AES-CTR（跨帧密钥流）
  *
  * 视频源：MediaCodec Surface 输入（H.264 硬编码），内容由画面源渲染
  * （隐形屏模式的 DualDisplayComposer 输入 Surface）。
@@ -30,11 +29,10 @@ class VideoSender(
     private val host: String,
     private val dataPort: Int,
     /**
-     * 帧加密方式（catplay `ScreenFrameCodec` 三种形态）：
-     *  - ChaCha：已配对（pair-verify 派生流密钥）
-     *  - AesCtr：未配对会话（`et=NONE`，AES-128-CTR + 全零会话密钥）
+     * AirPlay 会话泵句柄（帧密封态驻留 Rust 会话——fw: cryptor 驻留流存储
+     * 域；streamSetup 应答时按车机 `et` 形态建立，宿主零钥面）。
      */
-    private val frameCipher: StreamFrameCipher,
+    private val sessionHandle: Long,
     /** H.264 4:2:0 要求偶数尺寸——奇数高度会让编码器在首帧输入时进错误态（125% 缩放实测踩坑）。 */
     width: Int,
     height: Int,
@@ -58,12 +56,7 @@ class VideoSender(
     private var encoder: MediaCodec? = null
     private var inputSurface: Surface? = null
     private val running = AtomicBoolean(false)
-    private var frameCounter = 0L
     private var configSent = false
-
-    /** AES-CTR 密钥流实例：状态必须跨帧连续（每帧新建会导致对端解出乱码）。 */
-    private val aesStream: AirPlayCrypto.Aes128CtrStream? =
-        (frameCipher as? StreamFrameCipher.AesCtr)?.let { AirPlayCrypto.Aes128CtrStream(it.key, it.iv) }
 
     /** 上一次屏幕流 keepAlive 的时刻（uptimeMillis；0 = 尚未发过）。 */
     private var lastKeepAliveAt = 0L
@@ -282,7 +275,14 @@ class VideoSender(
         bytesSinceKeepAlive = 0
         lastKeepAliveAt = now
         keepAliveCount++
-        val frame = buildKeepAliveFrame(keepAliveWithStats, frames, bytesPerSecond, framesPerSecond)
+        val frame =
+            NativeBridge.nativeAirplayScreenKeepAliveFrame(
+                keepAliveWithStats,
+                frames,
+                bytesPerSecond,
+                framesPerSecond,
+            ) ?: ByteArray(0)
+        if (frame.isEmpty()) return
         output.write(frame)
         output.flush()
         if (keepAliveCount <= 3 || keepAliveCount % 30 == 0L) {
@@ -336,7 +336,9 @@ class VideoSender(
         //  - params[0] 归零（catplay 的 config 不带 PTS；只有 VideoFrame 才写 params[0]）
         // 旧实现三项都没写——DiPlay/WinPlay 只读 body、不校验头，所以测试台一直正常，
         // 真车（Audi 4851）却黑屏（2026-10-19 用户日志）。
-        val header = buildVideoConfigHeader(body.size, width, height)
+        val header =
+            NativeBridge.nativeAirplayScreenBuildConfigHeader(sessionHandle, body.size, width, height)
+                ?: return
         output.write(header)
         output.write(body)
         output.flush()
@@ -382,29 +384,16 @@ class VideoSender(
         }
         val plain = packed.toByteArray()
 
-        // 加密方式按会话的 et 选择（catplay ScreenFrameCodec）：
-        //  - ChaCha：header 作 AAD，body 长度含 16B tag；
-        //  - AES-128-CTR：无 tag、不改长度，密钥流跨帧连续。
-        // keepAlive/config 帧在两种模式下都不加密。头只能构造一次——ChaCha 的 AAD
-        // 必须是最终发出的那 128 字节（重复构造会带不同时间戳，对端解密必然失败）。
-        val header =
-            buildHeader(
-                OP_FRAME,
-                if (frameCipher is StreamFrameCipher.ChaCha) plain.size + TAG_SIZE else plain.size,
-            )
-        val sealed =
-            when (val cipher = frameCipher) {
-                is StreamFrameCipher.ChaCha ->
-                    AirPlayCrypto.chachaSeal(cipher.key, AirPlayCrypto.nonce64(frameCounter), plain, header)
-                is StreamFrameCipher.AesCtr -> {
-                    val encrypted = plain.copyOf()
-                    aesStream?.applyKeystream(encrypted)
-                    encrypted
+        // 帧头构造 + 密封全在 Rust（A4——fw: cryptor 变换 @0x227969f68）：
+        // ChaCha nonce = 8B LE 帧计数（会话驻留态）/ CTR 密钥流跨帧连续；
+        // 头只构造一次且作 AAD（Rust 内部完成，时间戳一致）。null = 无封包态。
+        val frame =
+            NativeBridge.nativeAirplayScreenSealFrame(sessionHandle, plain, System.nanoTime())
+                ?: run {
+                    log("VIDEO: 封包态不可用（无 streamSetup 密态）——跳帧")
+                    return
                 }
-            }
-        frameCounter++
-        output.write(header)
-        output.write(sealed)
+        output.write(frame)
         output.flush()
         framesSent++
         framesSinceKeepAlive++
@@ -415,38 +404,6 @@ class VideoSender(
         if (framesSent <= 3 || framesSent % 300 == 0L) {
             log("VIDEO: 帧 #$framesSent ${plain.size}B${if (keyFrame) " (key)" else ""} 已发送")
         }
-    }
-
-    /** 128 字节消息头：u32LE body 长度、opcode、NTP 32.32 LE 时间戳，其余为零。 */
-    private fun buildHeader(
-        opcode: Int,
-        bodyLength: Int,
-    ): ByteArray {
-        val header = ByteArray(HEADER_LEN)
-        header[0] = (bodyLength and 0xFF).toByte()
-        header[1] = ((bodyLength ushr 8) and 0xFF).toByte()
-        header[2] = ((bodyLength ushr 16) and 0xFF).toByte()
-        header[3] = ((bodyLength ushr 24) and 0xFF).toByte()
-        header[4] = opcode.toByte()
-        val nanos = System.nanoTime()
-        val seconds = nanos / 1_000_000_000L
-        val fraction = ((nanos % 1_000_000_000L) shl 32) / 1_000_000_000L
-        val ntp = (seconds shl 32) or fraction
-        for (index in 0 until 8) {
-            header[8 + index] = ((ntp ushr (8 * index)) and 0xFF).toByte()
-        }
-        return header
-    }
-
-    private fun writeMessage(
-        opcode: Int,
-        body: ByteArray,
-        declaredLength: Int,
-        output: java.io.OutputStream,
-    ) {
-        output.write(buildHeader(opcode, declaredLength))
-        output.write(body)
-        output.flush()
     }
 
     /** 按 00 00 00 01 / 00 00 01 起始码切分 AnnexB 码流为 NAL 列表。 */
@@ -484,102 +441,15 @@ class VideoSender(
     }
 
     companion object {
-        private const val HEADER_LEN = 128
         private const val OP_FRAME = 0
-        private const val OP_CONFIG = 1
         private const val OP_KEEP_ALIVE = 2
         private const val OP_KEEP_ALIVE_WITH_BODY = 5
-        private const val TAG_SIZE = 16
-
-        /**
-         * 头部位标志（catplay `ScreenFlag`）：写进 `small_param[1]`（头部偏移 6）。
-         * `Encrypted = 1<<2`：视频帧是 ChaCha 密封的；VideoConfig 里必须声明，
-         * 否则车机按明文 NAL 解析 → 解码失败黑屏（会话与触摸仍正常）。
-         */
-        private const val SCREEN_FLAG_ENCRYPTED = 0x04
-
-        /** VideoConfig 头部 `params[1]` 的偏移：8 + 1×8，两个 f32 LE = 宽、高。 */
-        private const val CONFIG_WIDTH_HEIGHT_OFFSET = 16
 
         /** 屏幕流 keepAlive 间隔（catplay `DEFAULT_KEEP_ALIVE` = 1s）。 */
         private const val KEEPALIVE_INTERVAL_MS = 1_000L
 
-        /**
-         * 构造屏幕流 keepAlive 帧（明文头 + 可选 bplist 统计体）。
-         *
-         * 拆成纯函数是为了单测：帧格式一旦写错（opcode/body 长度字段/统计体键名），
-         * 接收端会静默忽略而不报错——现象仍是 10 秒后被拆链，排查成本极高。
-         * R3：统计体 bplist 在 Rust（nativeAirplayKeepAliveStatsBody，键名/
-         * 类型钉 fw::airplay::screen 测试）。
-         */
-        internal fun buildKeepAliveFrame(
-            withStats: Boolean,
-            frames: Int,
-            bytesPerSecond: Double,
-            framesPerSecond: Int,
-        ): ByteArray {
-            val body =
-                if (withStats) {
-                    NativeBridge.nativeAirplayKeepAliveStatsBody(frames, bytesPerSecond, framesPerSecond)
-                        ?: ByteArray(0)
-                } else {
-                    ByteArray(0)
-                }
-            val header = ByteArray(HEADER_LEN)
-            // 头部布局：u32LE body 长度、u8 opcode、3 字节小参数、15 × 8 字节参数
-            header[0] = (body.size and 0xFF).toByte()
-            header[1] = ((body.size ushr 8) and 0xFF).toByte()
-            header[2] = ((body.size ushr 16) and 0xFF).toByte()
-            header[3] = ((body.size ushr 24) and 0xFF).toByte()
-            header[4] = (if (body.isEmpty()) OP_KEEP_ALIVE else OP_KEEP_ALIVE_WITH_BODY).toByte()
-            if (body.isNotEmpty()) {
-                // params[14]（偏移 8+14*8=120）：前 4 字节 0.0f，后 4 字节 body 长度 f32 LE
-                writeLittleEndianFloat(header, 120, 0f)
-                writeLittleEndianFloat(header, 124, body.size.toFloat())
-            }
-            return if (body.isEmpty()) header else header + body
-        }
-
-        /**
-         * VideoConfig 帧头（catplay `ScreenFrame::config` 逐字节对齐）：
-         *  - `small_param[1]`（偏移 6）置 Encrypted(0x04) —— 声明后续视频帧是密封的
-         *  - `params[1]`（偏移 16）= 宽、高两个 f32 LE —— 车机据此建解码器画布
-         *  - `params[0]`（偏移 8..16）保持 0 —— config 不带 PTS
-         *
-         * 拆成纯函数是为了单测：真车（Audi 4851）缺这两项时**会话不断、触摸正常、屏全黑**，
-         * 日志里看不出任何错误，极难排查。
-         */
-        internal fun buildVideoConfigHeader(
-            bodySize: Int,
-            width: Int,
-            height: Int,
-        ): ByteArray {
-            val header = ByteArray(HEADER_LEN)
-            header[0] = (bodySize and 0xFF).toByte()
-            header[1] = ((bodySize ushr 8) and 0xFF).toByte()
-            header[2] = ((bodySize ushr 16) and 0xFF).toByte()
-            header[3] = ((bodySize ushr 24) and 0xFF).toByte()
-            header[4] = OP_CONFIG.toByte()
-            header[6] = SCREEN_FLAG_ENCRYPTED.toByte()
-            for (index in 0 until 4) {
-                val widthBits = width.toFloat().toRawBits()
-                header[CONFIG_WIDTH_HEIGHT_OFFSET + index] = ((widthBits ushr (8 * index)) and 0xFF).toByte()
-                val heightBits = height.toFloat().toRawBits()
-                header[CONFIG_WIDTH_HEIGHT_OFFSET + 4 + index] = ((heightBits ushr (8 * index)) and 0xFF).toByte()
-            }
-            return header
-        }
-
-        private fun writeLittleEndianFloat(
-            target: ByteArray,
-            offset: Int,
-            value: Float,
-        ) {
-            val bits = value.toRawBits()
-            for (index in 0 until 4) {
-                target[offset + index] = ((bits ushr (8 * index)) and 0xFF).toByte()
-            }
-        }
+        /** 128B 消息头（fw: `calloc(1, 0x80)` @0x2276b6964——布局/构造全在 Rust）。 */
+        internal const val HEADER_LEN = 128
     }
 }
 
