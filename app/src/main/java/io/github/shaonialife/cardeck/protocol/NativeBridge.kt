@@ -97,14 +97,6 @@ object NativeBridge {
         bluetoothMac: String,
     )
 
-    /** 隧道模式编排（车机发起型：mode 1=DiPlay、2=MIB3、3=现代隧道）。 */
-    external fun nativeSessionFlowStartTunnel(
-        handle: Long,
-        mode: Int,
-        deviceName: String,
-        bluetoothMac: String,
-    )
-
     /** 裸 CSM 分发（DiPlay type-130 隧道：入站即完整会话消息，无链路封装）。 */
     external fun nativeSessionDispatchRaw(
         handle: Long,

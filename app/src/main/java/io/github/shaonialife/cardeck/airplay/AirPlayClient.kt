@@ -6,8 +6,6 @@ import io.github.shaonialife.cardeck.audio.AudioCodec
 import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioSender
 import io.github.shaonialife.cardeck.audio.AudioTuning
-import io.github.shaonialife.cardeck.iap2.Iap2Csm
-import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.TcpLiveness
@@ -657,8 +655,6 @@ class AirPlayClient(
         // 新连接总是从**明文**开始（pair-verify 成功后才切加密）：旧连接的 cipher 必须
         // 清掉，否则重连后的读线程会把明文应答当密文帧解，后续所有请求超时。
         cipher = null
-        runCatching { iapTunnel?.socket?.close() }
-        iapTunnel = null
         iapLink = null
         // 注意：controlIapTx 不在这里 shutdown——close() 会被同实例的重试路径
         // （retryWithPairing 等）复用，杀掉执行器会废掉重连后的 MIB3 出站；
@@ -1067,251 +1063,6 @@ class AirPlayClient(
         val cipher: StreamFrameCipher,
     )
 
-    inner class IapTunnelClient(
-        val socket: Socket,
-        private val readKey: ByteArray,
-        private val logPrefix: String = "TUNNEL",
-        private val writeKey: ByteArray = readKey,
-    ) {
-        @Volatile
-        var messageCount = 0
-            private set
-
-        /** 车机→手机 iAP2 消息回调（CSM 帧字节）。 */
-        var onIapMessage: ((Iap2Csm.Frame) -> Unit)? = null
-
-        private val parser =
-            Iap2Csm
-                .Parser()
-
-        private val writeLock = Any()
-        private var writeCounter = 0L
-        private var writeFailureLogged = false
-
-        /**
-         * 手机→接收端方向（隧道）写入：DiPlay 的隧道链路引擎**只从 TCP socket 读**
-         * （AirPlayIapTunnelStream 的 inbound=IapTunnel/TCP，outbound=事件通道），
-         * 因此发送端必须把 iAP2 链路字节以「ChaCha 帧（2B LE 长度作 AAD + 密文 + 16B tag）
-         * ⊃ APTransportPackage（4B BE 总长、偏移 16 处 type="comm"）」写进该 socket。
-         * 密钥与读取方向同源（OUTPUT 标签 = 手机→接收端方向，2026-08 对照源码确认）。
-         * 返回是否写出（socket 关闭/异常返回 false，调用方仅记录一次）。
-         *
-         * 包头偏移 20..28 为 8B 大端**包序号**（自 1 递增，2026-10-26 对照参考
-         * 实现补齐——标准接收端校验该序号；DiPlay 不读它，补齐无副作用）。
-         */
-        fun writeIapBytes(bytes: ByteArray): Boolean {
-            if (socket.isClosed || !socket.isConnected || bytes.isEmpty()) return false
-            return try {
-                val size = TUNNEL_PACKAGE_HEADER_BYTES + bytes.size
-                val plain = ByteArray(size)
-                plain[0] = (size ushr 24).toByte()
-                plain[1] = (size ushr 16).toByte()
-                plain[2] = (size ushr 8).toByte()
-                plain[3] = size.toByte()
-                plain[16] = 'c'.code.toByte()
-                plain[17] = 'o'.code.toByte()
-                plain[18] = 'm'.code.toByte()
-                plain[19] = 'm'.code.toByte()
-                // 双类型标签（参考实现 C4.d() 字节布局）：offset 4..8 恒写 "sync"——
-                // 读端按 offset4 与 offset16 两个独立位置分发（sync→活性/rply、
-                // comm→投递载荷），DiPlay 只看 comm 所以旧版不写也通，标准接收端
-                // 按 offset4 分发时不写 sync 的上行包会被当未知类型丢弃（2026-10-26
-                // 审查 P0：链路永远建立不起来的第一嫌疑）
-                plain[4] = 's'.code.toByte()
-                plain[5] = 'y'.code.toByte()
-                plain[6] = 'n'.code.toByte()
-                plain[7] = 'c'.code.toByte()
-                bytes.copyInto(plain, TUNNEL_PACKAGE_HEADER_BYTES)
-                val aad =
-                    byteArrayOf(
-                        (size and 0xFF).toByte(),
-                        ((size ushr 8) and 0xFF).toByte(),
-                    )
-                // 包序号 @20..28 与 ChaCha 计数器都必须与写 socket 同锁：
-                // 任一乱序都会让对端拒收/解密失败
-                synchronized(writeLock) {
-                    val sequence = ++writeSequence
-                    for (index in 0 until 8) {
-                        plain[20 + index] = (sequence ushr ((7 - index) * 8)).toByte()
-                    }
-                    val sealed =
-                        AirPlayCrypto.chachaSeal(
-                            writeKey,
-                            AirPlayCrypto.nonce64(writeCounter++),
-                            plain,
-                            aad,
-                        )
-                    val output = socket.getOutputStream()
-                    output.write(aad)
-                    output.write(sealed)
-                    output.flush()
-                }
-                writeFailureLogged = false
-                true
-            } catch (error: IOException) {
-                if (!writeFailureLogged) {
-                    writeFailureLogged = true
-                    log("$logPrefix: 写出失败 - ${error.message}")
-                }
-                false
-            }
-        }
-
-        /** APTransportPackage 包序号（偏移 20..28 的 8B BE，自 1 递增）。 */
-        private var writeSequence = 0L
-
-        fun startReading() {
-            Thread({
-                val input = socket.getInputStream()
-                var pending = ByteArray(0)
-                var plaintext = ByteArray(0)
-                val buffer = ByteArray(16 * 1024)
-                try {
-                    while (socket.isClosed == false) {
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        pending += buffer.copyOf(count)
-                        val decrypted = decryptFrames(pending)
-                        pending = decrypted.second
-                        plaintext += decrypted.first
-                        plaintext = parsePackages(plaintext)
-                    }
-                    log("$logPrefix: 通道关闭（EOF），共 $messageCount 条 iAP2 消息")
-                } catch (error: IOException) {
-                    log("$logPrefix: 读取结束 - ${error.message}")
-                }
-            }, "iap-tunnel-reader").apply {
-                isDaemon = true
-                start()
-            }
-        }
-
-        /** ChaCha 帧解密（与 ControlCipher 同帧格式，独立计数器/密钥）。 */
-        private fun decryptFrames(buffer: ByteArray): Pair<ByteArray, ByteArray> {
-            val output = ArrayList<ByteArray>()
-            var offset = 0
-            while (buffer.size - offset >= 2) {
-                val length = (buffer[offset].toInt() and 0xFF) or ((buffer[offset + 1].toInt() and 0xFF) shl 8)
-                val frameLength = 2 + length + 16
-                if (buffer.size - offset < frameLength) break
-                val aad = buffer.copyOfRange(offset, offset + 2)
-                val sealed = buffer.copyOfRange(offset + 2, offset + frameLength)
-                val plain =
-                    AirPlayCrypto.chachaOpen(
-                        readKey,
-                        AirPlayCrypto.nonce64(tunnelReadCounter++),
-                        sealed,
-                        aad,
-                    )
-                output += plain
-                offset += frameLength
-            }
-            val rest = buffer.copyOfRange(offset, buffer.size)
-            return if (output.isEmpty()) ByteArray(0) to rest else output.reduce { a, b -> a + b } to rest
-        }
-
-        /**
-         * APTransportPackage 解析：4B BE 总长，32B 头。
-         *  - 偏移 16 type="comm" → body=iAP2 消息（CSM 解析 + [onRawBytes] 原样上抛）；
-         *  - 偏移 4 type="sync" → 接收端存活探测，回 `rply`（抄回对方 20..28 时间戳）——
-         *    参考实现对每条 sync 都回，标准接收端靠它
-         *    判隧道活性，不回会被断开；DiPlay 从不发 sync，无行为变化。
-         */
-        private fun parsePackages(buffer: ByteArray): ByteArray {
-            var offset = 0
-            while (buffer.size - offset >= 32) {
-                val size =
-                    ((buffer[offset].toInt() and 0xFF) shl 24) or
-                        ((buffer[offset + 1].toInt() and 0xFF) shl 16) or
-                        ((buffer[offset + 2].toInt() and 0xFF) shl 8) or
-                        (buffer[offset + 3].toInt() and 0xFF)
-                if (size < 32 || buffer.size - offset < size) break
-                val messageType = String(buffer, offset + 16, 4, Charsets.US_ASCII)
-                if (messageType == "comm") {
-                    val body = buffer.copyOfRange(offset + 32, offset + size)
-                    onRawBytes?.invoke(body)
-                    onIapBytes(body)
-                } else if (String(buffer, offset + 4, 4, Charsets.US_ASCII) == "sync") {
-                    val reply = ByteArray(32)
-                    reply[0] = 0
-                    reply[1] = 0
-                    reply[2] = 0
-                    reply[3] = 32
-                    "rply".toByteArray(Charsets.US_ASCII).copyInto(reply, 4)
-                    System.arraycopy(buffer, offset + 20, reply, 20, 8)
-                    writeRawPackage(reply)
-                    if (syncReplies <= 3) {
-                        syncReplies++
-                        log("$logPrefix: sync 探测 → 已回 rply #$syncReplies")
-                    }
-                }
-                offset += size
-            }
-            return buffer.copyOfRange(offset, buffer.size)
-        }
-
-        /** 已应答的 sync 探测数（日志节流）。 */
-        private var syncReplies = 0
-
-        /**
-         * 车机→手机方向的原 comm 载荷（未解析）：喂给事件通道虚拟链路的引擎——
-         * type-130 隧道全双工形态（参考实现语义）下车机把链路帧（DETECT/SYN/
-         * CSM 的 FF5A 封装）直接放 comm 包里发过来，不走事件通道。
-         */
-        var onRawBytes: ((ByteArray) -> Unit)? = null
-
-        /** 加密写出一个自构造的 APTransportPackage（rply 应答用，不含 comm 标记）。 */
-        private fun writeRawPackage(plain: ByteArray): Boolean =
-            try {
-                val aad =
-                    byteArrayOf(
-                        (plain.size and 0xFF).toByte(),
-                        ((plain.size ushr 8) and 0xFF).toByte(),
-                    )
-                synchronized(writeLock) {
-                    val sealed =
-                        AirPlayCrypto.chachaSeal(
-                            writeKey,
-                            AirPlayCrypto.nonce64(writeCounter++),
-                            plain,
-                            aad,
-                        )
-                    val output = socket.getOutputStream()
-                    output.write(aad)
-                    output.write(sealed)
-                    output.flush()
-                }
-                true
-            } catch (error: IOException) {
-                if (!writeFailureLogged) {
-                    writeFailureLogged = true
-                    log("$logPrefix: 写出失败 - ${error.message}")
-                }
-                false
-            }
-
-        private fun onIapBytes(bytes: ByteArray) {
-            messageCount++
-            val frames = parser.offer(bytes)
-            for (frame in frames) {
-                // hex 格式化有成本：只在真要打日志的分支里做（此前每条消息都先算一遍）
-                if (messageCount <= 20) {
-                    val hex = bytes.joinToString(" ") { "%02x".format(it) }
-                    log(
-                        "$logPrefix: iAP2 msg #$messageCount id=0x${frame.messageId.toString(16)} " +
-                            "(${Iap2MessageIds.nameOf(frame.messageId)}) body=${frame.body.size}B " +
-                            "hex=${hex.take(160)}",
-                    )
-                } else if (messageCount % 100 == 0) {
-                    log("$logPrefix: iAP2 msg #$messageCount id=0x${frame.messageId.toString(16)} body=${frame.body.size}B")
-                }
-                onIapMessage?.invoke(frame)
-            }
-        }
-
-        private var tunnelReadCounter = 0L
-    }
-
     /**
      * SETUP type-130 iAP 隧道并连接车机 dataPort。失败返回 null（会话继续，触摸不可用）。
      * 手机→车机方向用 [sendIap]（事件通道 iAPSendMessage）。
@@ -1325,28 +1076,6 @@ class AirPlayClient(
      * 全双工「现代认证」形态（两步式 0xAA00 + 记忆挑战 + runtime 问候，详见
      * [VirtualIap2Link.tunnelModernAuth]）；未声明（DiPlay）维持旧半双工行为。
      */
-    fun runIapTunnel(
-        sessionKey: ByteArray?,
-        modernAuth: Boolean = false,
-    ): IapTunnelClient? {
-        // 隧道 socket 用 DataStream 密钥加密，未配对会话没有共享密钥可派生 → 跳过。
-        if (sessionKey == null) {
-            log("TUNNEL: 未配对会话没有共享密钥——跳过 iAP 隧道（触摸不可用）")
-            return null
-        }
-        // legacy RTSP 直写分支已删（§10.62：连接序后泵恒在——type-130 专用
-        // socket 域的隧道对象重建待数据面收编；当前会话触摸走事件通道）。
-        return null
-    }
-
-    /**
-     * 隧道客户端引用（DiPlay 形态）：事件通道虚拟链路（[VirtualIap2Link]）的**出站方向**
-     * 必须写进 type-130 TCP（DiPlay 的隧道链路引擎只从 TCP 读；其出站走事件通道，
-     * 与我们被动接收一致）。无隧道（Audi 事件通道形态）时出站继续走事件通道 [sendIap]。
-     */
-    @Volatile
-    private var iapTunnel: IapTunnelClient? = null
-
     private var sendIapCount = 0
 
     /**
@@ -1403,36 +1132,9 @@ class AirPlayClient(
     /** 视频起流回调（屏幕上第一帧发出后）——实验模式下重申的触发源。 */
     var onStreamingStarted: (() -> Unit)? = null
 
-    /**
-     * MIB3 虚拟链路移交就绪（链路 NORMAL、即将发 0x1D00）：宿主据此拆 BT iAP2 会话
-     * （对齐真 iPhone 的无线移交形态：AirPlay 链成型后 BT 立刻退役，单一链路）。
-     */
-    var onMib3HandoffReady: (() -> Unit)? = null
-
-    /** MIB3 虚拟链路是否已布防（armMib3 成功）——拆链归因用：布防了但控制会话没完成就被拆 = 链路看门狗，与音频档位无关。 */
-    var mib3LinkArmed: Boolean = false
-        private set
-
     /** MIB3 控制会话是否完成过（auth+burst 已发）。 */
     var mib3ControlSessionDone: Boolean = false
         private set
-
-    /**
-     * 现代隧道形态（enabledFeatures 含 iAPChannel）下等待隧道控制会话完成
-     * （识别+MFi+runtime 问候，即 [mib3ControlSessionDone]）——参考实现把「iAP2
-     * 认证完成」作为屏幕流 SETUP 的前置（阻塞 6s，超时降级 screen-only 并重建
-     * 事件桥；2026-10-26 审查 P1）。我们超时后继续走屏幕流（隧道并发跑着），
-     * 不做关隧道降级——诊断期保留观察窗口。
-     */
-    fun awaitModernTunnelSession(timeoutMillis: Long): Boolean {
-        val deadline = SystemClock.elapsedRealtime() + timeoutMillis
-        while (SystemClock.elapsedRealtime() < deadline) {
-            if (mib3ControlSessionDone) return true
-            if (iapTunnel == null) return false
-            Thread.sleep(100)
-        }
-        return mib3ControlSessionDone
-    }
 
     /** 隧道链路唯一实例（原生会话薄层，协议行为全在 cardeck-protocol）。 */
     private fun obtainIapLink(): NativeTunnelIap2Link =
@@ -1441,8 +1143,6 @@ class AirPlayClient(
                 ?: NativeTunnelIap2Link(
                     log = { line -> log(line) },
                     sendEventIap = ::sendIap,
-                    sendControlIap = ::postControlIap,
-                    tunnelWriter = { iapTunnel },
                     alive = { socket?.isClosed == false },
                 ).also {
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
@@ -1451,7 +1151,6 @@ class AirPlayClient(
                         mib3ControlSessionDone = true
                         onTunnelControlSessionComplete?.invoke()
                     }
-                    it.onMib3HandoffReady = { onMib3HandoffReady?.invoke() }
                     iapLink = it
                 }
         }
@@ -1459,28 +1158,6 @@ class AirPlayClient(
     /** 车机 iAPSendMessage 字节入口（SessionController 事件命令处理器调用）。 */
     fun onIapEventBytes(data: ByteArray) {
         obtainIapLink().onCarBytes(data)
-    }
-
-    /**
-     * MIB3 布防：屏幕流 SETUP 成功后调用——主动经**控制通道** POST /command 发一次
-     * DETECT，随后等车机 SYN（真机 Frida 时序，详见 [VirtualIap2Link.armMib3]）。
-     * 明文会话（pre-HomeKit 老车机）没有 WiFi 隧道语义，跳过。
-     */
-    private fun armMib3VirtualLink() {
-        if (cipher == null) return
-        if (iapTunnel != null) return // DiPlay 隧道形态：不需要（也不该）布防
-        // 实验 C（2026-10-25，8015 不切屏排查）：CLASSIC_MIB3 完全跳过隧道布防——
-        // 不发 DETECT、车机因此不发 marker、链路永不协商。对齐真 iPhone 形态
-        // （sysdiagnose 成功会话 iAPChannel=0 = 无隧道）。已排除的变量：SPS level
-        // （40/32 都不切）、帧率（30/60 都不切）、分辨率（= /info 声明值）、
-        // modesChanged 重申与资源仲裁（全 200、modes 干净）。剩「协商完成抑制切屏」
-        // 这一条：0.1.12 切屏窗口恰在协商完成之前。
-        if (MIB3_TUNNEL_ARM_ENABLED) {
-            obtainIapLink().armMib3()
-            mib3LinkArmed = true
-        } else {
-            log("IAPLINK: 实验模式——跳过 MIB3 隧道布防（不发 DETECT，纯 AirPlay 流）")
-        }
     }
 
     /**
@@ -1501,44 +1178,6 @@ class AirPlayClient(
         log("IAPLINK: 控制通道直写已退役（帧丢弃——出站走事件通道）")
     }
 
-    /** 应答体的十六进制前缀（诊断用，截断到 24 字节）。 */
-    private fun hexPrefix(
-        bytes: ByteArray,
-        limit: Int = 24,
-    ): String = bytes.take(limit).joinToString(" ") { "%02x".format(it) } + if (bytes.size > limit) "…" else ""
-
-    /**
-     * 报文全量十六进制（故障取证用）：默认最多 480 字节、每行 48 字节。
-     * 排查车机 plist 解不出来时，只给 24 字节前缀看不到出错的对象，必须给全文。
-     */
-    private fun hexDump(
-        bytes: ByteArray,
-        limit: Int = 480,
-        perLine: Int = 48,
-    ): String {
-        if (bytes.isEmpty()) return "（空）"
-        val shown = minOf(bytes.size, limit)
-        val builder = StringBuilder(shown * 3)
-        var index = 0
-        while (index < shown) {
-            if (index > 0) builder.append("\n    ")
-            val end = minOf(index + perLine, shown)
-            for (position in index until end) {
-                builder.append("%02x".format(bytes[position]))
-                if (position != end - 1) builder.append(' ')
-            }
-            index = end
-        }
-        if (bytes.size > shown) builder.append(" …（共 ${bytes.size}B，只显示前 $shown）")
-        return builder.toString()
-    }
-
-    /** 应答体是否是 iAP2 链路帧（marker 0xFF55 / 同步包 0xFF5A）。 */
-    private fun looksLikeIapLink(bytes: ByteArray): Boolean =
-        bytes.size >= 6 &&
-            bytes[0] == 0xFF.toByte() &&
-            (bytes[1] == 0x5A.toByte() || bytes[1] == 0x55.toByte())
-
     /** 音频流协商结果（RTP over UDP；密钥同视频流规则，盐用音频连接 ID）。 */
     class AudioStreamInfo(
         val streamConnectionId: Long,
@@ -1550,7 +1189,6 @@ class AirPlayClient(
     )
 
     /** plist 端口是 u16 但以 2 字节有符号整数编码（>32767 读出为负），按位掩出真实值。 */
-    private fun portOf(value: Any?): Int = ((value as? Long) ?: 0L).toInt() and 0xFFFF
 
     companion object {
         /**
@@ -1558,7 +1196,6 @@ class AirPlayClient(
          * 实验结论出来后：切屏则永久改为「不发隧道」路线；不切则恢复 true 并转向
          * 隧道内数据通路（仪表盘订阅/0x5201 等）。
          */
-        private const val MIB3_TUNNEL_ARM_ENABLED = true
 
         /** 从 /info 或 changeModes 的 modes 结构解析状态；缺失的清单沿用 [base]。 */
         internal fun parseModesState(

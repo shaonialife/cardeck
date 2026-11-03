@@ -16,7 +16,6 @@ import io.github.shaonialife.cardeck.bt.Iap2BluetoothClient
 import io.github.shaonialife.cardeck.bt.Iap2BluetoothServer
 import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.capture.HiddenDisplaySource
-import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.input.ConsumerKeys
 import io.github.shaonialife.cardeck.input.HidNavigation
@@ -344,19 +343,6 @@ object SessionController {
 
     /** 会话建立互斥（端点交接 → 配对 → 推流全程只允许一条）。 */
     val sessionStarting = AtomicBoolean(false)
-
-    /**
-     * MIB3 无线移交已拆 BT（CarBluetoothReceiver 读）：真 iPhone 在 AirPlay 链成型后
-     * 94ms 内整体拆除 BT iAP2（sysdiagnose 2026-10-16），车机把「BT 释放」当移交完成
-     * 条件。我们拆 RFCOMM 后 ACL 随之掉线（HFP/A2DP 在连接前已被断开），若不豁免，
-     * ACL_DISCONNECTED 会立刻 AUTO_STOP_SESSION 把刚建好的会话杀掉。
-     */
-    @Volatile
-    var btHandoffActive: Boolean = false
-        private set
-
-    /** 本轮会话是否已执行过移交拆链（防重复；新一轮会话在 retireSession 复位）。 */
-    private val btHandoffDone = AtomicBoolean(false)
 
     /**
      * 交接流程已在跑、但 AirPlayClient 尚未创建时收到的晚到端点（0x4301）。
@@ -780,7 +766,6 @@ object SessionController {
         // （2026-10-16 实测）。BT 退役只在用户终态做，见 disconnect()。
         // 解除会话静默：出站探测恢复（下次会话建立时会再次置位）
         BtSessionGate.sessionActive = false
-        resetBtHandoffState()
         // 音频路由抢占自愈的节流状态随会话复位
         audioRouteReclaimLastAtMs = 0L
         audioRouteReclaimAttempts = 0
@@ -1689,16 +1674,6 @@ object SessionController {
         bluetoothClient?.detachCurrentSession()
     }
 
-    /**
-     * MIB3 移交标志复位（会话任一终点都要走：车机侧拆链的 onEnded 不经过
-     * retireSession——只挂一端必漏，暗幕「会话断了还启动」同款教训）。
-     * 豁免解除后 ACL 事件回归常规语义，下一轮会话允许再次执行移交拆链。
-     */
-    private fun resetBtHandoffState() {
-        btHandoffActive = false
-        btHandoffDone.set(false)
-    }
-
     /** 音频路由抢占自愈的节流状态（每会话最多 5 次、间隔 ≥30s；retireSession 复位）。 */
     private var audioRouteReclaimLastAtMs = 0L
 
@@ -1747,28 +1722,6 @@ object SessionController {
      * 服务端 accept 一并停掉：iPhone 拆 BT 后 90s+ 车机无 RFCOMM 回连，但停监听是
      * 防御性正确（防车机回连挂上第二条链）；onEnded/下一轮 startConnection 会重启。
      */
-    fun detachBtForMib3Handoff() {
-        // 2026-11-02 清理（用户令：车型特调全清，行为统一）：代际画像闸与
-        // 车型白名单（audi5163/5810）拆除——唯一触发条件 = 结构性协议状态
-        // （WiFi 隧道 iAP2 会话建成，onMib3HandoffReady），对齐真 iPhone
-        // sysdiagnose 时序（BT 在车机 SYN 与首帧视频之前落下）。历史车型
-        // 分歧（6318 拆 BT 后 AirPlay 被车机拆）归 M5 固件对照重审，不在
-        // Kotlin 侧做车型分支。
-        if (!btHandoffDone.compareAndSet(false, true)) return
-        btHandoffActive = true
-        appendLog(
-            "IAPLINK: MIB3 移交启动——对齐真 iPhone 顺序，立即拆除蓝牙 iAP2 会话（ACL 断开豁免已开启）",
-        )
-        Bg.run("bt-handoff-detach") {
-            runCatching {
-                bluetoothServer?.stop()
-                detachActiveBtSessions()
-            }.onFailure { error ->
-                appendLog("IAPLINK: ⚠ 移交拆链异常 ${error.javaClass.simpleName}: ${error.message}")
-            }
-            appendLog("IAPLINK: 蓝牙已退役（无线移交完成形态：单一 AirPlay iAP2 链）")
-        }
-    }
 
     /**
      * 等车机 ctrl 邀请（`GET /ctrl-int/1/connect`）——catplay 的连接触发点。
@@ -1973,19 +1926,6 @@ object SessionController {
         val profile = activeAudioProfile ?: return
         val startedAt = activeAudioStartedAt
         val identity = activeAudioReceiverKey
-        // 链路看门狗守卫（2026-10-23 车主 0.1.17 日志定谳）：MIB3 布防了但控制会话
-        // 没完成就被拆 = 车机 ~10s 链路看门狗（RECORD 后 10.18s，与 0.1.9 的 10.17s
-        // 同款），与音频档位无关。不守卫的话 t102/media 档被误记「不兼容」，下一轮
-        // 自动换到 compatibility 档——那条通路车机根本不接（AGENTS 音频三条硬约束），
-        // 从此永远没声。
-        currentClient?.let { client ->
-            if (client.mib3LinkArmed && !client.mib3ControlSessionDone) {
-                appendLog("AUDIO: 会话在链路协商完成前被车机拆掉（~10s 看门狗形态）——不记音频档位")
-                activeAudioProfile = null
-                activeAudioStartedAt = 0L
-                return
-            }
-        }
         val lived = if (startedAt > 0) android.os.SystemClock.uptimeMillis() - startedAt else -1L
         // 本轮记忆很快失效：下次连接重新按最新记忆选档
         activeAudioProfile = null
@@ -2547,16 +2487,10 @@ object SessionController {
                             created.onTunnelControlSessionComplete = {
                                 scheduleModesReclaim(created)
                             }
-                            // MIB3 虚拟链成型 → 拆 BT 完成无线移交（真 iPhone 时序，
-                            // 车机 HMI 切屏的先决条件；详见 detachBtForMib3Handoff）
-                            created.onMib3HandoffReady = { detachBtForMib3Handoff() }
-                            // 实验 C（跳过隧道布防）时隧道永远不完成 → 重申无触发源。
                             // 视频起流后立刻排一遍（时序与 AADisplay 的「起流 +1.5s」等价）。
                             created.onStreamingStarted = {
-                                if (!created.mib3LinkArmed) {
-                                    appendLog("AIRPLAY: 未布防隧道（实验模式）——起流后直接排 modesChanged 重申")
-                                    scheduleModesReclaim(created)
-                                }
+                                appendLog("AIRPLAY: 起流——排 modesChanged 重申")
+                                scheduleModesReclaim(created)
                             }
                             // 车机归还资源（UNBORROW/UNTAKE）= 切屏窗口：80ms 后补发
                             // modesChanged（AADisplay CarPlayEventChannel 同款时序）
@@ -2781,45 +2715,12 @@ object SessionController {
                         setup.hidDeviceUuids.forEach { uuid ->
                             client.sendHidSetInputMode(uuid, mode = 0)
                         }
-                        // iAP 隧道（type-130）协商在屏幕流 SETUP **之前**（2026-10-26
-                        // 对照参考实现时序）：8015 类车机在隧道上完成 iAP2 协商后
-                        // 才进入 CarPlay 激活窗口；且隧道成功后 armMib3VirtualLink 的
-                        // 「隧道形态不布防」门禁才能在屏幕流 SETUP 时生效（顺序颠倒会
-                        // 先按事件通道形态发 DETECT）。失败不阻塞（返回 null 继续）。
-                        // modernAuth：接收端 SETUP 应答声明了 iAPChannel（8015 类）
-                        // → 全双工「现代认证」形态（两步式 0xAA00 + 记忆挑战 +
-                        // runtime 问候）；未声明（DiPlay）→ 旧半双工行为。
-                        val tunnelModern = setup.enabledFeatures.contains("iAPChannel")
+                        // 接收端能力声明（诊断）：iAPChannel=1 表示车机请求 type-130
+                        // 隧道形态——该形态已随 MIB3 隧道退役，触摸统一走事件通道
+                        // iAP 虚链路（nativeSessionFeed 薄层）。
                         appendLog(
-                            "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}" +
-                                " iAPChannel=$tunnelModern",
+                            "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}",
                         )
-                        val tunnel = client.runIapTunnel(sessionKey, modernAuth = tunnelModern)
-                        if (tunnel != null && tunnelModern) {
-                            // 现代隧道形态：屏幕流 SETUP 前等待隧道控制会话完成
-                            // （识别+MFi+runtime，参考实现同款 6s 门；超时继续——
-                            // 隧道并发协商，屏幕流不无限等）
-                            val startedAt = SystemClock.elapsedRealtime()
-                            val ready = client.awaitModernTunnelSession(6_000L)
-                            appendLog(
-                                "TUNNEL: 现代认证等待 " +
-                                    (if (ready) "完成" else "超时（继续屏幕流）") +
-                                    "（${SystemClock.elapsedRealtime() - startedAt}ms）",
-                            )
-                        }
-                        tunnel?.onIapMessage = { frame ->
-                            // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
-                            if (frame.messageId != 0x0000) {
-                                val hex = frame.body.joinToString(" ") { "%02x".format(it) }
-                                appendLog(
-                                    "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
-                                        "(${Iap2MessageIds.nameOf(
-                                            frame.messageId,
-                                        )}) ${frame.body.size}B" +
-                                        if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
-                                )
-                            }
-                        }
                         val screen = client.runScreenStream(sessionKey, setup.displayUuid)
                         if (screen != null) {
                             // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
@@ -2902,25 +2803,6 @@ object SessionController {
                                         log = { line -> appendLog(line) },
                                         keepAliveWithStats = setup.keepAliveSendStatsAsBody,
                                         onEnded = {
-                                            // MIB3 移交收口（「两端收口」铁律）：车机拆链
-                                            // 是最常见的离场方式，此处必须复位移交豁免并
-                                            // 恢复入站监听——否则下次上车的 ACL 自动重连被
-                                            // 豁免吞掉、server 停摆无人重启（暗幕当年同款
-                                            // 「只挂一端」教训）。移交形态下 BT 已无会话可
-                                            // 接续端点，音频一并停止：改动前靠
-                                            // ACL_DISCONNECTED 全量收摊，移交后该路径被
-                                            // 豁免，熄火后音频会无限空转（审查定谳）。
-                                            if (btHandoffActive) {
-                                                resetBtHandoffState()
-                                                appendLog(
-                                                    "IAPLINK: 移交形态会话结束——恢复 ACL 常规语义与入站监听，停止音频采集",
-                                                )
-                                                audioSender?.stop()
-                                                audioSender = null
-                                                Bg.run("bt-server-restore") {
-                                                    runCatching { bluetoothServer?.start() }
-                                                }
-                                            }
                                             // 会话真实结束：解除静默降噪（客户端恢复探测/重连）
                                             appendLog(">>> CarPlay 会话结束（推流终止）——恢复蓝牙探测")
                                             BtSessionGate.sessionActive = false

@@ -8,26 +8,16 @@ import java.util.concurrent.LinkedBlockingQueue
 /**
  * WiFi 隧道 iAP2 链路（原生会话薄层）——替代日志推断的 [VirtualIap2Link]。
  *
- * 协议行为全部在 cardeck-protocol 固件真身内：
- *  - MIB3 控制通道形态：链路帧（FF 5A）走 nativeSessionFeed（ParseBuffer/FSM/
- *    分包器），车机 SYN → 原生 SYN|ACK；识别/MFi/问候/订阅空态由 flow handler
- *    端到端（车机发起型：0x1D01→0x1D02、0xAA00 两步序列号→0xAA01→0xAA02
- *    20B→0xAA03→0xAA05→问候突发→订阅空态应答）。
- *  - DiPlay type-130 隧道形态：隧道承载裸 CSM（40 40 无链路封装）——
- *    nativeSessionDispatchRaw 直进消息解析 + handler 分发（首条到达自动
- *    发 0x1D00）。
- *
- * Kotlin 侧只剩：传输路由（隧道/控制通道）、DETECT marker 应答（传输层探测，
- * 6 字节常量）、HID 报文 → 媒体键/旋钮的平台注入（ConsumerKeys/HidNavigation）。
+ * 协议行为全部在 cardeck-protocol 固件真身内（nativeSessionFeed：链路帧
+ * FF 5A 走 ParseBuffer/FSM，车机 SYN → 原生 SYN|ACK；识别/MFi/特性启动波
+ * 由编排泵端到端自推进）。Kotlin 侧只剩：字节搬运（事件通道 onCarBytes 进、
+ * 事件通道 iAPSendMessage 出）、DETECT marker 应答（传输层探测，6 字节常量）、
+ * HID 报文 → 媒体键/旋钮的平台注入（ConsumerKeys/HidNavigation）。
  */
 class NativeTunnelIap2Link(
     private val log: (String) -> Unit,
     /** 事件通道 iAPSendMessage 出站（旧形态兜底 + marker 应答）。 */
     private val sendEventIap: (ByteArray) -> Boolean,
-    /** 控制通道 iAPSendMessage 出站（MIB3 手机侧帧唯一正确通道）。 */
-    private val sendControlIap: (ByteArray) -> Unit,
-    /** DiPlay type-130 隧道写入口（每次出站动态取用，可为 null）。 */
-    private val tunnelWriter: () -> AirPlayClient.IapTunnelClient?,
     /** 节拍线程存活条件。 */
     private val alive: () -> Boolean,
 ) {
@@ -37,16 +27,6 @@ class NativeTunnelIap2Link(
     var handle: Long = 0L
         private set
 
-    @Volatile
-    var tunnelModernAuth: Boolean = false
-
-    @Volatile
-    var tunnelBluetoothMac: String? = null
-
-    /** 隧道入站是否裸 CSM（首条 40 40 后固定）。 */
-    @Volatile
-    private var tunnelIngressRawCsm = false
-
     /** 车机 HID 描述符（0x6800 载荷，媒体键解析用）。 */
     @Volatile
     var hidDescriptor: ByteArray? = null
@@ -55,8 +35,6 @@ class NativeTunnelIap2Link(
     var onMediaKey: ((Int) -> Unit)? = null
     var onNavKey: ((Int) -> Unit)? = null
     var onControlSessionComplete: (() -> Unit)? = null
-    var onMib3HandoffReady: (() -> Unit)? = null
-
     private val hidEvents = LinkedBlockingQueue<ByteArray>()
 
     val isAlive: Boolean get() = alive()
@@ -114,14 +92,10 @@ class NativeTunnelIap2Link(
         }
     }
 
-    /** 传输路由：隧道存在 → type-130；否则控制通道（MIB3 不读事件通道出站）。 */
+    /** 传输路由：出站收敛到事件通道（iAPSendMessage——Audi 事件通道形态；
+     *  控制通道直写已随 MIB3 隧道退役，2026-11-03 对接期清理）。 */
     private fun routeOutbound(bytes: ByteArray) {
-        val tunnel = tunnelWriter()
-        if (tunnel != null) {
-            tunnel.writeIapBytes(bytes)
-        } else {
-            sendControlIap(bytes)
-        }
+        sendEventIap(bytes)
     }
 
     /**
@@ -136,22 +110,7 @@ class NativeTunnelIap2Link(
             log("IAPLINK: 车机 marker——已回 DETECT（事件通道）")
             return
         }
-        // DiPlay 隧道裸 CSM 形态判定：40 40 开头 = 无链路封装
-        if (bytes.size >= 2 && bytes[0] == 0x40.toByte() && bytes[1] == 0x40.toByte()) {
-            tunnelIngressRawCsm = true
-        }
-        if (tunnelIngressRawCsm && tunnelWriter() != null) {
-            NativeBridge.nativeSessionDispatchRaw(handle, bytes)
-        } else {
-            NativeBridge.nativeSessionFeed(handle, bytes)
-        }
-    }
-
-    /** MIB3 布防：控制通道发 DETECT；半移交（拆 BT）回调随即触发。 */
-    fun armMib3() {
-        sendControlIap(MARKER)
-        log("IAPLINK: MIB3 detect 已发（控制通道）——等待车机 SYN")
-        onMib3HandoffReady?.invoke()
+        NativeBridge.nativeSessionFeed(handle, bytes)
     }
 
     private fun dispatchHid(params: List<ByteArray>) {
