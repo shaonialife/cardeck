@@ -3,7 +3,6 @@ package io.github.shaonialife.cardeck.airplay
 import io.github.shaonialife.cardeck.input.ConsumerKeys
 import io.github.shaonialife.cardeck.input.HidNavigation
 import io.github.shaonialife.cardeck.protocol.NativeBridge
-import java.util.concurrent.LinkedBlockingQueue
 
 /**
  * WiFi 隧道 iAP2 链路（原生会话薄层）——替代日志推断的 [VirtualIap2Link]。
@@ -35,8 +34,6 @@ class NativeTunnelIap2Link(
     var onMediaKey: ((Int) -> Unit)? = null
     var onNavKey: ((Int) -> Unit)? = null
     var onControlSessionComplete: (() -> Unit)? = null
-    private val hidEvents = LinkedBlockingQueue<ByteArray>()
-
     val isAlive: Boolean get() = alive()
 
     init {

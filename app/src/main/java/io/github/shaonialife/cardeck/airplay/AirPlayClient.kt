@@ -61,7 +61,6 @@ class AirPlayClient(
     private var endpointGeneration = 0
 
     private var socket: Socket? = null
-    private var cSeq = 0
 
     /**
      * 最近一次成功连上接收端时使用的地址（字符串形式，IPv6 链路本地地址带 `%<iface>`）。
@@ -127,9 +126,6 @@ class AirPlayClient(
     /** Rust info 事件全量（runSetup 的 displays/HID/features 源）。 */
     private var rustInfoEvent: org.json.JSONObject? = null
         private set
-
-    /** 控制通道是否已加密（pair-verify 完成）。false = 明文会话（老车机 / 未配对）。 */
-    val controlEncrypted: Boolean get() = cipher != null
 
     /**
      * 跳过 HomeKit 配对，直接走 `et=NONE` 明文会话（pre-HomeKit 老车机）。
@@ -1234,49 +1230,8 @@ class AirPlayClient(
          */
         const val AUDIO_LATENCY_FALLBACK_MS = 250L
 
-        /** 车机音量 ≤ 这个值（dB）视为静音位（AirPlay 里 -144 约等于全静音）。 */
-        private const val MUTE_THRESHOLD_DB = -100f
-
-        /** 检测到静音位时抬到的音量（dB，0=最大；-25 属于中等偏小，不至于炸响）。 */
-        private const val SAFE_VOLUME_DB = -25.0f
-
-        /** 解析 `volume: -12.345678` 这类文本参数。 */
-        private val VOLUME_REGEX = Regex("volume:\\s*(-?[0-9.]+)")
-
-        /**
-         * SETUP 里的 iPhone 能力清单（接收端按「车机支持 ∩ 提议」计算 enabledFeatures，
-         * 缺失的能力整个功能被关——2026-10-11 奥迪实测：videoPlayback 单独提议时
-         * 视频管线未启用、屏幕流 400）。清单对照 catplay 真车发送端。
-         */
-        val CONTROLLER_FEATURES =
-            listOf(
-                "uiContext",
-                "viewAreas",
-                "cornerMasks",
-                "focusTransfer",
-                "h.264Level5.1",
-                "mainBuffered",
-                "altScreen",
-                "enhancedSiri",
-                "hevc",
-                "sessionManagement",
-                "logTransfer",
-                "iAPChannel",
-                "vehicleStateProtocol",
-                "videoPlayback",
-            )
-
-        /** 等车机打开 AirPlay 窗口的总时长（用户在车机上点手机图标的等待窗口）。 */
-        private const val PAIRING_WINDOW_MILLIS = 120_000L
-
         /** 配对重试期间调用 [retryTick] 的间隔（次）：每轮回 2s，10 次 ≈ 每 20s 重新公告一次。 */
         private const val RETRY_TICK_ATTEMPTS = 10
-
-        /**
-         * 接收端明确回「没有这个接口」的 HTTP 状态。命中即判定为 pre-HomeKit 老车机，
-         * 立刻转明文会话，不再把 120s 配对窗口空跑完。
-         */
-        private val PAIRING_UNSUPPORTED_STATUS = listOf("404", "405", "455", "501")
 
         /** 发送端自报的 AirPlay 版本（catplay 真车验证值，iOS 15.0.2 时代；勿用车机的版本）。 */
         private const val SENDER_SOURCE_VERSION = "566.25.21"
