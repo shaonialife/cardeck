@@ -98,12 +98,24 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
   {bt_write, uptime_ms}——推模型对接说明见 src/host.rs 头注释
 
 ### 待做（压缩后按序开工）
-- [ ] **R1 编排段收缩**：SessionController 删端点合并族（enrichEndpointFromBrowser/
-      mergeBrowserEndpoint/preferEndpoint/drainPendingEndpoint/
-      watchForPendingStartSession/onLateEndpoint/txtValue）、awaitCtrlInvite、
-      resolveEndpointHost（B11 定谳后简化——地址集 Rust 透传，连接时直接用）；
-      onCarPlayEndpoint 保留流启动时序（SETUP→连端口→RECORD→编码器→音频
-      SETUP 2s 看门狗序=平台调度）
+- [x] **R1 编排段收缩**（2026-11-03 完成，android-carplay 25a42c6 + protocol 7461043）：
+      - **根因修复（Rust 侧）**：EV_ENDPOINT 载荷补 wifi 尾块（0x4301 组1
+        子0 ssid/子1 pass/子2 sec/子4 ch 透传，fw/endpoint.rs
+        `_iap2_CarPlayStartSession` @0x10015633c）——此前 ssid 恒空，
+        fw 引擎时代端点全数落入空端点观察器分支（连接触发断链根因）
+      - 事件路径定形：-2 ENDPOINT → onEndpoint 直通 onCarPlayEndpoint
+        （原 onEndpoint 是死接线，端点绕行 onLateEndpoint）；-3 纯诊断
+      - SessionController（3020→2617）删：onLateEndpoint/
+        watchForPendingStartSession/drainPendingEndpoint/preferEndpoint/
+        mergeBrowserEndpoint/resolveEndpointHost/awaitCtrlInvite/
+        pendingEndpointUpdate 状态机 + 4 常量 + 死参链（onEndpointUpdate/
+        knownCarSsid/timeoutMillis）
+      - onCarPlayEndpoint 薄化：无 wifi 域→已绑网沿用直通/否则本轮放弃；
+        连接序直连（窗口未开的 refused 由决策机退避吸收，mDNS 缺口由
+        runFlow 的 endpointRefresher 补齐——enrichEndpointFromBrowser+
+        txtValue 保留 = 唯一 mDNS 消费面）；流启动时序原样保留
+      - 验证：Kotlin compile+JVM 测试+spotless+lint 全绿；Rust 187 lib
+        全绿；**装机待设备空闲**（so 已构建入 jniLibs，设备 19:56 在用）
 - [ ] **R2 AirPlayLink 壳**：新文件替代 AirPlayClient（2011 行）——TCP socket +
       nativeAirplay* 泵搬运 + keepalive UDP + Timing socket + 事件通道命令
       POST；ControlCipher/AirPlayCrypto 暂以传输组件保留（E3 双界验证）；
