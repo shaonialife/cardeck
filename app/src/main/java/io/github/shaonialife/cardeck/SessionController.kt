@@ -17,8 +17,8 @@ import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.capture.HiddenDisplaySource
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.input.ConsumerKeys
+import io.github.shaonialife.cardeck.input.Contact
 import io.github.shaonialife.cardeck.input.HidNavigation
-import io.github.shaonialife.cardeck.input.TouchReports
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
@@ -31,6 +31,7 @@ import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.WifiCarPlayConnector
 import io.github.shaonialife.cardeck.net.WifiConnectCommand
 import io.github.shaonialife.cardeck.net.WifiSavedNetworks
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import io.github.shaonialife.cardeck.service.CarPlayService
 import io.github.shaonialife.cardeck.shizuku.CarInputClient
 import io.github.shaonialife.cardeck.shizuku.Shell
@@ -2062,103 +2063,87 @@ object SessionController {
                             when (command["type"]) {
                                 "hidSendReport" -> {
                                     val uuid = command["uuid"]?.toString()
-                                    val report = command["hidReport"] as? ByteArray
-                                    // 车机媒体键（Consumer Control）走 hidSendReport 通路，
-                                    // 判定**以设备描述符为准**（不按 uuid、不按车机型号写死）：
-                                    // 描述符声明了 Consumer 页(0x0C)的设备才当媒体键，报告字节是
-                                    // Usage 数组下标（HID Array 语义）。触摸/旋钮/电话设备的描述符
-                                    // 分别是 Digitizer/GenericDesktop/Telephony 页，一律不走这里——
-                                    // DiPlay 的 knob(4B) 与 telephony(1B) 报告长度与媒体键重叠，
-                                    // 只靠长度会误判（如 telephony usage 0xB3 会误发「快进」）。
+                                    val report = command["hidReport"] as? ByteArray ?: return@connectEventChannel
+                                    // A6 下沉：判定树全在 Rust（fw::airplay::hid——媒体键 →
+                                    // 导航 → Consumer 释放 → 触摸，**以设备描述符为准**，
+                                    // 不按 uuid/车型写死；fw: APHIDClientHandleHIDReport
+                                    // @0x2276b7e4c 报告格式由 hidDescriptor 定义）。
+                                    // Kotlin 只剩动作面：媒体键派发/DPAD 注入/触点注入。
                                     val descriptor = uuid?.let { setup.hidDescriptors[it] }
-                                    val keyMap =
-                                        descriptor?.let(ConsumerKeys::parseDescriptor)
-                                    val rawValue =
-                                        report
-                                            ?.takeIf { it.isNotEmpty() }
-                                            ?.let { it[0].toInt() and 0xFF }
-                                    val consumerUsage =
-                                        when {
-                                            // 有描述符：只有 Consumer 设备才解析（非 Consumer → null）
-                                            descriptor != null -> keyMap?.let { rawValue?.let(it::usageFor) }
-                                            // 描述符缺失（未知车机）：保守回退——仅 1 字节报告，
-                                            // 值当 Usage ID 直读
-                                            report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
-                                            else -> null
-                                        }
-                                    // 旋钮/四向拨杆（Generic Desktop 页的 Wheel/Hat）：
-                                    // 不是 Consumer 设备才走这里；输出 DPAD_* 注入虚拟屏。
-                                    val navKeys =
-                                        if (consumerUsage == null && report != null) {
-                                            if (HidNavigation.rawLogEnabled) {
+                                    val dispatch = NativeBridge.nativeAirplayHidDispatch(descriptor, report)
+                                    if (dispatch != null && HidNavigation.rawLogEnabled) {
+                                        appendLog(
+                                            "HID-RAW: uuid=$uuid bytes=" +
+                                                report.joinToString(" ") { "%02X".format(it) } +
+                                                " → $dispatch",
+                                        )
+                                    }
+                                    if (dispatch == null) return@connectEventChannel
+                                    val obj = org.json.JSONObject(dispatch)
+                                    when (obj.getString("kind")) {
+                                        "nav" -> {
+                                            val mask = obj.getInt("mask")
+                                            val delta =
+                                                if (obj.has("delta") && !obj.isNull("delta")) obj.getInt("delta") else null
+                                            val hat = if (!obj.isNull("hat")) obj.getInt("hat") else null
+                                            val navKeys = HidNavigation.handleRaw(uuid.orEmpty(), mask, delta, hat)
+                                            if (navKeys.isNotEmpty()) {
+                                                navKeys.forEach(::injectNavigationKey)
                                                 appendLog(
-                                                    "HID-RAW: uuid=$uuid bytes=" +
-                                                        report.joinToString(" ") { "%02X".format(it) } +
-                                                        " desc=${descriptor?.size ?: 0}B",
+                                                    "EVENT: 旋钮/导航键 " +
+                                                        navKeys.joinToString("+") { HidNavigation.nameOf(it) } +
+                                                        "（uuid=$uuid）",
                                                 )
                                             }
-                                            HidNavigation.handle(uuid.orEmpty(), descriptor, report)
-                                        } else {
-                                            emptyList()
                                         }
-                                    val contacts =
-                                        if (consumerUsage == null && navKeys.isEmpty() && report != null) {
-                                            // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
-                                            // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
-                                            val touchFormat =
-                                                descriptor?.let(TouchReports::formatFromDescriptor)
-                                            TouchReports.parse(report, touchFormat)
-                                        } else {
-                                            null
+
+                                        "media" -> {
+                                            val usages = obj.getJSONArray("usages")
+                                            for (i in 0 until usages.length()) {
+                                                val usage = usages.getInt(i)
+                                                val keyCode = ConsumerKeys.keyCodeFor(usage)
+                                                if (keyCode != 0) {
+                                                    dispatchMediaKey(keyCode)
+                                                    appendLog(
+                                                        "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(usage)}" +
+                                                            "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）".format(usage),
+                                                    )
+                                                } else {
+                                                    appendLog(
+                                                        "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(usage)}" +
+                                                            "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略".format(usage),
+                                                    )
+                                                }
+                                            }
                                         }
-                                    if (navKeys.isNotEmpty()) {
-                                        navKeys.forEach(::injectNavigationKey)
-                                        appendLog(
-                                            "EVENT: 旋钮/导航键 " +
-                                                navKeys.joinToString("+") { HidNavigation.nameOf(it) } +
-                                                "（uuid=$uuid）",
-                                        )
-                                    } else if (consumerUsage != null) {
-                                        val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
-                                        if (keyCode != 0) {
-                                            dispatchMediaKey(keyCode)
-                                            appendLog(
-                                                "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                    "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
-                                                        .format(consumerUsage),
-                                            )
-                                        } else {
-                                            appendLog(
-                                                "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                    "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
-                                                        .format(consumerUsage),
-                                            )
+
+                                        else -> {
+                                            val contacts = obj.getJSONArray("contacts")
+                                            if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
+                                                appendLog(
+                                                    "EVENT: 触摸 " +
+                                                        (0 until contacts.length())
+                                                            .joinToString { i ->
+                                                                val c = contacts.getJSONObject(i)
+                                                                "#${c.getInt("slot")}(${c.getInt("x")},${c.getInt("y")})" +
+                                                                    if (c.getBoolean("down")) "↓" else "↑"
+                                                            },
+                                                )
+                                            }
+                                            touchLogCount++
+                                            for (i in 0 until contacts.length()) {
+                                                val c = contacts.getJSONObject(i)
+                                                TouchRouter.onContact(
+                                                    context.applicationContext,
+                                                    Contact(
+                                                        slot = c.getInt("slot"),
+                                                        xPixels = c.getInt("x"),
+                                                        yPixels = c.getInt("y"),
+                                                        down = c.getBoolean("down"),
+                                                    ),
+                                                )
+                                            }
                                         }
-                                    } else if (keyMap != null && report != null) {
-                                        // Consumer 设备的「无按键」/释放报文（值为 0 或下标越界）：
-                                        // 静默计数，避免释放事件刷屏
-                                        consumerReleaseCount++
-                                    } else if (contacts != null) {
-                                        if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
-                                            appendLog(
-                                                "EVENT: 触摸 " +
-                                                    contacts.joinToString {
-                                                        "#${it.slot}(${it.xPixels},${it.yPixels})${if (it.down) "↓" else "↑"}"
-                                                    },
-                                            )
-                                        }
-                                        touchLogCount++
-                                        contacts.forEach {
-                                            TouchRouter.onContact(
-                                                context.applicationContext,
-                                                it,
-                                            )
-                                        }
-                                    } else if (report != null) {
-                                        appendLog(
-                                            "EVENT: 其他 HID 报告 uuid=$uuid bytes=${report.size}" +
-                                                " hex=${report.joinToString(" ") { "%02x".format(it) }}",
-                                        )
                                     }
                                 }
 
@@ -2496,10 +2481,6 @@ object SessionController {
     /** 触摸/隧道事件低频计数（迁移自 MainActivity 字段，保持日志节流行为一致）。 */
     @Volatile
     private var touchLogCount = 0
-
-    /** 车机媒体键「释放」报文计数（值为 0 的 1 字节报告，静默丢弃，仅计数备查）。 */
-    @Volatile
-    private var consumerReleaseCount = 0
 
     @Volatile
     private var iapEventMessageCount = 0

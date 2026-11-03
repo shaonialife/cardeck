@@ -1,7 +1,6 @@
 package io.github.shaonialife.cardeck.input
 
 import android.content.Context
-import io.github.shaonialife.cardeck.input.TouchReports.Contact
 import io.github.shaonialife.cardeck.launcher.CardGesture
 import io.github.shaonialife.cardeck.launcher.LetterboxHintController
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
@@ -10,6 +9,14 @@ import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.render.CARD_MARGIN_PX
 import io.github.shaonialife.cardeck.shizuku.CarInputClient
 import io.github.shaonialife.cardeck.util.Bg
+
+/** 触点（字节解析在 Rust fw::airplay::hid——A6 下沉，本类只做路由注入）。 */
+data class Contact(
+    val slot: Int,
+    val xPixels: Int,
+    val yPixels: Int,
+    val down: Boolean,
+)
 
 /**
  * 触摸路由：把车机 hidSendReport 触点注入到车机侧虚拟屏（隐形屏模式）。

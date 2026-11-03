@@ -1,6 +1,5 @@
 package io.github.shaonialife.cardeck.airplay
 
-import io.github.shaonialife.cardeck.input.ConsumerKeys
 import io.github.shaonialife.cardeck.input.HidNavigation
 import io.github.shaonialife.cardeck.protocol.NativeBridge
 
@@ -113,22 +112,29 @@ class NativeTunnelIap2Link(
     private fun dispatchHid(params: List<ByteArray>) {
         // 参数 id=1 才是 HID 报文（id=0 是恒定的报告类型描述——本田 HFT 教训）
         val report = hidReportFromParams(params) ?: return
-        if (HidNavigation.isNavigationDevice(hidDescriptor)) {
-            val navKeys = HidNavigation.handle("iap2-hid", hidDescriptor, report)
-            if (navKeys.isNotEmpty()) {
-                log("IAPLINK: 旋钮/导航键 " + navKeys.joinToString("+") { HidNavigation.nameOf(it) })
-                navKeys.forEach { onNavKey?.invoke(it) }
-            }
-        } else {
-            val keyMap = hidDescriptor?.let(ConsumerKeys::parseDescriptor)
-            val usages =
-                when {
-                    keyMap != null -> keyMap.usagesFor(report)
-                    // 无描述符：退化为「单字节即 Usage ID」
-                    else -> listOf(report[0].toInt() and 0xFF).filter { it != 0 }
+        // A6 下沉：判定树在 Rust（fw::airplay::hid——描述符驱动，media →
+        // nav → consumer-release → touch；本入口的触点无消费者，touch/
+        // other 判为 null 即无动作）。Kotlin 只剩动作回调。
+        val dispatch = NativeBridge.nativeAirplayHidDispatch(hidDescriptor, report) ?: return
+        val obj = org.json.JSONObject(dispatch)
+        when (obj.getString("kind")) {
+            "nav" -> {
+                val mask = obj.getInt("mask")
+                val delta =
+                    if (obj.has("delta") && !obj.isNull("delta")) obj.getInt("delta") else null
+                val hat = if (!obj.isNull("hat")) obj.getInt("hat") else null
+                val navKeys = HidNavigation.handleRaw("iap2-hid", mask, delta, hat)
+                if (navKeys.isNotEmpty()) {
+                    log("IAPLINK: 旋钮/导航键 " + navKeys.joinToString("+") { HidNavigation.nameOf(it) })
+                    navKeys.forEach { onNavKey?.invoke(it) }
                 }
-            for (u in usages) {
-                if (u != 0) onMediaKey?.invoke(u)
+            }
+
+            "media" -> {
+                val usages = obj.getJSONArray("usages")
+                for (i in 0 until usages.length()) {
+                    onMediaKey?.invoke(usages.getInt(i))
+                }
             }
         }
     }

@@ -457,6 +457,16 @@ object NativeBridge {
         first: Int,
     ): ByteArray?
 
+    /** HID 报告分派（A6 下沉——fw::airplay::hid 判定树：media → nav →
+     *  consumer-release → touch → other，描述符驱动；fw:
+     *  APHIDClientHandleHIDReport @0x2276b7e4c 报告格式由 hidDescriptor
+     *  定义）。返回事件 JSON（kind=media/nav/touch）；null = 无动作。
+     *  纯函数。 */
+    external fun nativeAirplayHidDispatch(
+        descriptor: ByteArray?,
+        report: ByteArray,
+    ): String?
+
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
 
     /** 建连接编排决策机（每轮 runFlow 一个；[noPairingHint] = TXT 未声明
