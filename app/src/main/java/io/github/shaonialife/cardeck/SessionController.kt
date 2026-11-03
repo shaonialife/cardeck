@@ -85,26 +85,6 @@ object SessionController {
     /** 用户取消连接后，「上车自动连接」的冷却窗（见 [autoConnectSuppressedUntil]）。 */
     private const val AUTO_CONNECT_COOLDOWN_MS = 10 * 60_000L
 
-    /** 合成端点 mDNS 全 miss 后的「车机武装」加等窗（车机交接 FSM 可能在路上）。 */
-    private const val ENDPOINT_REARM_WAIT_MS = 4_000L
-
-    /**
-     * 空端点（车机声明会发 0x4301 但窗口内未到）的等待上限。
-     * 奥迪 MMI 9310 实测 0x4301 晚到 2 分 35 秒——保活窗口必须显著长于它；
-     * 超时拆链让 BT 重连循环接管（与旧「8s 拆链」的区别只在窗口长度）。
-     */
-    private const val PENDING_START_SESSION_WAIT_MS = 5 * 60_000L
-
-    /**
-     * 等车机 ctrl 邀请的上限（事件驱动，收到即走）。
-     * catplay 以邀请为连接触发点；实测邀请在 ctrl 重注册后 ~1.0-1.3s 到达。
-     * 车机不发邀请时（旧机型）由「已发现 _airplay._tcp」提前放行，最坏也只等这么久。
-     */
-    private const val CTRL_INVITE_WAIT_MS = 4_000L
-
-    /** 端点不完整时等 mDNS 缓存命中：绑网时已开始发现，通常几百毫秒内命中。 */
-    private const val ENDPOINT_RESOLVE_WAIT_MS = 3_000L
-
     /** 连接编排窗口（fw: 决策在 fw::airplay::flow；窗口 = 车机 AirPlay 窗口
      *  「用户点车机图标/收到 ctrl 邀请才开」的等待上界，宿主连接策略层。
      *  决策机内部自带各阶段退避节奏：403→5s / 其余→0.5s / 明文 SETUP→2s）。
@@ -344,13 +324,6 @@ object SessionController {
     /** 会话建立互斥（端点交接 → 配对 → 推流全程只允许一条）。 */
     val sessionStarting = AtomicBoolean(false)
 
-    /**
-     * 交接流程已在跑、但 AirPlayClient 尚未创建时收到的晚到端点（0x4301）。
-     * 配对线程起步时取用一次后清空——此刻没有 client 可更新，丢了就白等到下一轮。
-     */
-    @Volatile
-    private var pendingEndpointUpdate: Iap2SenderSession.CarPlayEndpoint? = null
-
     /** 用户取消连接：配对线程在关键检查点看到后中止（mDNS/配对等待无法中途打断，粒度秒级）。 */
     @Volatile
     var connectCancelled: Boolean = false
@@ -403,17 +376,6 @@ object SessionController {
             appendLog(">>> 本轮蓝牙链路断开——释放「会话处理中」，等待车机重连端点接手")
         }
     }
-
-    /**
-     * 本进程已知的车机热点 SSID：优先取已绑定的那个，其次取最近一次凭据的 SSID。
-     *
-     * 供给 [Iap2SenderSession] 做「本轮既无 0x5703 也无 0x4301」时的兜底：只要知道
-     * 车机热点是哪个，就不必拆链——按当前网络走 mDNS/网关，晚到的 0x4301 仍会热更新。
-     * 2026-10-22 奥迪 3315 日志：第 2 轮起手机就已在车机热点上，却因「无凭据」每轮
-     * 8 秒自杀一次，把车机侧邀请窗口反复清零（真 iPhone 实录要约 21 秒才邀请）。
-     */
-
-    private fun knownCarHotspotSsid(): String? = boundCarSsid ?: lastCarWifiSsid
 
     /**
      * 最近一次 0x5703 的热点密码（仅内存，不落盘）。
@@ -482,9 +444,7 @@ object SessionController {
                     log = { line -> appendLog(line) },
                     onEndpoint = { endpoint -> onCarPlayEndpoint(endpoint, "车机回连") },
                     onWifiCredentials = wifiCredentialHook,
-                    onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "车机回连") },
                     onLinkClosed = ::onSenderLinkClosed,
-                    knownCarSsid = ::knownCarHotspotSsid,
                     targetProvider = targetProvider,
                 )
             bluetoothClient =
@@ -493,9 +453,7 @@ object SessionController {
                     log = { line -> appendLog(line) },
                     onEndpoint = { endpoint -> onCarPlayEndpoint(endpoint, "主动连车机") },
                     onWifiCredentials = wifiCredentialHook,
-                    onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     onLinkClosed = ::onSenderLinkClosed,
-                    knownCarSsid = ::knownCarHotspotSsid,
                     targetProvider = targetProvider,
                 )
             ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
@@ -602,7 +560,6 @@ object SessionController {
     /** 「断开连接」（可在任意 Activity 实例上调用——操作的是真管线对象）。 */
     fun disconnect(context: Context) {
         val hadProjection = CarPlayService.mediaProjection != null
-        pendingEndpointUpdate = null
         retireSession()
         // BT 控制会话只在这里（用户终态）退役，socket close 让保活读循环立刻退出：
         // 否则它阻塞到对端超时（实测 ~24s）才结束，用户取消后英雄卡持续转圈。
@@ -1723,63 +1680,6 @@ object SessionController {
      * 防御性正确（防车机回连挂上第二条链）；onEnded/下一轮 startConnection 会重启。
      */
 
-    /**
-     * 等车机 ctrl 邀请（`GET /ctrl-int/1/connect`）——catplay 的连接触发点。
-     *
-     * 邀请意味着「车机已在 WiFi 上发现我们，且已把 AirPlay 端口打开」，此时连
-     * AirPlay 才不会被 Connection refused。旧实现用固定 sleep 1.6s 赌邀请已到：
-     * 车机快时白等，慢时又不够。这里事件驱动，并且若 mDNS 已发现 `_airplay._tcp`
-     * （端口确定可连）也立即放行，避免旧机型不发邀请时白等满窗口。
-     *
-     * @return true = 收到邀请 / 已发现端点；false = 等待窗口耗尽
-     */
-    private fun awaitCtrlInvite(
-        ssid: String,
-        timeoutMillis: Long,
-    ): Boolean {
-        val advertiser = ctrlAdvertiser
-        val deadline = android.os.SystemClock.uptimeMillis() + timeoutMillis
-        val startedAt = android.os.SystemClock.uptimeMillis()
-        var lastLogAt = startedAt
-        var reannounced = false
-        while (android.os.SystemClock.uptimeMillis() < deadline) {
-            if (connectCancelled) return false
-            val invites = advertiser?.inviteCount ?: 0
-            if (invites > 0) {
-                appendLog(
-                    "CTRL: ✓ 收到车机邀请（${android.os.SystemClock.uptimeMillis() - startedAt}ms，第 $invites 次）" +
-                        "——立即连接 AirPlay",
-                )
-                return true
-            }
-            if (endpointBrowser?.awaitEndpoint(0) != null) {
-                appendLog(
-                    "CTRL: 已发现 _airplay._tcp（未收到邀请，旧机型行为）——直接连接 AirPlay",
-                )
-                return true
-            }
-            val now = android.os.SystemClock.uptimeMillis()
-            // catplay 实测：iPhone 的 Bonjour 公告常被车机丢弃——它在每次邀请前都
-            // force_announce。这里在等待中途补发一次，覆盖「绑网瞬间公告丢失」的情况。
-            if (!reannounced && now - startedAt >= 2_000) {
-                reannounced = true
-                appendLog("CTRL: 2s 未收到邀请——强制重新公告一次（catplay 同款 force_announce）")
-                ctrlAdvertiser?.ensureForNetwork(ssid, force = true, network = wifiConnector?.currentNetwork)
-            }
-            if (now - lastLogAt > 1_200) {
-                appendLog("CTRL: 等待车机 ctrl 邀请…（已等 ${now - startedAt}ms）")
-                lastLogAt = now
-            }
-            try {
-                Thread.sleep(50)
-            } catch (_: InterruptedException) {
-                return false
-            }
-        }
-        appendLog("CTRL: ${timeoutMillis}ms 未收到邀请——按超时继续连接（可能车机走旧发现路径）")
-        return false
-    }
-
     // ---- 以下方法体自 MainActivity 原样迁入（会话逻辑不依赖 Activity）----
 
     /**
@@ -2005,240 +1905,6 @@ object SessionController {
     }
 
     /**
-     * 端点补全：优先吸收 mDNS 解析出的地址，再决定是否等待/兜底。
-     *
-     * 关键（2026-10-19 奥迪 4851 实车日志）：0x4301 只给了
-     * `fe80::3ca8:64ff:fe7c:293e`（IPv6 链路本地），而 `_airplay._tcp` 解析出的是
-     * `10.174.189.1:7000`——车机实际用 IPv4 通的。**不能因为 0x4301 带了 IPv6 就不看
-     * mDNS**：那样会把唯一验证过的 IPv4 路径丢掉。这里先做一次「零等待」缓存合并，
-     * 拿到 IPv4 就按 EndpointHosts 的优先级（IPv4 → IPv6）使用；缓存没命中才按需等。
-     */
-    private fun resolveEndpointHost(
-        endpoint: Iap2SenderSession.CarPlayEndpoint,
-        source: String,
-    ): Iap2SenderSession.CarPlayEndpoint? {
-        var effective = endpoint
-        val cached = endpointBrowser?.awaitEndpoint(0)
-        if (cached != null) {
-            effective = mergeBrowserEndpoint(effective, cached, source, needPort = effective.airPlayPort <= 0)
-        }
-        val needHost = !EndpointHosts.hasUsable(effective.ipAddresses)
-        val needPort = effective.airPlayPort <= 0
-        if (!needHost && !needPort) return effective
-
-        phaseHint = "mDNS 解析车机地址…"
-        appendLog(">>> [$source] 0x4301 端点不完整（port=${effective.airPlayPort} ips=${effective.ipAddresses}），取 mDNS 车机 _airplay._tcp…")
-        // 用常驻发现器的缓存（绑网时已开始后台发现，通常此时已命中）。
-        // 此前现起一次发现并硬重试 3×6s：车机 mDNS 稳定时白等，不稳定时又拖满 18s。
-        // 网段过滤（防误连同网 macOS 接收器）由 browser 的 accept 统一做。
-        val info =
-            endpointBrowser?.awaitEndpoint(ENDPOINT_RESOLVE_WAIT_MS) ?: run {
-                // 2026-10-24 奥迪 8015 定谳：**合成端点**（本轮从未拿到 0x4301 完整地址，
-                // port=0 且无 IP）在 mDNS 完全未发现时，网关直连会把 AirPlay 会话建在
-                // 「车机还没武装」的状态上——隧道 0x1d00 零应答、modesChanged 重申永不
-                // 触发、87s 后车机 reset 并锁死连接入口（要重启车机）。改为：再等
-                // [ENDPOINT_REARM_WAIT_MS] 仍无发现 → 返回 null，调用方转「保活等
-                // 0x4301」（PR19 路径；0x4301 是车机交接 FSM 完成的信号）。
-                // 带 0x4301 端口/IP 的端点不适用此守卫（车机已明确告知连哪里）。
-                if (endpoint.airPlayPort <= 0 && endpoint.ipAddresses.isEmpty()) {
-                    appendLog(">>> [$source] mDNS 未发现——车机 CarPlay 栈可能未武装（0x4301 未到），加等 ${ENDPOINT_REARM_WAIT_MS / 1000}s 再判")
-                    val rearm = endpointBrowser?.awaitEndpoint(ENDPOINT_REARM_WAIT_MS)
-                    if (rearm != null) {
-                        return mergeBrowserEndpoint(effective, rearm, source, needPort = true)
-                    }
-                    appendLog(">>> [$source] 仍无 mDNS——不网关直连（会建在未武装状态上），转保活等 0x4301")
-                    return null
-                }
-                // 兜底：热点场景车机 IP = 网关（Audi 实测 .1，但取网关更通用）。
-                // mDNS 在部分网络/机型上不稳定（2026-10-11 实测车机 mDNS 时有时无）；
-                // 网关地址 + 默认端口 7000 直接连，AirPlay 端口是固定约定。
-                val gateway = wifiConnector?.gatewayAddress()
-                if (gateway != null && EndpointHosts.candidates(listOf(gateway)).isNotEmpty()) {
-                    appendLog(">>> [$source] mDNS 未发现，兜底使用网关地址 $gateway:7000（车机热点网关=车机）")
-                    return effective.copy(
-                        ipAddresses = listOf(gateway) + effective.ipAddresses,
-                        airPlayPort = if (needPort) 7000 else effective.airPlayPort,
-                    )
-                }
-                appendLog(">>> [$source] mDNS 未发现车机 AirPlay 服务（车机可能尚未启动无线会话）")
-                return effective
-            }
-        return mergeBrowserEndpoint(effective, info, source, needPort)
-    }
-
-    /**
-     * 把一次 mDNS 解析结果并入端点：地址**追加到最前**（EndpointHosts 会按
-     * IPv4 → 全局 IPv6 → 链路本地 IPv6 重排，顺序只影响同类型内部）。
-     * 其余字段只在缺失时补（0x4301 的权威值不覆盖）。
-     */
-    private fun mergeBrowserEndpoint(
-        endpoint: Iap2SenderSession.CarPlayEndpoint,
-        info: android.net.nsd.NsdServiceInfo,
-        source: String,
-        needPort: Boolean,
-    ): Iap2SenderSession.CarPlayEndpoint {
-        var result = endpoint
-        val address = info.host?.hostAddress
-        if (address != null &&
-            EndpointHosts.candidates(listOf(address)).isNotEmpty() &&
-            result.ipAddresses.none { EndpointHosts.stripScope(it) == EndpointHosts.stripScope(address) }
-        ) {
-            result = result.copy(ipAddresses = listOf(address) + result.ipAddresses)
-            appendLog(">>> [$source] mDNS 解析到车机地址 $address:${info.port}")
-        }
-        if (needPort && info.port > 0) {
-            result = result.copy(airPlayPort = info.port)
-        }
-        // TXT 公钥兜底（pair-verify 校验用；0x4301 缺失时只能从这里拿）
-        if (result.publicKey == null) {
-            txtValue(info, "pk")?.let { result = result.copy(publicKey = it) }
-        }
-        if (result.deviceIdentifier == null) {
-            txtValue(info, "deviceid")?.let { result = result.copy(deviceIdentifier = it) }
-        }
-        if (result.sourceVersion == null) {
-            txtValue(info, "srcvers")?.let { result = result.copy(sourceVersion = it) }
-        }
-        if (result.advertisedFeatures == null) {
-            AirPlayFeatures.parse(txtValue(info, "features"))?.let {
-                result = result.copy(advertisedFeatures = it)
-            }
-        }
-        return result
-    }
-
-    /**
-     * Phase 1 之后车机补发 0x4301（CarPlay 窗口晚开）时的热更新入口。
-     *
-     * 三种归属：
-     *  - 正在推流：冗余端点，忽略（与 [onCarPlayEndpoint] 同一防护，避免拆掉健康会话）；
-     *  - 交接/配对进行中：热更新当前 AirPlayClient 的端点，配对循环下一轮即用新地址；
-     *    若 client 尚未创建（还在绑网/等邀请）先暂存，配对线程起步时并入；
-     *  - 上一轮已失败（无会话在跑）：按新端点重走一轮完整交接——Audi MMI 9310
-     *    实测 0x4301 在 120s 配对窗口耗尽后 28s 才到，旧实现把它当日志垃圾丢掉，
-     *    车机等 15s 无人连入即拆链，表现为「连上后自动断开」。
-     */
-    private fun onLateEndpoint(
-        endpoint: Iap2SenderSession.CarPlayEndpoint,
-        source: String,
-    ) {
-        if (connectCancelled) {
-            appendLog(">>> [$source] 0x4301 晚到（已取消连接）——忽略")
-            return
-        }
-        if (videoSender?.isRunning == true) {
-            appendLog(">>> [$source] 0x4301 晚到（推流中）——忽略冗余端点")
-            return
-        }
-        val client = currentClient
-        if (sessionStarting.get()) {
-            if (client != null && client.pairingInProgress) {
-                // 合并而非替换：0x4301 可能不带 IPv4（Audi MMI 9310 实测端点解析依赖
-                // mDNS/网关），直接替换会把已解析到的地址抹掉，配对循环反而连不上。
-                val merged = preferEndpoint(endpoint, client.currentEndpoint)
-                val changed = client.updateEndpoint(merged, "0x4301 晚到")
-                appendLog(
-                    if (changed) {
-                        ">>> [$source] 0x4301 晚到（配对进行中）——端点已热更新，下一轮重试用新地址"
-                    } else {
-                        ">>> [$source] 0x4301 晚到（配对进行中）——端点无变化，忽略"
-                    },
-                )
-            } else {
-                pendingEndpointUpdate = endpoint
-                appendLog(">>> [$source] 0x4301 晚到（交接尚未创建配对客户端）——暂存，配对起步时采用")
-            }
-            return
-        }
-        // 用户已断开（BT 组件已停）时不得用晚到消息复活会话
-        if (bluetoothClient?.isRunning != true && bluetoothServer?.isRunning != true) {
-            appendLog(">>> [$source] 0x4301 晚到（蓝牙链路已退役）——忽略")
-            return
-        }
-        appendLog(">>> [$source] 0x4301 晚到（上一轮已结束）——按新端点重走一轮连接")
-        onCarPlayEndpoint(endpoint, "$source/0x4301 晚到")
-    }
-
-    /** 把交接期间暂存的晚到端点并入新建的客户端（建 client 与收到 0x4301 的竞态窗口）。 */
-    private fun drainPendingEndpoint(client: AirPlayClient) {
-        val late = pendingEndpointUpdate ?: return
-        pendingEndpointUpdate = null
-        if (client.updateEndpoint(preferEndpoint(late, client.currentEndpoint), "交接期间晚到 0x4301")) {
-            appendLog("AIRPLAY: 交界窗口的 0x4301 端点已并入配对客户端")
-        }
-    }
-
-    /**
-     * 空端点等待期（车机声明会发 0x4301 但迟迟未到）的观察任务：
-     * 1. **mDNS 发现即自动重走**：当前网是 0x5703 热点且浏览器发现 `_airplay._tcp`
-     *    ——车机晚武装（6318 实测入网 +88s 才广播、15s 后又消失），立即连接；
-     * 2. 每 5s 轮询当前 WiFi——用户手动连上车机热点后弹窗确认，确认即以该 SSID
-     *    合成端点重走 [onCarPlayEndpoint]（无端口 → mDNS/网关兜底）；
-     * 3. 晚到 0x4301 触发新一轮交接（sessionStarting 重新置位）时让位退出；
-     * 4. 超过 [PENDING_START_SESSION_WAIT_MS] 无进展：记日志并拆掉保活链路，
-     *    让 BT 重连循环接管（与旧「8s 拆链」的区别只在窗口长度）。
-     */
-    private fun watchForPendingStartSession(
-        endpoint: Iap2SenderSession.CarPlayEndpoint,
-        source: String,
-    ) {
-        Bg.run("pending-start-session-watch") {
-            var promptedSsid: String? = null
-            val deadline = android.os.SystemClock.uptimeMillis() + PENDING_START_SESSION_WAIT_MS
-            while (!connectCancelled && android.os.SystemClock.uptimeMillis() < deadline) {
-                Thread.sleep(5_000)
-                if (connectCancelled) return@run
-                // 晚到 0x4301 已触发新一轮交接——观察任务让位。
-                if (sessionStarting.get()) return@run
-                val ssid = shellWifiStatus().second ?: continue
-                // 车机晚武装（6318 实测 2026-10-25：入网后 +88s 才广播 _airplay._tcp，
-                // 又 15s 后消失）：当前网就是 0x5703 下发的热点且 mDNS 已发现车机
-                // AirPlay 服务——无需用户确认，立即以发现结果重走连接。旧版每 8s
-                // 拆链重试的循环天然能接住晚武装，保活等待模式必须自己补这个钩子，
-                // 否则「发现了却无人消费，干等车机拆 BT」。
-                if (ssid == endpoint.ssid) {
-                    val found = endpointBrowser?.awaitEndpoint(0)
-                    if (found != null && found.port > 0) {
-                        val merged = enrichEndpointFromBrowser(endpoint, source) ?: endpoint
-                        appendLog(
-                            ">>> [$source] 保活等待中发现车机 AirPlay" +
-                                "（${found.host?.hostAddress}:${found.port}）——立即重走连接（车机晚武装）",
-                        )
-                        onCarPlayEndpoint(merged, "$source/mDNS 发现")
-                        return@run
-                    }
-                }
-                // 同一 SSID 只问一次（用户选「继续等待」后不再打扰）；换网络再问。
-                if (ssid.isEmpty() || promptedSsid == ssid) continue
-                promptedSsid = ssid
-                val choice =
-                    askWifiJoinChoice(
-                        DialogSpec(
-                            title = "检测到已连接 $ssid",
-                            message =
-                                "车机尚未经蓝牙下发连接信息（0x4301）。是否把当前网络 \"$ssid\" 当车机热点，" +
-                                    "直接尝试 mDNS/网关连接？（点「继续等待」则保持蓝牙保活等车机下发）",
-                            positive = "按车机热点继续",
-                            negative = "继续等待",
-                        ),
-                    )
-                if (choice == true && !connectCancelled && !sessionStarting.get()) {
-                    appendLog(">>> [$source] 用户确认当前网络 \"$ssid\" 为车机热点——以合成端点重走连接")
-                    onCarPlayEndpoint(endpoint.copy(ssid = ssid), "$source/手动入网")
-                    return@run
-                }
-            }
-            if (!connectCancelled && !sessionStarting.get()) {
-                appendLog(
-                    ">>> [$source] 空端点等待 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟超时——" +
-                        "车机未下发 0x4301。拆掉保活链路让重连循环接管，请导出日志反馈",
-                )
-                detachActiveBtSessions()
-            }
-        }
-    }
-
-    /**
      * 配对循环的端点刷新器（非阻塞）：只读浏览器缓存的 `_airplay._tcp`，
      * 有则并入 IP/端口/公钥等字段。返回 null = 无新信息（配对循环继续用当前端点）。
      */
@@ -2289,24 +1955,11 @@ object SessionController {
             ?.trimEnd { it.code == 0 }
             ?.takeIf { it.isNotEmpty() }
 
-    /**
-     * 晚到端点优先：车机明确告知的端口/公钥优先于 mDNS 合成值，
-     * 但 IP 列表取并集（0x4301 可能不带 IPv4，Audi MMI 9310 实测即如此）。
-     */
-    private fun preferEndpoint(
-        late: Iap2SenderSession.CarPlayEndpoint,
-        fallback: Iap2SenderSession.CarPlayEndpoint,
-    ): Iap2SenderSession.CarPlayEndpoint =
-        late.copy(
-            airPlayPort = if (late.airPlayPort > 0) late.airPlayPort else fallback.airPlayPort,
-            ipAddresses = (late.ipAddresses + fallback.ipAddresses).distinct(),
-            publicKey = late.publicKey ?: fallback.publicKey,
-            deviceIdentifier = late.deviceIdentifier ?: fallback.deviceIdentifier,
-            sourceVersion = late.sourceVersion ?: fallback.sourceVersion,
-            advertisedFeatures = late.advertisedFeatures ?: fallback.advertisedFeatures,
-        )
-
-    /** BT 会话交接点：拿到 0x5703/0x4301 后两条路径流程一致——绑 WiFi → AirPlay 配对 → SETUP → 推流。 */
+    /** BT 会话交接点（0x4301 → AirPlay 连接）：绑 WiFi → 配对/SETUP → 推流。
+     *  R1 定形（2026-11-03）：端点即 Rust EV_ENDPOINT 透传（port/IP/wifi 域
+     *  一体，fw/endpoint.rs `_iap2_CarPlayStartSession` @0x10015633c 消化），
+     *  直连不预解析——地址族选择委托系统评估器（B11 定谳），mDNS 缺口由
+     *  runFlow 连接循环的 endpointRefresher 补齐，决策机退避吸收「窗口未开」。 */
     private fun onCarPlayEndpoint(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
@@ -2328,42 +1981,40 @@ object SessionController {
         // onSenderLinkClosed）——能走到这里说明 BT 组件仍在运行（用户取消路径会
         // 停组件、被上方守卫拦截），该标志属于已退场的旧轮次，不清会误伤本轮。
         connectCancelled = false
-        // 新一轮交接开始：清掉上一轮（可能中途失败）遗留的晚到端点暂存，
-        // 否则它会在本轮的 drain 阶段覆盖掉本会话刚解析出的端点。
-        pendingEndpointUpdate = null
-        // 空端点 = 新协议车机声明会发 0x4301 但窗口内未到（Iap2SenderSession 已不拆链，
-        // 保活泵会把晚到的 0x4301 经 onLateEndpoint 送回本函数重走完整流程）。
-        // 这里不占 sessionStarting：晚到端点走「上一轮已结束」分支；等待期间轮询手机
-        // WiFi——用户手动连上车机热点（密码车机设置可知，凯迪拉克 CT5 实测）后经确认
-        // 可直接以该 SSID 合成端点走 mDNS/网关路径。
-        if (endpoint.ssid.isEmpty()) {
-            appendLog(
-                ">>> [$source] 端点无 AP 信息（车机未在窗口内下发 0x4301）——蓝牙保持保活等待晚到 0x4301；" +
-                    "检测到手机已连 WiFi 时会询问是否按车机热点继续",
-            )
-            phaseHint = "等待车机下发连接信息（0x4301）…"
-            sessionStarting.set(false)
-            watchForPendingStartSession(endpoint, source)
-            return
+        // 端点 wifi 域空 = 车机 0x4301 未带组1 wifi 参数（固件只保证组1 存在
+        // IP 时才可连）。已绑定车机网络则沿用绑定网直连；否则本轮放行不了
+        // （没有热点可连）——记日志释放互斥，等 BT 重连/重发的 0x4301。
+        var effective = endpoint
+        if (effective.ssid.isEmpty()) {
+            val bound = boundCarSsid
+            if (bound != null && wifiConnector?.currentNetwork != null) {
+                appendLog(">>> [$source] 端点无 wifi 域——沿用已绑定车机网络 $bound 直连")
+                effective = effective.copy(ssid = bound)
+            } else {
+                appendLog(">>> [$source] 端点无 wifi 域且未绑定车机网络——无法加入热点，本轮放弃（等 0x5703/重发 0x4301）")
+                phaseHint = "车机端点缺少热点信息（0x4301 组1），等待重发…"
+                sessionStarting.set(false)
+                return
+            }
         }
         appendLog(
-            ">>> [$source] 拿到接收端热点：SSID=${endpoint.ssid}；" +
-                "密码=${if (endpoint.passphrase.isEmpty()) "(空)" else "已获取"}",
+            ">>> [$source] 拿到接收端热点：SSID=${effective.ssid}；" +
+                "密码=${if (effective.passphrase.isEmpty()) "(空)" else "已获取"}",
         )
         phaseHint = "蓝牙已连上车机，解析热点地址…"
-        ssidSink?.invoke(endpoint.ssid)
+        ssidSink?.invoke(effective.ssid)
         // 凭据缓存对两条路径都要写：0x5703 走 onWifiCredentials，0x4301 只到这里。
         // 漏写会让「车机热点 → 去连接」手动兜底误报「尚未拿到热点密码（需 0x5703）」
         // ——2026-10-22 奥迪日志里就是这么把排查方向带偏的。
-        if (endpoint.ssid.isNotBlank()) {
-            lastCarWifiSsid = endpoint.ssid
-            if (endpoint.passphrase.isNotEmpty()) lastWifiPsk = endpoint.passphrase
+        if (effective.ssid.isNotBlank()) {
+            lastCarWifiSsid = effective.ssid
+            if (effective.passphrase.isNotEmpty()) lastWifiPsk = effective.passphrase
         }
         // 诊断（老车机排查必看）：地址是 IPv4 还是只有 IPv6、TXT features 是否声明配对能力。
         // 奥迪 4xxx 两种「连不上」都源于这里——旧版日志里完全没有这两项。
-        val addresses = endpoint.ipAddresses
+        val addresses = effective.ipAddresses
         val hasIpv4 = addresses.any { EndpointHosts.isIpv4(it) }
-        val pairingFlag = AirPlayFeatures.supportsPairing(endpoint.advertisedFeatures)
+        val pairingFlag = AirPlayFeatures.supportsPairing(effective.advertisedFeatures)
         appendLog(
             ">>> [$source] 端点诊断：地址=${addresses.ifEmpty { listOf("(无)") }}" +
                 "（${if (hasIpv4) {
@@ -2373,7 +2024,7 @@ object SessionController {
                 } else {
                     "仅 IPv6"
                 }}）" +
-                " features=" + (endpoint.advertisedFeatures?.let { "0x${it.toString(16)}" } ?: "未知") +
+                " features=" + (effective.advertisedFeatures?.let { "0x${it.toString(16)}" } ?: "未知") +
                 " HomeKit配对=" +
                 when (pairingFlag) {
                     true -> "声明支持"
@@ -2381,28 +2032,23 @@ object SessionController {
                     null -> "未知（按需配对）"
                 },
         )
-        // 先绑网络再解析端点：mDNS 组播跟随 bindProcessToNetwork 的网络，解析放前面
-        // 只会拿到旧网络的结果（此前靠 resolveEndpointHost 内部重试掩盖，白等数秒）。
-        // 绑定完成后再并行做三件事：ctrl 广播针对新网络重注册、后台发现 _airplay._tcp、
-        // 等车机 ctrl 邀请（车机已发现我们的权威信号）。
+        // 先绑网络再连接（mDNS 组播跟随 bindProcessToNetwork 的网络，注册/发现
+        // 必须在绑定后）。R1 定形：绑定完成即直连——原「等 ctrl 邀请 + 前置
+        // mDNS 解析 + 晚到端点合并」三段编排退役：车机 AirPlay 窗口未开时的
+        // Connection refused 由决策机（fw::airplay::flow）退避重试吸收，
+        // mDNS 地址缺口由 runFlow 连接循环的 endpointRefresher 补齐。
         val continueWithNetwork: (Boolean) -> Unit = proceed@{ bound ->
             if (!bound) {
-                phaseHint = "手机不在车机热点——请到 WLAN 设置加入 ${endpoint.ssid}"
-                appendLog(">>> [$source] 手机当前不在该热点——请到 设置>WLAN 加入 \"${endpoint.ssid}\" 后断开重连")
+                phaseHint = "手机不在车机热点——请到 WLAN 设置加入 ${effective.ssid}"
+                appendLog(">>> [$source] 手机当前不在该热点——请到 设置>WLAN 加入 \"${effective.ssid}\" 后断开重连")
                 sessionStarting.set(false)
                 return@proceed
             }
-            // 网络绑定完成：ctrl 广播重新注册（落到车机所在网络），同时开始后台 mDNS 发现。
-            // 两者都发生在等邀请期间，不额外占用时间。
-            ctrlAdvertiser?.ensureForNetwork(endpoint.ssid, force = true, network = wifiConnector?.currentNetwork)
+            // 网络绑定完成：ctrl 广播重新注册（落到车机所在网络），同时开始后台 mDNS 发现
+            // （发现结果由配对循环的 refresher/retryTick 消费）。
+            ctrlAdvertiser?.ensureForNetwork(effective.ssid, force = true, network = wifiConnector?.currentNetwork)
             endpointBrowser?.resetCache()
             endpointBrowser?.start()
-            // 0x4301 自带完整地址+端口 = 接收端已明确告知「连这里」，无需等邀请
-            // （DiPlay 测试台路径：本轮直接配对，省掉固定等待）。
-            // IPv6 也算地址：奥迪 4xxx 的 0x4301 常只给 fe80::（旧判据只看 IPv4，
-            // 会把这类端点当成「不完整」，白等 ctrl 邀请再退回网关兜底）。
-            val endpointSelfContained =
-                endpoint.airPlayPort > 0 && EndpointHosts.hasUsable(endpoint.ipAddresses)
             Bg.run("airplay-pairing") {
                 try {
                     if (connectCancelled) {
@@ -2410,47 +2056,10 @@ object SessionController {
                         sessionStarting.set(false)
                         return@run
                     }
-                    if (endpointSelfContained) {
-                        appendLog("AIRPLAY: 0x4301 端点完整（${endpoint.ipAddresses.firstOrNull()}:${endpoint.airPlayPort}）——直接配对，不等 ctrl 邀请")
-                    } else {
-                        // 等 ctrl 邀请（catplay CarPlayCtrlServer：邀请=车机已发现手机且
-                        // AirPlay 窗口已开，收到即刻连接）。此前是「固定睡 1.6s 赌它已到」，
-                        // 快的时候白等、慢的时候不够；改为事件驱动。
-                        awaitCtrlInvite(endpoint.ssid, CTRL_INVITE_WAIT_MS)
-                    }
-                    // 端点解析放在邀请之后：车机的 `_airplay._tcp` 常在受邀后才上线，
-                    // 且这一步最长 3s——必须在后台线程做，不能占住网络回调线程。
-                    var effectiveEndpoint = resolveEndpointHost(endpoint, source)
-                    if (effectiveEndpoint == null) {
-                        // 合成端点 + mDNS 全 miss：车机未武装（0x4301 未到）。转保活
-                        // 等 0x4301（PR19 路径）——此时直连只会建出注定被 reset 的会话。
-                        appendLog(">>> [$source] 端点未解析且车机未武装——转入保活等待 0x4301")
-                        sessionStarting.set(false)
-                        watchForPendingStartSession(endpoint, source)
-                        return@run
-                    }
-                    // 交接流程起步期间车机补发的 0x4301（比 mDNS 合成更权威）在此并入。
-                    pendingEndpointUpdate?.let { late ->
-                        pendingEndpointUpdate = null
-                        val merged = preferEndpoint(late, effectiveEndpoint)
-                        effectiveEndpoint = merged
-                        appendLog(
-                            "AIRPLAY: 并入交接期间晚到的 0x4301 端点 → " +
-                                "${merged.ipAddresses.firstOrNull()}:${merged.airPlayPort}",
-                        )
-                    }
-                    if (connectCancelled) {
-                        appendLog("AIRPLAY: 用户已取消——中止配对")
-                        sessionStarting.set(false)
-                        return@run
-                    }
-
-                    // 上面的 null 分支已 return——此处断言非空仅为满足 var 的类型
-                    val resolvedEndpoint = effectiveEndpoint!!
 
                     fun newClient() =
                         AirPlayClient(
-                            resolvedEndpoint,
+                            effective,
                             log = { line -> appendLog(line) },
                             context = context.applicationContext,
                             endpointRefresher = { current -> enrichEndpointFromBrowser(current, source) },
@@ -2460,7 +2069,7 @@ object SessionController {
                                 // 只看得到「端口未开」的重试刷屏，无法判断是车机没邀请还是
                                 // 地址不对（2026-10-19 奥迪 0.1.7 日志就缺这两条信息）。
                                 ctrlAdvertiser?.ensureForNetwork(
-                                    endpoint.ssid,
+                                    effective.ssid,
                                     force = true,
                                     network = wifiConnector?.currentNetwork,
                                 )
@@ -2521,7 +2130,6 @@ object SessionController {
                     phaseHint = "AirPlay 连接中…"
                     val client = newClient()
                     currentClient = client
-                    drainPendingEndpoint(client)
                     // pre-HomeKit 老车机（CarPlay 210.81 时代，奥迪 4xxx 固件）在
                     // `_airplay._tcp` 里**不声明** HK_PAIRING_AND_ENCRYPT——决策机
                     // 据此跳过注定失败的 pair-setup（兼容层初值；判错由明文 SETUP
@@ -2551,7 +2159,7 @@ object SessionController {
                         val eventsWrite = pairedKeys?.eventsWriteKey
                         val eventsRead = pairedKeys?.eventsReadKey
                         // 记录会话凭据：投影授权晚于连接时用于动态补启音频。
-                        // 用 client.currentEndpoint 而非 effectiveEndpoint：配对期间
+                        // 用 client.currentEndpoint（而非本轮透传端点）：配对期间
                         // mDNS 刷新过端点时，真正连上的是 client 里的地址（2026-10-18：
                         // 0x4301 的定长 IP 字段带 NUL，mDNS 给的是干净地址，取旧值
                         // 会让视频端口/keepAlive 用脏地址 → 一律解析失败）。
@@ -2909,17 +2517,6 @@ object SessionController {
                     // 推流活跃时保持关闭，由 VideoSender.onEnded（推流终止）负责解除。
                     if (videoSender?.isRunning != true) {
                         BtSessionGate.sessionActive = false
-                        // 收尾竞态：晚到 0x4301 若恰好在「配对已失败、互斥尚未释放」的
-                        // 窗口内到达，会被暂存但没人消费。此处补投一次——车机等 15s
-                        // 无人连入就拆链，错过这一投就是整轮失败（2026-10-18 分析）。
-                        val pending = pendingEndpointUpdate
-                        if (pending != null && !connectCancelled) {
-                            pendingEndpointUpdate = null
-                            appendLog(">>> 收尾时发现暂存的晚到 0x4301——立即按新端点重走一轮")
-                            Bg.run("late-endpoint-retry") {
-                                onCarPlayEndpoint(pending, "0x4301 晚到（本轮收尾补投）")
-                            }
-                        }
                     }
                 }
             }
@@ -2929,13 +2526,13 @@ object SessionController {
         // 会把刚注册好的 ctrl mDNS 广播打断，再等系统重建绑定。
         val wifiConfig =
             Iap2SenderSession.WifiConfiguration(
-                endpoint.ssid,
-                endpoint.passphrase,
-                endpoint.channel,
-                endpoint.securityType,
+                effective.ssid,
+                effective.passphrase,
+                effective.channel,
+                effective.securityType,
             )
-        if (boundCarSsid == endpoint.ssid && wifiConnector?.currentNetwork != null) {
-            appendLog(">>> [$source] 已绑定车机热点 ${endpoint.ssid}，跳过重复绑定")
+        if (boundCarSsid == effective.ssid && wifiConnector?.currentNetwork != null) {
+            appendLog(">>> [$source] 已绑定车机热点 ${effective.ssid}，跳过重复绑定")
             continueWithNetwork(true)
         } else {
             // 端点先于 0x5703 到达（或上一轮换网失败）：同样的入口——静默路径优先，

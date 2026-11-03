@@ -6,11 +6,11 @@ import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
  * 发送端会话（fw-engine 专用、纯驱动层）：协议逻辑 100% 在 Rust
  * （cardeck-protocol 固件真身——链路/FSM/协商/识别/认证/编排全链）。
  *
- * Kotlin 职责只剩三件（用户指令 2026-11-01：旧 JVM 连接逻辑已完整移除，
+ * Kotlin 职责只剩两件（用户指令 2026-11-01：旧 JVM 连接逻辑已完整移除，
  * 不经开关、不留代码）：
  *  1. 链路就绪后调 startFlow 启动 Rust 编排泵
- *  2. 循环驱动：链路事件（WIFI/ENDPOINT/PHASE1_DONE）+ 会话镜像帧分发
- *  3. 把 0x1D01 画像 / 0x5703 热点凭据 / 端点回调给主控
+ *  2. 循环驱动：链路事件（WIFI/ENDPOINT/PHASE1_DONE）+ 会话镜像帧分发，
+ *     把 0x1D01 画像 / 0x5703 热点凭据 / 0x4301 端点回调给主控
  *
  * 无任何超时（fw-engine 路径）：协议推进由 Rust 编排泵驱动，活性由链路
  * 状态机管——固件 accessoryd 会话引擎同样无识别/认证完成时限（仅链路层
@@ -25,12 +25,8 @@ class Iap2SenderSession(
     private val deviceName: String = "iPhone",
     /** 收到 0x5703（热点凭据）时回调——主控立即绑 WiFi + 广播 _carplay-ctrl。 */
     private val onWifiCredentials: ((WifiConfiguration) -> Unit)? = null,
-    /** 0x4301 晚到端点热更新回调。 */
-    private val onEndpointUpdate: ((CarPlayEndpoint) -> Unit)? = null,
-    /** 本进程已知的车机热点 SSID（无新凭据时沿用）。 */
-    private val knownCarSsid: (() -> String?)? = null,
-    /** 兼容旧构造（未使用；fw 路径无 JVM MFi 记忆）。 */
-    private val context: android.content.Context? = null,
+    /** 收到 0x4301（CarPlay 端点，含 wifi 域）时回调——主控直接走 AirPlay 连接。 */
+    private val onEndpoint: ((CarPlayEndpoint) -> Unit)? = null,
 ) {
     /** 从 0x5703 + 0x4301 解析出的接收端信息。 */
     data class CarPlayEndpoint(
@@ -72,17 +68,20 @@ class Iap2SenderSession(
      * 会话主循环：链路就绪 → startFlow（Rust 编排泵自推进）→ 永续分发
      * （链路事件 + 会话镜像帧），直至链路断开（run 返回 = 本会话结束）。
      */
-    fun run(): CarPlayEndpoint {
+    fun run() {
         if (!channel.awaitReady(0L)) { // 0 = 无限期（固件会话引擎无完成时限；活性归链路层）
             log("iap2 链路未就绪即终止")
-            return emptyEndpoint()
+            return
         }
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
         channel.startFlow(deviceName, bluetoothMac)
 
-        var endpoint: CarPlayEndpoint? = null
         while (channel.isAlive) {
-            // 链路事件（Rust：WIFI=-1 / ENDPOINT=-2 / PHASE1_DONE=-3）
+            // 链路事件（Rust：WIFI=-1 / ENDPOINT=-2 / PHASE1_DONE=-3）。
+            // R1 对接定形（2026-11-03）：ENDPOINT 是唯一的连接触发事件，
+            // 直通主控 onCarPlayEndpoint——旧「晚到端点」合并状态机
+            // （onLateEndpoint/prefer/drain）随空端点观察器一并退役；
+            // PHASE1_DONE 纯诊断（协议推进由 Rust 泵管，端点未到不连接）。
             channel.pollFlowEvent(200L)?.let { event ->
                 when (event.id) {
                     -1 -> {
@@ -91,21 +90,19 @@ class Iap2SenderSession(
                         onWifiCredentials?.invoke(cfg)
                     }
                     -2 -> {
-                        endpoint = decodeEndpointEvent(event.bytes)
-                        log("iap2 flow endpoint port=${endpoint?.airPlayPort}")
-                        endpoint?.let { onEndpointUpdate?.invoke(it) }
+                        val endpoint = decodeEndpointEvent(event.bytes)
+                        log(
+                            "iap2 flow endpoint port=${endpoint.airPlayPort} " +
+                                "ssid=${endpoint.ssid} ips=${endpoint.ipAddresses}",
+                        )
+                        onEndpoint?.invoke(endpoint)
                     }
-                    -3 -> {
-                        log("iap2 flow phase-1 done")
-                        val ep = endpoint ?: emptyEndpoint()
-                        onEndpointUpdate?.invoke(ep)
-                    }
+                    -3 -> log("iap2 flow phase-1 done")
                 }
             }
             drainMirrorFrames()
         }
         log("iap2 会话循环结束（链路关闭）")
-        return endpoint ?: emptyEndpoint()
     }
 
     /** 非阻塞清空镜像帧队列并分发。 */
@@ -118,7 +115,8 @@ class Iap2SenderSession(
         }
     }
 
-    /** 镜像帧分发：1D01 画像日志/EA 表、5703 热点凭据、4301 端点热更新。 */
+    /** 镜像帧分发：1D01 画像日志/EA 表、5703 热点凭据；0x4301 已在 Rust 内消化
+     *  为 ENDPOINT 事件（协议帧不过宿主边界），镜像面只剩日志。 */
     private fun dispatchMirror(frame: Iap2Csm.Frame) {
         when (frame.messageId) {
             0x1D01 -> {
@@ -130,22 +128,9 @@ class Iap2SenderSession(
                 log("iap2 rx=0x5703 ssid=${cfg.ssid} channel=${cfg.channel} security=${cfg.securityType}")
                 onWifiCredentials?.invoke(cfg)
             }
-            0x4301 -> log("iap2 rx=0x4301 CarPlayStartSession（端点热更新 M5 接）")
+            0x4301 -> log("iap2 rx=0x4301 CarPlayStartSession（Rust 已消化为 ENDPOINT 事件）")
         }
     }
-
-    private fun emptyEndpoint() =
-        CarPlayEndpoint(
-            ssid = "",
-            passphrase = "",
-            channel = 0,
-            securityType = 0,
-            airPlayPort = 0,
-            deviceIdentifier = null,
-            publicKey = null,
-            sourceVersion = null,
-            ipAddresses = emptyList(),
-        )
 
     // ---- 0x1D01 / 0x5703 解析（纯函数，输入来自 Rust 镜像） ----
 
@@ -246,7 +231,10 @@ class Iap2SenderSession(
         return WifiConfiguration(ssid = ssid, passphrase = psk, channel = ch, securityType = sec)
     }
 
-    /** EV_ENDPOINT 载荷：port(u32be) + ident\0 + pubkey\0 + srcvers\0 + ips（各\0）+ 空\0。 */
+    /** EV_ENDPOINT 载荷（Rust fw/endpoint.rs 契约）：port(u32be) + ident\0 +
+     *  pubkey\0 + srcvers\0 + ips（各\0）+ 空\0 + [ssid\0 + pass\0 + ch u8 + sec u8]。
+     *  尾块 = 0x4301 组1 wifi 域透传（R1 对接修正 2026-11-03——此前丢弃致
+     *  ssid 恒空，端点全数落入空端点分支）；旧载荷无尾块时默认空。 */
     private fun decodeEndpointEvent(b: ByteArray): CarPlayEndpoint {
         var off = 4
         val port =
@@ -273,11 +261,16 @@ class Iap2SenderSession(
             if (ip.isEmpty()) break
             ips += ip
         }
+        // wifi 尾块（0x4301 组1 透传；旧载荷在此处已到末尾，全部取默认）
+        val ssid = nulString()
+        val pass = nulString()
+        val channel = b.getOrNull(off)?.toInt()?.and(0xFF) ?: 0
+        val security = b.getOrNull(off + 1)?.toInt()?.and(0xFF) ?: 0
         return CarPlayEndpoint(
-            ssid = "",
-            passphrase = "",
-            channel = 0,
-            securityType = 0,
+            ssid = ssid,
+            passphrase = pass,
+            channel = channel,
+            securityType = security,
             airPlayPort = port,
             deviceIdentifier = ident,
             publicKey = pubkey,

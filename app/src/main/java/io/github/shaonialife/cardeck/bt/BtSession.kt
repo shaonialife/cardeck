@@ -12,14 +12,10 @@ import io.github.shaonialife.cardeck.util.DeviceIdentity
  */
 internal fun Iap2LinkChannel.runSenderSession(
     context: Context,
-    timeoutMillis: Long,
     log: (String) -> Unit,
     onEndpoint: (Iap2SenderSession.CarPlayEndpoint) -> Unit,
     onWifiCredentials: (Iap2SenderSession.WifiConfiguration) -> Unit,
-    onEndpointUpdate: (Iap2SenderSession.CarPlayEndpoint) -> Unit,
     onLinkClosed: () -> Unit = {},
-    /** 本进程已知的车机热点 SSID（无新凭据时沿用，避免每轮拆链）。 */
-    knownCarSsid: () -> String? = { null },
 ) {
     // fw-engine：会话循环阻塞至链路关闭；端点/凭据经回调即时上抛
     // （无 Kotlin 超时——协议推进由 Rust 编排泵驱动，活性由链路状态机管）
@@ -30,8 +26,7 @@ internal fun Iap2LinkChannel.runSenderSession(
             resolveBluetoothMac(context, log),
             DeviceIdentity.deviceName(context),
             onWifiCredentials,
-            onEndpointUpdate,
-            knownCarSsid,
+            onEndpoint,
         )
     session.run()
     onLinkClosed()

@@ -32,12 +32,8 @@ class Iap2BluetoothClient(
     private val onEndpoint: (Iap2SenderSession.CarPlayEndpoint) -> Unit = {},
     /** 0x5703 一到即触发（绑 WiFi + 广播 _carplay-ctrl），真车 0x4301 的前置条件。 */
     private val onWifiCredentials: (Iap2SenderSession.WifiConfiguration) -> Unit = {},
-    /** Phase 1 之后车机补发 0x4301（CarPlay 窗口晚开）时交给主控热更新端点。 */
-    private val onEndpointUpdate: (Iap2SenderSession.CarPlayEndpoint) -> Unit = {},
     /** 发送端链路断开（保活泵退出）时通知主控（释放僵尸轮次，见 SessionController.onSenderLinkClosed）。 */
     private val onLinkClosed: () -> Unit = {},
-    /** 本进程已知的车机热点 SSID（本轮无新凭据时沿用，避免每轮 8 秒拆链）。 */
-    private val knownCarSsid: () -> String? = { null },
     /** 目标车机（动态读取：选择后无需重启链路，下一轮尝试即生效）。 */
     private val targetProvider: () -> TargetDevicePrefs.Target? = { null },
 ) {
@@ -349,13 +345,10 @@ class Iap2BluetoothClient(
         try {
             channel.runSenderSession(
                 context,
-                0, // 无超时：fw-engine 路径（会话超时归 Rust/链路层，Kotlin 不设）
                 log,
                 onEndpoint,
                 onWifiCredentials,
-                onEndpointUpdate,
                 onLinkClosed,
-                knownCarSsid,
             )
         } catch (error: IOException) {
             log("BT-C: SESSION 失败 - ${error.message}")
