@@ -121,11 +121,23 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
         SETUP → RECORD → 推流稳定（帧 #600/keepAlive #30/fps=30，零崩溃）
       - 验证：Kotlin compile+JVM 测试+spotless+lint 全绿；Rust 187 lib
         全绿；装机 0.1.28.44-debug
-- [ ] **R2 AirPlayLink 壳**：新文件替代 AirPlayClient（2011 行）——TCP socket +
-      nativeAirplay* 泵搬运 + keepalive UDP + Timing socket + 事件通道命令
-      POST；ControlCipher/AirPlayCrypto 暂以传输组件保留（E3 双界验证）；
-      AudioSender/VideoSender 调度接线
-- [ ] **R3 删除日**：SessionController 残余编排/AirPlayClient/NativeTunnelIap2Link/
+- [x] **R2 AirPlayLink 壳**（2026-11-04 完成，android-carplay（R2 Kotlin 提交）
+      + protocol 4d3b693）：AirPlayClient → AirPlayLink（2011→1723，git mv
+      保溯源）。架构审查发现旧类已是泵壳形态，本刀为「协议逻辑下沉 + 死代码
+      退役」：
+      - 下沉 Rust：D7 音频候选（nativeAirplayAudioCandidates——顺带修复
+        negotiatedInfo 断链：M5.2 起宿主 /info 缓存从未赋值，D7 协商退化
+        基线、receiverIdentity 恒 unknown 的潜伏回归）、modesChanged 声明体
+        （nativeAirplayAssertModes）、modes 宿主消费语义（事件 JSON 直给
+        布尔，8015 四用例移植 Rust，borrow 域从原始 params 保留）、
+        ANNOUNCE/流 SETUP 协议常量缺省域（bit15/authType8/latency/键 IV/
+        屏 25ms/音频三布尔）
+      - 退役：ControlCipher（网络面加密早已全 Rust）+ ControlCipherTest +
+        ModesStateParseTest（迁 Rust）+ 两处死 BinaryPlist 体 + 5 死常量 +
+        4 孤儿注释块 + pairingRetryBackoffMs
+      - 验证：Rust 194 全绿；Kotlin compile/JVM/spotless/lint 全绿；
+        **装机/真机回归待平板重连**（D7 候选恢复 + 会话全链）
+- [ ] **R3 删除日**：SessionController 残余编排/NativeTunnelIap2Link/
       Iap2SenderSession/Iap2Csm/BinaryPlist/AudioProfileMemory/TimingServer
       （~3000 行）——新壳接线验证后整文件退役
 - [ ] **JNI 注入面接线**：set_platform_values（设备名/语言/时区）、
