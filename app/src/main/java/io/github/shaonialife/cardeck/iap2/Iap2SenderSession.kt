@@ -23,6 +23,12 @@ class Iap2SenderSession(
     private val bluetoothMac: String = "02:00:00:00:00:00",
     /** 本机蓝牙名（0x4E09 设备信息）。 */
     private val deviceName: String = "iPhone",
+    /** 本端语言标签（0x4E0A；Locale.toLanguageTag 形态，宿主平台值）。 */
+    private val language: String = "zh-CN",
+    /** 本端时区偏移（分钟，含夏令时；0x4E0B 参数 1，负值按 u16 位形透传）。 */
+    private val tzOffsetMinutes: Int = 480,
+    /** 本端夏令时标志（0x4E0B 参数 2 u8；1 = 夏令时生效）。 */
+    private val dst: Int = 0,
     /** 收到 0x5703（热点凭据）时回调——主控立即绑 WiFi + 广播 _carplay-ctrl。 */
     private val onWifiCredentials: ((WifiConfiguration) -> Unit)? = null,
     /** 收到 0x4301（CarPlay 端点，含 wifi 域）时回调——主控直接走 AirPlay 连接。 */
@@ -74,7 +80,13 @@ class Iap2SenderSession(
             return
         }
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
-        channel.startFlow(deviceName, bluetoothMac)
+        channel.startFlow(
+            deviceName.toByteArray(),
+            bluetoothMac.toByteArray(),
+            language.toByteArray(),
+            tzOffsetMinutes,
+            dst,
+        )
 
         while (channel.isAlive) {
             // 链路事件（Rust：WIFI=-1 / ENDPOINT=-2 / PHASE1_DONE=-3）。

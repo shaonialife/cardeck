@@ -33,13 +33,17 @@ class Iap2LinkChannel(
         val bytes: ByteArray,
     )
 
-    /** 启动原生 Phase-1 编排线程（识别→MFi→问候→WiFi→端点，全固件真身）。 */
+    /** 启动原生 Phase-1 编排线程（识别→MFi→问候→WiFi→端点，全固件真身）。
+     *  平台值直传（JNI 注入面接线——0x4E 通知波身份域，Rust 侧不落缺省）。 */
     fun startFlow(
-        deviceName: String,
-        bluetoothMac: String,
+        deviceName: ByteArray,
+        bluetoothMac: ByteArray,
+        language: ByteArray,
+        tzOffsetMinutes: Int,
+        dst: Int,
     ) {
         check(handle != 0L) { "flow start on dead channel" }
-        NativeBridge.nativeSessionFlowStart(handle, deviceName, bluetoothMac)
+        NativeBridge.nativeSessionFlowStart(handle, deviceName, bluetoothMac, language, tzOffsetMinutes, dst)
     }
 
     /** 取下一个编排事件；超时返回 null。 */

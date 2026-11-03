@@ -90,11 +90,17 @@ object NativeBridge {
     /**
      * 启动 Phase-1 编排线程（识别→MFi→问候→WiFi→CarPlay 会话，全固件真身）。
      * 通道创建后立即调；结果经 EventSink：-1=WiFi 凭据、-2=端点、-3=Phase-1 完成。
+     * 平台值注入（JNI 注入面接线 2026-11-03）：设备名→0x4E09、语言→0x4E0A、
+     * 时区（分钟，含夏令时偏移）+夏令时标志→0x4E0B；字符串走 ByteArray
+     * （桥面 bytes 传输约定——荣耀 ROM GetStringUTFChars 越界前科）。
      */
     external fun nativeSessionFlowStart(
         handle: Long,
-        deviceName: String,
-        bluetoothMac: String,
+        deviceName: ByteArray,
+        bluetoothMac: ByteArray,
+        language: ByteArray,
+        tzOffsetMinutes: Int,
+        dst: Int,
     )
 
     /** 裸 CSM 分发（DiPlay type-130 隧道：入站即完整会话消息，无链路封装）。 */

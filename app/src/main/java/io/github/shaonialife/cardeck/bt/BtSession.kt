@@ -25,12 +25,38 @@ internal fun Iap2LinkChannel.runSenderSession(
             { line -> log(line) },
             resolveBluetoothMac(context, log),
             DeviceIdentity.deviceName(context),
+            platformLanguage(),
+            platformTzOffsetMinutes(),
+            platformDstFlag(),
             onWifiCredentials,
             onEndpoint,
         )
     session.run()
     onLinkClosed()
 }
+
+/** 本端语言标签（0x4E0A 平台值——Locale.toLanguageTag，如 "zh-CN"）。 */
+private fun platformLanguage(): String =
+    java.util.Locale
+        .getDefault()
+        .toLanguageTag()
+
+/** 本端时区偏移（分钟，含夏令时偏移——0x4E0B 参数 1 平台值）。 */
+private fun platformTzOffsetMinutes(): Int =
+    java.util.TimeZone
+        .getDefault()
+        .getOffset(System.currentTimeMillis()) / 60_000
+
+/** 本端夏令时标志（0x4E0B 参数 2 u8 平台值；1 = 当前生效）。 */
+private fun platformDstFlag(): Int =
+    if (java.util.TimeZone
+            .getDefault()
+            .inDaylightTime(java.util.Date())
+    ) {
+        1
+    } else {
+        0
+    }
 
 /**
  * 会话启动时解析真实蓝牙 MAC（0x4300 / 0x4E0E 用）。
