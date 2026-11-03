@@ -235,7 +235,13 @@ class VideoSender(
                         if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                             sendVideoConfig(buffer, bufferInfo.size, output)
                         } else if (bufferInfo.size > 0) {
-                            sendVideoFrame(buffer, bufferInfo.size, flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0, output)
+                            sendVideoFrame(
+                                buffer,
+                                bufferInfo.size,
+                                bufferInfo.presentationTimeUs,
+                                flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0,
+                                output,
+                            )
                         }
                         codec.releaseOutputBuffer(index, false)
                         maybeSendKeepAlive(output)
@@ -337,8 +343,13 @@ class VideoSender(
         // 旧实现三项都没写——DiPlay/WinPlay 只读 body、不校验头，所以测试台一直正常，
         // 真车（Audi 4851）却黑屏（2026-10-19 用户日志）。
         val header =
-            NativeBridge.nativeAirplayScreenBuildConfigHeader(sessionHandle, body.size, width, height)
-                ?: return
+            NativeBridge.nativeAirplayScreenBuildConfigHeader(
+                sessionHandle,
+                body.size,
+                width,
+                height,
+                System.nanoTime(),
+            ) ?: return
         output.write(header)
         output.write(body)
         output.flush()
@@ -354,6 +365,7 @@ class VideoSender(
     private fun sendVideoFrame(
         buffer: java.nio.ByteBuffer,
         size: Int,
+        ptsUs: Long,
         keyFrame: Boolean,
         output: java.io.OutputStream,
     ) {
@@ -384,11 +396,12 @@ class VideoSender(
         }
         val plain = packed.toByteArray()
 
-        // 帧头构造 + 密封全在 Rust（A4——fw: cryptor 变换 @0x227969f68）：
-        // ChaCha nonce = 8B LE 帧计数（会话驻留态）/ CTR 密钥流跨帧连续；
-        // 头只构造一次且作 AAD（Rust 内部完成，时间戳一致）。null = 无封包态。
+        // 帧头构造 + 密封全在 Rust（A4 全量形态——fw: cryptor 变换
+        // @0x227969f68）：ChaCha nonce = 8B LE 帧计数（会话驻留态）/ CTR
+        // 密钥流跨帧连续；头只构造一次且作 AAD（0x2276b7300 指令级定谳），
+        // 时间戳 = convert(帧 PTS + 屏流延迟)。null = 无封包态。
         val frame =
-            NativeBridge.nativeAirplayScreenSealFrame(sessionHandle, plain, System.nanoTime())
+            NativeBridge.nativeAirplayScreenSealFrame(sessionHandle, plain, ptsUs * 1000)
                 ?: run {
                     log("VIDEO: 封包态不可用（无 streamSetup 密态）——跳帧")
                     return

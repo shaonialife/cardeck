@@ -412,22 +412,25 @@ object NativeBridge {
         fps: Int,
     ): ByteArray?
 
-    /** VideoConfig 头（128B；A5 下沉——fw: @0x227833f38 最小形态；
+    /** VideoConfig 头（128B 全量形态；A5 下沉——fw: @0x227833f38：
+     *  [6]=0x12|0x08|0x04 条件位、[7]=1、[8..15]=convert(now+延迟)；
      *  Encrypted 位由会话封包态判定）。 */
     external fun nativeAirplayScreenBuildConfigHeader(
         handle: Long,
         bodyLen: Int,
         width: Int,
         height: Int,
+        nowNanos: Long,
     ): ByteArray?
 
-    /** VideoFrame 密封整帧（128B 头 + 密封载荷；A4 下沉——fw:
-     *  cryptor 变换 @0x227969f68，帧计数器/AES 密钥流驻留会话态）。
+    /** VideoFrame 密封整帧（128B 全量头 + 密封载荷；A4 下沉——fw:
+     *  cryptor 变换 @0x227969f68，帧计数器/AES 密钥流驻留会话态；头时间戳 =
+     *  convert(帧 PTS + 屏流延迟)）。[ptsNanos] = 编码器 presentationTimeUs×1000。
      *  null = 无封包态（未 SETUP/被拒），宿主跳帧。 */
     external fun nativeAirplayScreenSealFrame(
         handle: Long,
         payload: ByteArray,
-        uptimeNanos: Long,
+        ptsNanos: Long,
     ): ByteArray?
 
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
