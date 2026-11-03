@@ -15,10 +15,14 @@ import java.util.concurrent.TimeUnit
 /**
  * 链路通道：一个读线程 + 一个节奏线程驱动【原生会话】（cardeck-protocol
  * 固件真身：accessoryd iAP2Link/FSM/分包器/队列全链），向会话层暴露
- * 阻塞式的 sendControl/recvControl 与 awaitReady。
+ * sendControl 与 awaitReady。
  *
  * Kotlin 侧只剩传输（RFCOMM 读写）与节拍——帧解析、协商、seq/ack、
  * 重传、会话消息分发全部在 Rust（日志推断的 Iap2LinkEngine 已下线）。
+ *
+ * **镜像面已退役（A7 下沉 2026-11-04）**：会话消息镜像不再入队过宿主
+ * （旧 consumers = Iap2SenderSession 的纯日志解析，零行为消费）——
+ * EventSink 只保留 "LINK msg" 诊断日志 + 编排事件分流。
  */
 class Iap2LinkChannel(
     private val stream: DuplexStream,
@@ -55,7 +59,6 @@ class Iap2LinkChannel(
         }
 
     private val lock = Object()
-    private val controls = LinkedBlockingQueue<ByteArray?>()
     private val flowEvents = LinkedBlockingQueue<FlowEvent>()
     private val readyLatch = CountDownLatch(1)
 
@@ -95,9 +98,9 @@ class Iap2LinkChannel(
                 }
             },
         )
-        // 事件汇：每条完整会话消息全量镜像（含被 Rust 消费的 1D01/AA01——
-        // Kotlin 侧自行过滤用途）；0x1D00/0x1D02 为 Rust 端到端无感；
-        // -1/-2/-3 为 Rust 编排事件
+        // 事件汇：Rust 编排事件（WIFI/ENDPOINT/PHASE1_DONE = 负 id）直通
+        // flowEvents；协议帧镜像只打诊断日志（id+len——连接排查的眼睛），
+        // 不再入队过宿主（A7：解析面已退役，Rust 内部消化）
         NativeBridge.nativeSessionSetEventSink(
             handle,
             object : NativeBridge.EventSink {
@@ -107,11 +110,7 @@ class Iap2LinkChannel(
                 ) {
                     if (terminated) return
                     log("LINK msg: id=0x${"%04x".format(msgId)} len=${bytes.size}")
-                    when {
-                        msgId == 0x1D00 || msgId == 0x1D02 -> return // Rust 端到端
-                        msgId < 0 -> flowEvents.offer(FlowEvent(msgId, bytes))
-                        else -> controls.offer(bytes)
-                    }
+                    if (msgId < 0) flowEvents.offer(FlowEvent(msgId, bytes))
                 }
             },
         )
@@ -155,29 +154,6 @@ class Iap2LinkChannel(
 
     /** 对端协商的最大控制载荷（已扣除帧头与校验和）。 */
     fun peerMaxControlPayload(): Int? = if (handle == 0L) null else NativeBridge.nativeSessionPeerMaxControl(handle).takeIf { it > 0 }
-
-    /** 排入一个完整控制载荷；链路已死返回 false。原生链内部排队 + ACK 驱动重传。 */
-    fun sendControl(
-        bytes: ByteArray,
-        awaitAck: Boolean = true,
-    ): Boolean {
-        if (terminated || handle == 0L) return false
-        dumpOutbound(bytes)
-        return NativeBridge.nativeSessionSendControl(handle, bytes) == 1
-    }
-
-    /** 取下一个控制载荷；超时或链路结束返回 null。 */
-    fun recvControl(timeoutMillis: Long): ByteArray? {
-        if (timeoutMillis == 0L && terminated && controls.isEmpty()) return null
-        val polled =
-            try {
-                controls.poll(timeoutMillis, TimeUnit.MILLISECONDS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return null
-            }
-        return if (polled === null || polled === POISON) null else polled
-    }
 
     override fun close() {
         finish(null)
@@ -248,7 +224,6 @@ class Iap2LinkChannel(
     private fun finishLocked(failure: IOException?) {
         if (terminated) return
         terminated = true
-        controls.offer(POISON) // 哨兵：唤醒阻塞的接收方（LBQ 不接受 null）
         readyLatch.countDown()
         lock.notifyAll()
         if (handle != 0L) {
@@ -263,8 +238,6 @@ class Iap2LinkChannel(
         }
     }
 
-    private fun nowMillis(): Long = System.nanoTime() / 1_000_000L
-
     private companion object {
         const val PACER_POLL_MILLIS = 20L
 
@@ -277,8 +250,5 @@ class Iap2LinkChannel(
 
         /** 逐帧摘要日志上限（每方向每连接）。 */
         const val FRAME_LOG_LIMIT = 40
-
-        /** 链路终结哨兵；真实控制载荷至少包含一段 CSM 帧，不会为空。 */
-        val POISON = ByteArray(0)
     }
 }
