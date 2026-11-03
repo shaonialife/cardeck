@@ -114,8 +114,13 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
         连接序直连（窗口未开的 refused 由决策机退避吸收，mDNS 缺口由
         runFlow 的 endpointRefresher 补齐——enrichEndpointFromBrowser+
         txtValue 保留 = 唯一 mDNS 消费面）；流启动时序原样保留
+      - **真机回归（DiPlay 台，20:25）**：首跑暴露 Rust 侧 ident/pubkey/
+        srcvers 未剥尾 NUL（C 串语义，双 \0 致 Kotlin 逐字段错位——旧载荷
+        时代潜伏 bug，旧观察器路径掩盖）；protocol 86e6e9b 修复后复跑全链
+        绿：ssid=Redmi K40 ips=[192.168.83.107] → TCP 直连 → 配对完成 →
+        SETUP → RECORD → 推流稳定（帧 #600/keepAlive #30/fps=30，零崩溃）
       - 验证：Kotlin compile+JVM 测试+spotless+lint 全绿；Rust 187 lib
-        全绿；**装机待设备空闲**（so 已构建入 jniLibs，设备 19:56 在用）
+        全绿；装机 0.1.28.44-debug
 - [ ] **R2 AirPlayLink 壳**：新文件替代 AirPlayClient（2011 行）——TCP socket +
       nativeAirplay* 泵搬运 + keepalive UDP + Timing socket + 事件通道命令
       POST；ControlCipher/AirPlayCrypto 暂以传输组件保留（E3 双界验证）；
