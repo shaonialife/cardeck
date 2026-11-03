@@ -394,6 +394,32 @@ object NativeBridge {
     /** 取走事件通道出站（应答/命令帧；null = 无）。 */
     external fun nativeAirplayEventTakeOutbound(handle: Long): ByteArray?
 
+    // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
+
+    /** 建连接编排决策机（每轮 runFlow 一个；[noPairingHint] = TXT 未声明
+     *  HK_PAIRING_AND_ENCRYPT 的兼容层初值）。返回 flowHandle。 */
+    external fun nativeAirplayFlowBegin(noPairingHint: Boolean): Long
+
+    /** 决策机步进：[reportJson] = 上一个动作结果
+     *  （begin/ok/connectFail/pairDone/pairForbidden/pairUnsupported/pairFail/
+     *  setupOk/setupFail/cancelled），返回动作 JSON
+     *  （connect/pairing/setup/wait/done/abort）。 */
+    external fun nativeAirplayFlowStep(
+        flowHandle: Long,
+        reportJson: ByteArray,
+    ): String?
+
+    /** 销毁决策机。 */
+    external fun nativeAirplayFlowDestroy(flowHandle: Long)
+
+    /** 连接序自动链（flow 的 Setup 动作）：stup→流 100/101→annc→rcrd 由
+     *  会话机自驱（fw: Stage2StartTransaction @0x2276cf53c 域序）。
+     *  [announceJson] = 宿主平台数据（本机地址/UUID/设备名/键 IV）。 */
+    external fun nativeAirplaySetupAuto(
+        handle: Long,
+        announceJson: ByteArray,
+    ): String?
+
     /** 发 ANNOUNCE（'annc'，SDP 文本体——fw: _sdpsession_sendAnnounce
      *  @0x22779ddd4 直切）。[paramsJson] = {"uuidU64":N,"localIp":"..",
      *  "ip6":B,"deviceName":"..","audioFormatBit":N,"authType":N,

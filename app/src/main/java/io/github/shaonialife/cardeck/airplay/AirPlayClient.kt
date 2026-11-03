@@ -168,18 +168,6 @@ class AirPlayClient(
     fun reconnect(timeoutMillis: Int = 5_000): Boolean = ensureConnected(timeoutMillis)
 
     /**
-     * 明文 SETUP 被拒后的「加密升级」重试（catplay `handle_setup_result` 同义）：
-     * 先按 pre-HomeKit 车机走 `et=NONE`，若 SETUP 被拒且此前没试过配对，
-     * 就补做一次 pair-setup/pair-verify 再 SETUP。TXT features 判断错误时不至于直接失败。
-     */
-    fun retryWithPairing(windowMillis: Long = 30_000): ControlKeys? {
-        pairingUnsupported = false
-        close()
-        log("AIRPLAY: 明文 SETUP 未通过——尝试加密升级（补做 HomeKit 配对）")
-        return runPairing(windowMillis)
-    }
-
-    /**
      * 配对：先试 pair-setup（注册长期公钥）→ pair-verify（派生控制密钥）；
      * 若 pair-setup 被 **403** 拒绝（真车 Audi MIB3 实测：iAP2 阶段已完成 MFi 信任，
      * 不接受匿名 SRP 配对窗口），则改走「已配对设备快路径」直接 pair-verify。
@@ -231,104 +219,144 @@ class AirPlayClient(
         return true
     }
 
-    fun runPairing(windowMillis: Long = PAIRING_WINDOW_MILLIS): ControlKeys? {
+    /** 配对泵交付物（flow 完成后宿主数据面消费——sharedSecret/Events 双钥）。 */
+    var lastKeys: ControlKeys? = null
+        private set
+
+    /** 连接序完成时由 [setupRound] 装配（flow done 动作的返回载荷）。 */
+    private var pendingSetupInfo: SetupInfo? = null
+
+    /** flow connect 动作计数（低频 retryTick 钩子节拍）。 */
+    private var flowConnectTick = 0
+
+    /**
+     * 连接编排泵（**决策机 = Rust fw::airplay::flow**——固件骨架
+     * `_apsession_ensureConnectedInternal` @0x22775f8a0 +
+     * `_apsession_ensureStartedInternalStage1StartTransaction` @0x2276ce288）。
+     * 本循环只**执行动作、上报结果**，全部决策（配对路径/明文降级/加密升级/
+     * 403 退避/放弃）由决策机给出：
+     * - connect → 建 TCP（平台 IO）
+     * - pairing → 单连接配对轮（fw: tryAPPairSetupAndVerify 单连接单次）
+     * - setup   → 连接序自动链（会话机内自驱 stup→100→101→annc→rcrd）
+     * - wait    → 退避（值由决策机给，宿主执行+检查取消）
+     * - done    → 连接序完成，返回 [SetupInfo]
+     * - abort   → 结构失败放弃
+     */
+    fun runFlow(
+        windowMs: Long,
+        noPairingHint: Boolean,
+    ): SetupInfo? {
         pairingInProgress = true
+        lastKeys = null
+        pendingSetupInfo = null
+        flowConnectTick = 0
+        val identity = loadOrCreateIdentity()
+        log("AIRPLAY: 控制器身份 pairingId=${identity.pairingId}")
+        val flowHandle = NativeBridge.nativeAirplayFlowBegin(noPairingHint)
+        if (flowHandle == 0L) {
+            log("AIRPLAY: ⚠ flow 决策机创建失败（so 未加载？）")
+            pairingInProgress = false
+            return null
+        }
         try {
-            return runPairingLoop(windowMillis)
+            val deadline = System.currentTimeMillis() + windowMs
+            var report = "{\"op\":\"begin\"}"
+            while (!cancelled && System.currentTimeMillis() < deadline) {
+                val action =
+                    NativeBridge.nativeAirplayFlowStep(flowHandle, report.toByteArray())
+                        ?: return null
+                val json = org.json.JSONObject(action)
+                when (json.optString("action")) {
+                    "connect" -> {
+                        // 平台节奏辅助（非决策）：吸收 mDNS 新结果 + 低频 ctrl 重公告
+                        endpointRefresher?.invoke(endpoint)?.let { refreshed ->
+                            updateEndpoint(refreshed, "配对期间 mDNS 刷新")
+                        }
+                        flowConnectTick++
+                        if (flowConnectTick == 1 || flowConnectTick % RETRY_TICK_ATTEMPTS == 0) {
+                            runCatching { retryTick?.invoke(flowConnectTick) }
+                        }
+                        close()
+                        report =
+                            if (ensureConnected(2_000)) {
+                                "{\"op\":\"ok\"}"
+                            } else {
+                                "{\"op\":\"connectFail\"}"
+                            }
+                    }
+                    "pairing" -> report = pairingRound(identity)
+                    "setup" -> report = setupRound()
+                    "wait" -> {
+                        val ms = json.optLong("ms")
+                        log("AIRPLAY: flow 退避 ${ms}ms（${json.optString("reason")}）")
+                        var left = ms
+                        while (left > 0 && !cancelled) {
+                            Thread.sleep(minOf(left, 200))
+                            left -= 200
+                        }
+                        report = if (cancelled) "{\"op\":\"cancelled\"}" else "{\"op\":\"ok\"}"
+                    }
+                    "done" -> return pendingSetupInfo
+                    "abort" -> {
+                        log("AIRPLAY: flow 放弃 - ${json.optString("reason")}")
+                        return null
+                    }
+                }
+            }
+            log("AIRPLAY: flow 窗口耗尽（${windowMs}ms）")
+            return null
         } finally {
+            NativeBridge.nativeAirplayFlowDestroy(flowHandle)
             pairingInProgress = false
         }
     }
 
-    private fun runPairingLoop(windowMillis: Long): ControlKeys? {
-        val identity = loadOrCreateIdentity()
-        log("AIRPLAY: 控制器身份 pairingId=${identity.pairingId}")
-        // 车机 AirPlay 窗口是「用户点车机上的手机图标 / 收到 ctrl 邀请后才开」的
-        // （Audi 实测：端口从 Connection refused 变为开放）。因此重试采用时限制：
-        // 默认 120s 内每 2s 试一次——用户在车机上点一下的等待不会被提前放弃。
-        val deadline = System.currentTimeMillis() + windowMillis
-        var attempt = 0
-        while (System.currentTimeMillis() < deadline && !cancelled) {
-            attempt++
-            // 每轮重试前吸收一次 mDNS 新结果：网关兜底地址连不通时，车机的
-            // _airplay._tcp 可能已经在后台发现到，及时换过去比空转 120s 强。
-            endpointRefresher?.invoke(endpoint)?.let { refreshed ->
-                updateEndpoint(refreshed, "配对期间 mDNS 刷新")
-            }
-            // 低频钩子：主控据此重新公告 ctrl mDNS（车机 Bonjour 可能漏掉首次公告）
-            if (attempt == 1 || attempt % RETRY_TICK_ATTEMPTS == 0) {
-                runCatching { retryTick?.invoke(attempt) }
-            }
-            close()
-            if (!ensureConnected(2_000)) {
-                if (attempt == 1 || attempt % 5 == 0) {
-                    log("AIRPLAY: 车机 AirPlay 端口未开（等待你点车机上的手机图标 / 车机发 ctrl 邀请）…第 $attempt 次重试")
-                }
-                Thread.sleep(2_000)
-                continue
-            }
-            attemptedPairing = true
-            // M5.2 会话泵：info → 配对全交换（M1-M6/M1-M4、CSeq、头集、密钥派生）
-            // 全在 Rust（fw: apsession_ensureConnectedInternal 直切）；
-            // Kotlin 只剩 TCP 读写 + 事件消费。
-            // peerKnown = fw: isPeerKnown——**我方配对库存有对端 LTPK** 的分支
-            // 语义。本会话 setup 完成（done）或 403（车机视 iAP2 信任为已配对）
-            // 才算已知；endpoint.publicKey 是车机自己的身份（0x4301 参数 4），
-            // 不是「车机已配对我们」的证据——误当 peerKnown 会跳过 pair-setup，
-            // 车机验 M3 签名无记录 → M4 空 type5（16:40 真机 121 次循环实证）。
-            val peerKnown =
-                if (setupReceiverIdentity != null || pairingForbidden) 1 else 0
-            // 配对码注入（§10.49：PIN 流接收端——features bit7/9 的车机走
-            // 「/pair-pin-start → 车机屏 PIN → 用户输入」固件流）。宿主数据
-            // 初值通路：files/pair_pin.txt 存在即读，**每次尝试都重读**——
-            // 车机屏弹出配对码后 adb 写入文件，下一次尝试即携带
-            // （adb: run-as io.github.shaonialife.cardeck sh -c 'echo -n 482613 > files/pair_pin.txt'）。
-            // 纯平台 IO，配对协议全在 Rust。null = 空透传（Rust 决定
-            // pin-start 或常量码回落）。
-            if (setupCodeOverride == null) {
-                runCatching {
-                    val dir = context?.filesDir ?: return@runCatching
-                    val pinFile = java.io.File(dir, "pair_pin.txt")
-                    if (pinFile.isFile) {
-                        val pin = pinFile.readText().trim()
-                        if (pin.isNotEmpty()) {
-                            setupCodeOverride = pin
-                            log("AIRPLAY: 已载入配对码注入（files/pair_pin.txt，${pin.length} 位）")
-                        }
+    /**
+     * 单连接配对轮（fw: tryAPPairSetupAndVerify 单连接单次——每轮新连接新会话
+     * 句柄，接收端按连接维护状态机）。返回 flow 上报 JSON。
+     */
+    private fun pairingRound(identity: ControllerIdentity): String {
+        // peerKnown = fw: isPeerKnown——**我方配对库存有对端 LTPK** 的分支
+        // 语义：本会话 setup 完成（done）或 403（车机视 iAP2 信任为已配对）
+        // 才算已知；endpoint.publicKey 是车机自己的身份，不是「车机已配对
+        // 我们」的证据——误当 peerKnown 会跳过 pair-setup，车机验 M3 签名
+        // 无记录 → M4 空 type5（16:40 真机 121 次循环实证）。
+        val peerKnown =
+            if (setupReceiverIdentity != null || pairingForbidden) 1 else 0
+        // 配对码注入（§10.49：PIN 流接收端）。纯平台 IO：files/pair_pin.txt
+        // 存在即读，每次尝试重读（adb 写入 → 下一次尝试携带）。
+        if (setupCodeOverride == null) {
+            runCatching {
+                val dir = context?.filesDir ?: return@runCatching
+                val pinFile = java.io.File(dir, "pair_pin.txt")
+                if (pinFile.isFile) {
+                    val pin = pinFile.readText().trim()
+                    if (pin.isNotEmpty()) {
+                        setupCodeOverride = pin
+                        log("AIRPLAY: 已载入配对码注入（files/pair_pin.txt，${pin.length} 位）")
                     }
                 }
             }
-            val handle =
-                NativeBridge.nativeAirplayCreate(
-                    FLAGS_AIRPLAY_SENDER,
-                    identity.pairingId.toByteArray(),
-                    identity.privateKey,
-                    (android.os.Build.MODEL ?: "CarDeck").toByteArray(),
-                    peerKnown,
-                    setupCodeOverride?.toByteArray(),
-                )
-            if (handle == 0L) {
-                log("AIRPLAY: ⚠ 会话创建失败（so 未加载？）")
-                return null
-            }
-            try {
-                val keys = pumpPairingSession(handle, attempt)
-                if (keys != null) {
-                    // 句柄已存 controlSessionHandle——会话跨 runSetup 存活，不销毁
-                    return keys
-                }
-            } finally {
-                // 失败路径才销毁（成功路径句柄移交 controlSessionHandle）
-                if (controlSessionHandle != handle) {
-                    NativeBridge.nativeAirplayDestroy(handle)
-                }
-            }
-            // 403 退避（真机抓包：车机首连被拒后需 18~20s 才进入可接受状态）；
-            // 其余失败维持快速轮询等端口开放（连接策略层节奏，固件配对层单次）
-            if (pairingForbidden) Thread.sleep(pairingRetryBackoffMs("403"))
         }
-        log("AIRPLAY: 配对最终失败（接收端 RTSP 无应答）")
-        return null
+        val handle =
+            NativeBridge.nativeAirplayCreate(
+                FLAGS_AIRPLAY_SENDER,
+                identity.pairingId.toByteArray(),
+                identity.privateKey,
+                (android.os.Build.MODEL ?: "CarDeck").toByteArray(),
+                peerKnown,
+                setupCodeOverride?.toByteArray(),
+            )
+        if (handle == 0L) {
+            log("AIRPLAY: ⚠ 会话创建失败（so 未加载？）")
+            return "{\"op\":\"pairFail\"}"
+        }
+        val outcome = pumpPairingSession(handle)
+        // 失败路径才销毁（成功路径句柄移交 controlSessionHandle）
+        if (controlSessionHandle != handle) {
+            NativeBridge.nativeAirplayDestroy(handle)
+        }
+        return outcome
     }
 
     /**
@@ -336,11 +364,8 @@ class AirPlayClient(
      * Rust 侧决策（fw: orchestrator）：403 → reconnectRequired（返回后由外层
      * 重连重试）；完成 → ControlKeys（Control 双钥，fw: CreateEncryptionKeysForContext）。
      */
-    private fun pumpPairingSession(
-        handle: Long,
-        attempt: Int,
-    ): ControlKeys? {
-        val client = socket ?: return null
+    private fun pumpPairingSession(handle: Long): String {
+        val client = socket ?: return "{\"op\":\"pairFail\"}"
         client.soTimeout = 10_000
         val input = client.getInputStream()
         val output = client.getOutputStream()
@@ -400,15 +425,15 @@ class AirPlayClient(
                         }
                         continue
                     }
-                    log("AIRPLAY: 配对读超时（第 $attempt 次尝试）- ${error.message}")
-                    return null
+                    log("AIRPLAY: 配对读超时 - ${error.message}")
+                    return "{\"op\":\"pairFail\"}"
                 } catch (error: IOException) {
-                    log("AIRPLAY: 配对读断开（第 $attempt 次尝试）- ${error.message}")
-                    return null
+                    log("AIRPLAY: 配对读断开 - ${error.message}")
+                    return "{\"op\":\"pairFail\"}"
                 }
             if (n < 0) {
-                log("AIRPLAY: 配对连接被对端关闭（第 $attempt 次尝试）")
-                return null
+                log("AIRPLAY: 配对连接被对端关闭")
+                return "{\"op\":\"pairFail\"}"
             }
             val event = NativeBridge.nativeAirplayOnBytes(handle, buf.copyOf(n)) ?: continue
             if (event.isEmpty()) continue
@@ -434,10 +459,9 @@ class AirPlayClient(
                 }
                 "reconnectRequired" -> {
                     // fw: 403 = 信任已建（SavePeer）→ 外层换新连接重试
-                    pairSetupRejected = true
                     pairingForbidden = true
                     log("AIRPLAY: pair-setup 被 403 拒绝（车机不接受匿名配对——iAP2 已完成信任）→ 转已配对快路径")
-                    return null
+                    return "{\"op\":\"pairForbidden\"}"
                 }
                 "done" -> {
                     // fw: setup M6 产物（SavePeer 内容）+ Control 双钥
@@ -455,21 +479,25 @@ class AirPlayClient(
                     // Rust Done 交付；此前空数组 → Kotlin 事件加密密钥错 → 接收端
                     // BAD_DECRYPT，真机 22:04:46 实证）
                     val shared = hexToBytes(json.optString("sharedSecret")) ?: ByteArray(0)
+                    // Events 双钥（Rust 会话 verify M4 同域派生）——事件通道直用
+                    val eventsWrite = hexToBytes(json.optString("eventsWriteKey")) ?: ByteArray(0)
+                    val eventsRead = hexToBytes(json.optString("eventsReadKey")) ?: ByteArray(0)
                     // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
                     cipher = ControlCipher(read, write)
-                    log("AIRPLAY: 配对完成（第 $attempt 次尝试），控制通道加密已启用")
-                    // M5.2：会话句柄存活跨 runSetup（fw: apsession 生命周期——
+                    log("AIRPLAY: 配对完成，控制通道加密已启用")
+                    // M5.2：会话句柄存活跨连接序（fw: apsession 生命周期——
                     // 控制建立/流 SETUP/事件通道全走同一加密会话）
                     controlSessionHandle = handle
-                    return ControlKeys(write, read, shared)
+                    lastKeys = ControlKeys(write, read, shared, eventsWrite, eventsRead)
+                    return "{\"op\":\"pairDone\"}"
                 }
                 "error" -> {
-                    log("AIRPLAY: 会话事件错误（第 $attempt 次尝试）- ${json.optString("message")}")
-                    return null
+                    log("AIRPLAY: 会话事件错误 - ${json.optString("message")}")
+                    return "{\"op\":\"pairFail\"}"
                 }
             }
         }
-        return null
+        return "{\"op\":\"cancelled\"}"
     }
 
     // 单连接上的 pair-verify 尝试（原 runVerifyAttempt）：**已整体移入 Rust 会话泵**
@@ -757,91 +785,61 @@ class AirPlayClient(
     @Volatile
     private var eventCommandSocket: Socket? = null
 
-    /** null = 明文事件通道（et=NONE 的老车机会话，catplay `EventsServer::unencrypted`）。 */
-    @Volatile
-    private var eventCommandCipher: ControlCipher? = null
+    private val eventWriteLock = Any()
 
-    private val eventCommandLock = Any()
-    private var eventCseq = 0
-
-    /** 未知请求（非 /command 的合法请求）累计数：前 10 条留痕后静默。 */
-    @Volatile
-    private var unknownEventRequests = 0
-
-    /** /command 里 plist 解不出来的累计数：前 8 条带原始 hex 留痕（排查车机命令通路）。 */
-    @Volatile
-    private var badEventCommands = 0
-
-    /**
-     * 解不出来的 /command 的「体型指纹」（长度 + 首 8 字节）。
-     *
-     * 车机一般每秒重发同一批命令，按指纹去重后只对**新出现**的体型做全文取证，
-     * 既不刷屏又不会漏掉任何一类（此前只按条数截断，换个车型就只看到前 8 条）。
-     */
-    private val badEventSignatures = LinkedHashSet<String>()
-
-    /** 事件通道建立后由 connectEventChannel 调用。cipher=null 表示明文通道。 */
-    private fun registerEventCommandChannel(
-        socket: Socket,
-        cipher: ControlCipher?,
-    ) {
+    /** 事件通道建立后由 connectEventChannel 调用（加密态由 nativeAirplayEventCreate 定）。 */
+    private fun registerEventCommandChannel(socket: Socket) {
         eventCommandSocket = socket
-        eventCommandCipher = cipher
     }
 
-    /** 在事件通道上发 POST /command（通道加密时加密）。通道未就绪时返回 false。 */
-    fun postEventCommand(command: Map<String, Any?>): Boolean {
-        val socket = eventCommandSocket ?: return false
-        val cipher = eventCommandCipher
-        return try {
-            synchronized(eventCommandLock) {
-                eventCseq++
-                val body = BinaryPlist.encode(command)
-                val head =
-                    "POST /command RTSP/1.0\r\n" +
-                        "Content-Type: application/x-apple-binary-plist\r\n" +
-                        "Content-Length: ${body.size}\r\n" +
-                        "CSeq: $eventCseq\r\n\r\n"
-                val plaintext = head.toByteArray(Charsets.US_ASCII) + body
-                val bytes = cipher?.encrypt(plaintext) ?: plaintext
+    /** 取走 Rust 事件通道出站（车机命令应答/我方命令帧）写网；无出站是常态空转。 */
+    private fun pumpEventOutbound() {
+        val socket = eventCommandSocket ?: return
+        val out = NativeBridge.nativeAirplayEventTakeOutbound(controlSessionHandle) ?: return
+        if (out.isEmpty()) return
+        synchronized(eventWriteLock) {
+            try {
                 socket.getOutputStream().apply {
-                    write(bytes)
+                    write(out)
                     flush()
                 }
+            } catch (_: IOException) {
             }
-            true
-        } catch (error: IOException) {
-            log("EVENT: 命令发送失败 - ${error.message}")
-            false
         }
     }
 
-    /**
-     * 事件通道请求应答：只对**车机的请求**回 RTSP/1.0 200 OK，并 echo 其 CSeq
-     * （DiPlay buildResponse 同款，对照 RtspMessage.kt:76）。踩坑记录（2026-10-11）：
-     * 此前对一切入向消息都回 200——对"应答"回应答与 DiPlay 形成乒乓：DiPlay 把我们的
-     * 多余应答解析成请求（"RTSP/1.0" 当 method 剥掉后 protocol 取到第三 token），
-     * 回出畸形行 "OK 200 OK"；我们再回 → 无限回声，日志雪崩且空耗加密通道。
-     * 通道写与 postEventCommand 共用一把锁，避免两线程加密帧交叉。
-     */
-    private fun respondEventRequest(
-        cseq: String?,
-        body: ByteArray? = null,
-    ) {
-        val socket = eventCommandSocket ?: return
-        val cipher = eventCommandCipher
-        try {
-            synchronized(eventCommandLock) {
-                val head =
-                    "RTSP/1.0 200 OK\r\nContent-Length: ${body?.size ?: 0}\r\n" +
-                        (cseq?.let { "CSeq: $it\r\n" } ?: "") + "\r\n"
-                val plaintext = head.toByteArray(Charsets.US_ASCII) + (body ?: ByteArray(0))
-                socket.getOutputStream().apply {
-                    write(cipher?.encrypt(plaintext) ?: plaintext)
-                    flush()
-                }
+    /** 命令字典 → JSON（ByteArray 值 → 0..255 整数数组，Rust json_to_plist
+     *  还原为 plist Data——与 plist_to_json 输出互为双射）。 */
+    private fun eventCommandJson(command: Map<String, Any?>): org.json.JSONObject {
+        fun wrap(v: Any?): Any? =
+            when (v) {
+                is ByteArray -> org.json.JSONArray(v.map { it.toInt() and 0xFF })
+                is Map<*, *> ->
+                    org.json.JSONObject(
+                        v.entries.associate { it.key.toString() to wrap(it.value) },
+                    )
+                is List<*> -> org.json.JSONArray(v.map { wrap(it) })
+                else -> v
             }
-        } catch (_: IOException) {
+        return org.json.JSONObject(command.entries.associate { it.key.toString() to wrap(it.value) })
+    }
+
+    /** 在事件通道上发 POST /command（Rust 组帧+加密入队）。未就绪/被拒返回 false。 */
+    fun postEventCommand(command: Map<String, Any?>): Boolean {
+        if (eventCommandSocket == null) return false
+        return try {
+            val json = eventCommandJson(command)
+            val result = NativeBridge.nativeAirplaySendCommand(controlSessionHandle, json.toString().toByteArray())
+            if (!result.isNullOrEmpty() && result.contains("\"type\":\"error\"")) {
+                log("EVENT: 命令发送失败(rust) - $result")
+                false
+            } else {
+                pumpEventOutbound()
+                true
+            }
+        } catch (error: IOException) {
+            log("EVENT: 命令发送失败 - ${error.message}")
+            false
         }
     }
 
@@ -884,28 +882,6 @@ class AirPlayClient(
         )
         return restored
     }
-
-    /** changeModes 应答体：status=0 + 当前资源快照（AADisplay CarPlayEventChannel.kt:344 同构）。 */
-    private fun modesResponseBody(): ByteArray =
-        BinaryPlist.encode(
-            linkedMapOf(
-                "status" to 0L,
-                "params" to
-                    linkedMapOf(
-                        "appStates" to
-                            listOf(
-                                linkedMapOf<String, Any?>("appStateID" to 2L, "entity" to 0L),
-                                linkedMapOf<String, Any?>("appStateID" to 3L, "entity" to 0L),
-                                linkedMapOf<String, Any?>("appStateID" to 1L, "entity" to 0L, "speechMode" to -1L),
-                            ),
-                        "resources" to
-                            listOf(
-                                linkedMapOf<String, Any?>("resourceID" to 1L, "entity" to 1L, "permanentEntity" to 1L),
-                                linkedMapOf<String, Any?>("resourceID" to 2L, "entity" to 1L, "permanentEntity" to 1L),
-                            ),
-                    ),
-            ),
-        )
 
     fun assertModes(): Boolean {
         // §10.56：命令走**事件通道**（DiPlay 同款——命令双向都在事件通道
@@ -992,128 +968,142 @@ class AirPlayClient(
         return params.toString()
     }
 
-    /** Rust 会话全连接序（fw: ensureConnectedInternal B 会话序直切——
-     *  control 'stup' → 流 'stup'（恒建对 Main=100/Alt=101，§10.38）→
-     *  'annc'（§10.41）→ 'rcrd' → recorded。事件泵 = OnBytes/TakeOutbound
-     *  单循环；无 Kotlin 回退（连接逻辑唯一来源 = 固件 Rust）。 */
-    private fun runSetupRust(handle: Long): SetupInfo? {
-        val socket = socket ?: return null
+    /** Rust 连接序自动链（fw: Stage2StartTransaction @0x2276cf53c 域序——
+     *  'stup' → 流 100/101 → 'annc' → 'rcrd' 由会话机**自驱**（setup_auto_advance），
+     *  Kotlin 只泵字节至 recorded/error。 */
+    private fun setupRound(): String {
+        if (!timingServer.start()) {
+            log("AIRPLAY: 计时服务未启动（继续，但媒体时钟无法同步）")
+        }
+        var handle = controlSessionHandle
+        if (handle == 0L) {
+            // 明文会话（配对被决策机跳过/降级）：建会话句柄（peerKnown=0）
+            val identity = loadOrCreateIdentity()
+            handle =
+                NativeBridge.nativeAirplayCreate(
+                    FLAGS_AIRPLAY_SENDER,
+                    identity.pairingId.toByteArray(),
+                    identity.privateKey,
+                    (android.os.Build.MODEL ?: "CarDeck").toByteArray(),
+                    0,
+                    null,
+                )
+            if (handle == 0L) {
+                log("AIRPLAY: ⚠ 明文会话句柄创建失败")
+                return "{\"op\":\"setupFail\"}"
+            }
+            controlSessionHandle = handle
+        }
         NativeBridge.nativeAirplaySetTimingPort(handle, timingServer.port)
-        val input = socket.getInputStream()
-        val output = socket.getOutputStream()
+        val sock = socket ?: return "{\"op\":\"setupFail\"}"
+        val input = sock.getInputStream()
+        val output = sock.getOutputStream()
 
-        fun drainAndWrite() {
+        fun drain() {
             NativeBridge.nativeAirplayTakeOutbound(handle)?.let { bytes ->
                 synchronized(rtspWriteLock) {
                     output.write(bytes)
                     output.flush()
                 }
-                log("AIRPLAY: setup tx ${bytes.size}B")
             }
         }
-
-        // fw: requestControlSetupWithResponse——'stup' POST /setup
-        NativeBridge.nativeAirplayControlSetup(handle)
-        drainAndWrite()
-
-        var controlJson: org.json.JSONObject? = null
-        var streamIdx = 0
+        // info：明文路径未拉过（配对路径已在配对泵拉）——fw: fetchInitialInfo
+        // 先行（@0x227763824）
+        if (rustInfoEvent == null) {
+            NativeBridge.nativeAirplayInfo(handle)
+            drain()
+            val infoDeadline = System.currentTimeMillis() + 8_000
+            val infoBuf = ByteArray(16 * 1024)
+            while (rustInfoEvent == null && System.currentTimeMillis() < infoDeadline && !cancelled) {
+                val n =
+                    try {
+                        input.read(infoBuf)
+                    } catch (_: java.net.SocketTimeoutException) {
+                        continue
+                    } catch (error: IOException) {
+                        log("AIRPLAY: info 读断开 - ${error.message}")
+                        return "{\"op\":\"setupFail\"}"
+                    }
+                if (n < 0) return "{\"op\":\"setupFail\"}"
+                val ev = NativeBridge.nativeAirplayOnBytes(handle, infoBuf.copyOf(n)) ?: continue
+                drain()
+                if (ev.isNotEmpty() && org.json.JSONObject(ev).optString("type") == "info") {
+                    rustInfoEvent = org.json.JSONObject(ev)
+                    log("AIRPLAY: info deviceID=${rustInfoEvent?.optString("deviceID")}")
+                }
+            }
+            if (rustInfoEvent == null) {
+                log("AIRPLAY: ⚠ info 未取得（继续连接序——display 用默认值）")
+            }
+        }
+        // 自动链启动（ANNOUNCE 参数 = 宿主平台数据：本机地址/UUID/设备名/键 IV）
+        NativeBridge.nativeAirplaySetupAuto(handle, buildAnnounceParams(sock).toByteArray())
+        drain()
         val buf = ByteArray(16 * 1024)
         val deadline = System.currentTimeMillis() + 30_000
+        var controlJson: org.json.JSONObject? = null
         while (System.currentTimeMillis() < deadline && !cancelled) {
             val n =
                 try {
                     input.read(buf)
-                } catch (error: java.net.SocketTimeoutException) {
+                } catch (_: java.net.SocketTimeoutException) {
                     continue
                 } catch (error: IOException) {
-                    log("AIRPLAY: Rust 连接序读断开 - ${error.message}")
-                    return null
+                    log("AIRPLAY: 连接序读断开 - ${error.message}")
+                    return "{\"op\":\"setupFail\"}"
                 }
-            if (n < 0) return null
+            if (n < 0) return "{\"op\":\"setupFail\"}"
             val event = NativeBridge.nativeAirplayOnBytes(handle, buf.copyOf(n)) ?: continue
-            drainAndWrite()
+            drain()
             if (event.isEmpty()) continue
             val json = org.json.JSONObject(event)
             when (json.optString("type")) {
-                "controlSetup" -> {
-                    controlJson = json
-                    // fw: 流序 SETUP→ANNOUNCE（sdpsession 域）——恒建对 Main/Alt
-                    NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":100}".toByteArray())
-                    drainAndWrite()
-                }
-                "streamSetup" -> {
-                    streamIdx++
-                    if (streamIdx == 1) {
-                        NativeBridge.nativeAirplayStreamSetup(handle, "{\"streamType\":101}".toByteArray())
-                        drainAndWrite()
-                    } else {
-                        // 流 SETUP 齐 → ANNOUNCE（§10.41 SDP 体）
-                        NativeBridge.nativeAirplayAnnounce(handle, buildAnnounceParams(socket).toByteArray())
-                        drainAndWrite()
-                    }
-                }
-                "announced" -> {
-                    NativeBridge.nativeAirplayRecord(handle)
-                    drainAndWrite()
-                }
+                "controlSetup" -> controlJson = json
                 "recorded" -> {
-                    val root = rustInfoEvent
-                    val displays = root?.optJSONArray("displays")
-                    val display = displays?.optJSONObject(0)
-                    val cj = controlJson
-                    if (cj == null) {
+                    pendingSetupInfo = buildSetupInfo(controlJson)
+                    if (pendingSetupInfo == null) {
                         log("AIRPLAY: recorded 但缺 controlSetup 事件")
-                        return null
+                        return "{\"op\":\"setupFail\"}"
                     }
-                    val info =
-                        SetupInfo(
-                            eventPort = cj.optInt("eventPort"),
-                            timingPort = cj.optInt("timingPort"),
-                            keepAlivePort = cj.optInt("keepAlivePort").takeIf { it != 0 },
-                            enabledFeatures = emptyList(),
-                            displayWidth = (display?.optLong("widthPixels") ?: 1080L).toInt(),
-                            displayHeight = (display?.optLong("heightPixels") ?: 2320L).toInt(),
-                            displayUuid = display?.optString("uuid").orEmpty(),
-                            maxFps = (display?.optLong("maxFPS") ?: 30L).toInt(),
-                            hidDeviceUuids = emptyList(),
-                            hidDescriptors = emptyMap(),
-                            keepAliveSendStatsAsBody = false,
-                        )
                     log(
-                        "AIRPLAY: ✓ 连接序完成（Rust 全链）eventPort=${info.eventPort} " +
-                            "timingPort=${info.timingPort} 流=$streamIdx " +
-                            "display=${info.displayWidth}x${info.displayHeight}",
+                        "AIRPLAY: ✓ 连接序完成（Rust 自动链）eventPort=${pendingSetupInfo!!.eventPort} " +
+                            "timingPort=${pendingSetupInfo!!.timingPort} " +
+                            "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
                     )
-                    // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者——
-                    // Kotlin legacy request() 的写计数器与 Rust 分叉 → nonce
-                    // 错位 BAD_DECRYPT，真机 21:58/22:04 双实证）
-                    socket.soTimeout = 1_000
+                    // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者）
+                    sock.soTimeout = 1_000
                     startSessionPump(handle, input, output)
-                    return info
+                    return "{\"op\":\"setupOk\"}"
                 }
                 "error" -> {
-                    log("AIRPLAY: Rust 连接序错误 - ${json.optString("message")}")
-                    return null
+                    log("AIRPLAY: 连接序错误 - ${json.optString("message")}")
+                    return "{\"op\":\"setupFail\"}"
                 }
             }
         }
-        log("AIRPLAY: Rust 连接序超时（phase=stream$streamIdx）")
-        return null
+        log("AIRPLAY: 连接序超时")
+        return "{\"op\":\"setupFail\"}"
     }
 
-    /** 连接入口——纯 Rust 驱动（Kotlin 旧路径已删：连接逻辑唯一来源 = 固件）。 */
-    fun runSetup(): SetupInfo? {
-        // 计时端口：车机（媒体时钟主）轮询我方 UDP timing server（§10.39）
-        if (!timingServer.start()) {
-            log("AIRPLAY: 计时服务未启动（继续，但媒体时钟无法同步）")
-        }
-        val handle = controlSessionHandle
-        if (handle == 0L) {
-            log("AIRPLAY: 无 Rust 会话（配对未完成？）")
-            return null
-        }
-        return runSetupRust(handle)
+    /** SetupInfo 装配（controlSetup 端口域 + info displays——宿主数据面消费）。 */
+    private fun buildSetupInfo(controlJson: org.json.JSONObject?): SetupInfo? {
+        val cj = controlJson ?: return null
+        val root = rustInfoEvent
+        val displays = root?.optJSONArray("displays")
+        val display = displays?.optJSONObject(0)
+        return SetupInfo(
+            eventPort = cj.optInt("eventPort"),
+            timingPort = cj.optInt("timingPort"),
+            keepAlivePort = cj.optInt("keepAlivePort").takeIf { it != 0 },
+            enabledFeatures = emptyList(),
+            displayWidth = (display?.optLong("widthPixels") ?: 1080L).toInt(),
+            displayHeight = (display?.optLong("heightPixels") ?: 2320L).toInt(),
+            displayUuid = display?.optString("uuid").orEmpty(),
+            maxFps = (display?.optLong("maxFPS") ?: 30L).toInt(),
+            hidDeviceUuids = emptyList(),
+            hidDescriptors = emptyMap(),
+            keepAliveSendStatsAsBody = false,
+        )
     }
 
     /**
@@ -2678,43 +2668,33 @@ class AirPlayClient(
 
     /** RECORD：激活会话（接收端 onSessionActive）。路径用相对 `/`（catplay record() 同款）。 */
     fun record(): Boolean {
-        // §10.57：Rust 连接序已含 'rcrd'（recorded 事件 = 接收端已激活）——
-        // legacy record() 的写计数器与 Rust 分叉，直写会 BAD_DECRYPT 拆会话
-        // （真机 22:24:24 实证：视频帧已出、RECORD CSeq=2 即关）
-        if (sessionPumpHandle != 0L) {
-            log("AIRPLAY: RECORD 已由 Rust 连接序完成——跳过 legacy 重复声明")
-            return true
-        }
-        return recordLegacy()
+        // 音频流后加入会话的**再激活**（2026-10-17 奥迪定谳：缺这一步车机回
+        // 200 给 dataPort 但不真正播放）。连接序的首个 RECORD 已由 Rust 自动
+        // 链完成；此处经 Rust 泵补发（fw: RECORD 每流 SETUP 后重发，
+        // Stage2StartTransaction @0x2276cf53c 域）。未建泵（无会话）返回 false。
+        val h = sessionPumpHandle
+        if (h == 0L) return false
+        val ev = NativeBridge.nativeAirplayRecord(h)
+        drainRustOutbound(h, socket?.getOutputStream() ?: return false)
+        log("AIRPLAY: RECORD 补发（流后加入再激活）ev=$ev")
+        return true
     }
-
-    private fun recordLegacy(): Boolean =
-        try {
-            val (statusLine, _) =
-                request(
-                    "RECORD",
-                    "/",
-                    BinaryPlist.encode(linkedMapOf<String, Any?>()),
-                    contentType = "application/x-apple-binary-plist",
-                )
-            val ok = statusLine.contains("200")
-            log(if (ok) "AIRPLAY: ✓ RECORD 完成——会话已激活" else "AIRPLAY: RECORD 应答 [$statusLine]")
-            ok
-        } catch (error: IOException) {
-            log("AIRPLAY: RECORD 失败 - ${error.message}")
-            false
-        }
 
     /**
      * 连接事件通道（接收端在 SETUP 应答的 eventPort 上等我们）。
      *
-     * [sessionKey] 非 null 时用 Events 密钥加密（注意方向标签与直觉相反：接收端用
-     * Events-Read 读我们的数据）；**null = 未配对会话，通道全程明文**（catplay
-     * `EventsServer::unencrypted` 同款，pre-HomeKit 老车机只认这种）。
-     * 读取线程把明文按 RTSP 报文重组、解析 plist 命令（如 hidSendReport 触摸）并回调 [onCommand]。
+     * M5 迁移：解密/重组/命令解析/自动应答全在 Rust（fw::airplay::event_channel，
+     * 应答策略 fw: carEndpoint_handleEventCreatingReply @0x2276b8214——changeModes
+     * 200+status+params，空体曾致奥迪黑屏 ~5s 拆链）。
+     * [eventsWriteKey]/[eventsReadKey] 直接取 Rust Done 交付的 Events 双钥
+     * （fw: CreateEncryptionKeysForContext Events-Salt 族）；**null = 未配对
+     * 会话，通道全程明文**（catplay `EventsServer::unencrypted` 同款）。
+     * 读取线程把原始字节喂 nativeAirplayEventOnBytes，事件 JSON 分发：
+     * command → [onCommand]（hidSendReport 触摸等）、modesChanged → 模式状态镜像。
      */
     fun connectEventChannel(
-        sessionKey: ByteArray?,
+        eventsWriteKey: ByteArray?,
+        eventsReadKey: ByteArray?,
         setup: SetupInfo,
         onCommand: (Map<*, *>) -> Unit = {},
     ) {
@@ -2730,28 +2710,16 @@ class AirPlayClient(
             socket.soTimeout = 30_000
             // 事件通道同样是长连接：对端消失时要能自己发现（见 TcpLiveness 注释）。
             TcpLiveness.configure(socket, "事件通道", log)
-            log("EVENT: ✓ 已连接事件通道 $host:${setup.eventPort}（${if (sessionKey != null) "加密" else "明文"}）")
-            val cipher =
-                sessionKey?.let { secret ->
-                    val phoneWriteKey =
-                        AirPlayCrypto.hkdfSha512(
-                            secret,
-                            "Events-Salt".toByteArray(),
-                            "Events-Read-Encryption-Key".toByteArray(),
-                        )
-                    val phoneReadKey =
-                        AirPlayCrypto.hkdfSha512(
-                            secret,
-                            "Events-Salt".toByteArray(),
-                            "Events-Write-Encryption-Key".toByteArray(),
-                        )
-                    ControlCipher(phoneReadKey, phoneWriteKey)
-                }
-            registerEventCommandChannel(socket, cipher)
+            val wk = eventsWriteKey ?: ByteArray(0)
+            val rk = eventsReadKey ?: ByteArray(0)
+            val created = NativeBridge.nativeAirplayEventCreate(controlSessionHandle, wk, rk) == 1
+            log(
+                "EVENT: ✓ 已连接事件通道 $host:${setup.eventPort}" +
+                    "（${if (wk.size == 32) "加密(Rust)" else "明文"} created=$created）",
+            )
+            registerEventCommandChannel(socket)
             Thread({
                 val input = socket.getInputStream()
-                val accumulator = RtspAccumulator()
-                var pending = ByteArray(0)
                 val buffer = ByteArray(8192)
                 try {
                     while (true) {
@@ -2767,90 +2735,37 @@ class AirPlayClient(
                             log("EVENT: 通道关闭（EOF）")
                             break
                         }
-                        pending += buffer.copyOf(count)
-                        val plain =
-                            if (cipher == null) {
-                                val all = pending
-                                pending = ByteArray(0)
-                                all
-                            } else {
-                                val decrypted = cipher.decrypt(pending)
-                                pending = decrypted.rest
-                                decrypted.data
-                            }
-                        var eventOtherLogged = 0
-                        for (message in accumulator.offer(plain)) {
-                            val firstLine = message.firstLine
-                            // (a) 状态行（"RTSP/1.0 200 OK" 等）= 车机对**我们命令**的应答：
-                            //     静默跳过——不回、不记录（回应答会触发乒乓回声，见 respondEventRequest）
-                            if (firstLine.startsWith("RTSP/") || firstLine.startsWith("HTTP/")) continue
-                            // (b) 请求判定：方法 token + "/"-开头路径。畸形行（如 "OK 200 OK"：
-                            //     第 2 token 是数字）判为非请求 → 静默丢弃，不回不记
-                            val tokens = firstLine.split(" ")
-                            val isRequest = tokens.size >= 2 && tokens[1].startsWith("/")
-                            if (!isRequest) continue
-                            // 车机请求：非 /command 立即回空 200；/command **先解析后应答**——
-                            // changeModes 的 200 必须带 status+params 体（空体曾让奥迪黑屏后
-                            // ~5s 拆链，AADisplay CarPlayEventChannel.kt:169 原话；2026-10-24
-                            // 8015 置灰案的放大器）。
-                            val cseq = CSEQ_REGEX.find(message.head)?.groupValues?.get(1)
-                            if (!firstLine.contains("/command")) {
-                                respondEventRequest(cseq)
-                                unknownEventRequests++
-                                if (unknownEventRequests <= 10) {
-                                    log("EVENT: 未知请求 [$firstLine] body=${message.body.size}B")
+                        // 原始字节 → Rust 泵（解密+RTSP 重组+plist 解析+自动应答）→ 事件 JSON
+                        val eventsJson =
+                            NativeBridge.nativeAirplayEventOnBytes(controlSessionHandle, buffer.copyOf(count))
+                        pumpEventOutbound()
+                        if (eventsJson.isNullOrEmpty() || eventsJson == "[]") continue
+                        val arr = org.json.JSONArray(eventsJson)
+                        for (i in 0 until arr.length()) {
+                            val ev = arr.optJSONObject(i) ?: continue
+                            when (ev.optString("type")) {
+                                "modesChanged" -> {
+                                    // 车机 changeModes：状态镜像 + 归还窗口回调
+                                    // （200+status+params 应答已由 Rust 自动排入出站）
+                                    val restored =
+                                        onCarModesEvent(ev.optJSONObject("params")?.let { jsonToCommandMap(it) })
+                                    if (restored) onModesRestored?.invoke()
                                 }
-                                continue
-                            }
-                            var commandError: String? = null
-                            val parsed =
-                                try {
-                                    val result = BinaryPlist.parseRecovered(message.body)
-                                    result.note?.let { note ->
-                                        log("EVENT: /command 容错解析成功——$note")
+                                "command" -> {
+                                    val body = ev.optJSONObject("body") ?: continue
+                                    try {
+                                        onCommand(jsonToCommandMap(body))
+                                    } catch (error: Exception) {
+                                        log("EVENT: 命令处理异常 - ${error.message}")
                                     }
-                                    result.value
-                                } catch (error: Throwable) {
-                                    // 不能只 catch IllegalArgumentException：越界/长度异常若逃出
-                                    // 这里会直接打死事件读线程，车机会把整个会话拆掉。
-                                    commandError = "${error.javaClass.simpleName}: ${error.message}"
-                                    null
                                 }
-                            val command = parsed as? Map<*, *>
-                            if (command == null) {
-                                respondEventRequest(cseq)
-                                // 车机每秒都会 POST 一条解不出来的 /command——按「体型指纹」
-                                // 去重，每种体型留一次全文（原因 + 报文头 + 完整 hex），其余只计数。
-                                badEventCommands++
-                                val signature =
-                                    message.body.size.toString() + ":" + hexPrefix(message.body, 8)
-                                if (badEventSignatures.add(signature) && badEventSignatures.size <= 4) {
-                                    log(
-                                        "EVENT: 命令无法识别 [$firstLine] body=${message.body.size}B " +
-                                            "原因=" + (commandError ?: "解析结果=${parsed?.javaClass?.simpleName}"),
-                                    )
-                                    log(
-                                        "EVENT: 命令报文头=" +
-                                            message.head.replace("\r\n", " | ").take(300),
-                                    )
-                                    log("EVENT: 命令报文体（${message.body.size}B）hex=" + hexDump(message.body))
+                                "reply" -> {
+                                    // 车机对我方命令的应答：不回、不记录（回应答触发乒乓回声）
                                 }
-                                if (badEventCommands % 120 == 0) {
-                                    log("EVENT: 累计 $badEventCommands 条 /command 解析失败（已静默，仅计数）")
-                                }
-                                continue
-                            }
-                            if (command["type"] == "changeModes") {
-                                val restored = onCarModesEvent(command["params"] as? Map<*, *>)
-                                respondEventRequest(cseq, modesResponseBody())
-                                if (restored) onModesRestored?.invoke()
-                            } else {
-                                respondEventRequest(cseq)
-                            }
-                            try {
-                                onCommand(command)
-                            } catch (error: Exception) {
-                                log("EVENT: 命令处理异常 - ${error.message}")
+                                "error" ->
+                                    // fw: NSTCP verify failed 即断（Rust 已摘除通道）——
+                                    // 事件通道死 = 整条会话将拆，走 IOException 拆链路径
+                                    throw IOException("rust 通道错误: ${ev.optString("message")}")
                             }
                         }
                     }
@@ -2870,38 +2785,33 @@ class AirPlayClient(
         }
     }
 
-    /** 流式 RTSP 报文重组器：喂入任意分片明文，弹出完整消息（首行 + body）。 */
-    private class RtspAccumulator {
-        /** 完整报文：首行（分类用）、头部全文（提取 CSeq）、body。 */
-        class Message(
-            val firstLine: String,
-            val head: String,
-            val body: ByteArray,
-        )
-
-        private var buffer = ByteArray(0)
-
-        fun offer(bytes: ByteArray): List<Message> {
-            if (bytes.isEmpty()) return emptyList()
-            buffer += bytes
-            val messages = ArrayList<Message>()
-            while (true) {
-                val index = indexOf(buffer, HEAD_SEPARATOR)
-                if (index < 0) break
-                val headText = String(buffer, 0, index, Charsets.ISO_8859_1)
-                val (firstLine, contentLength) = parseRtspHead(headText)
-                val bodyStart = index + HEAD_SEPARATOR.size
-                if (buffer.size - bodyStart < contentLength) break
-                messages +=
-                    Message(
-                        firstLine,
-                        headText,
-                        buffer.copyOfRange(bodyStart, bodyStart + contentLength),
-                    )
-                buffer = buffer.copyOfRange(bodyStart + contentLength, buffer.size)
+    /**
+     * Rust 事件 JSON → 命令字典（递归）。非空且全为 0..255 整数的数组还原为
+     * ByteArray（plist Data 双射——与 Rust plist_to_json 的 Data→整数数组输出
+     * 对应；消费方 SessionController 的 hidSendReport.hidReport 按 ByteArray 取）。
+     */
+    private fun jsonToCommandMap(body: org.json.JSONObject): Map<String, Any?> {
+        fun conv(v: Any?): Any? =
+            when (v) {
+                is org.json.JSONObject -> {
+                    val m = linkedMapOf<String, Any?>()
+                    v.keys().forEach { key -> m[key] = conv(v.opt(key)) }
+                    m
+                }
+                is org.json.JSONArray -> {
+                    val items = (0 until v.length()).map { conv(v.opt(it)) }
+                    val allBytes =
+                        items.isNotEmpty() &&
+                            items.all { (it is Int && it in 0..255) || (it is Long && it in 0..255) }
+                    if (allBytes) {
+                        items.map { (it as Number).toInt().toByte() }.toByteArray()
+                    } else {
+                        items
+                    }
+                }
+                else -> v
             }
-            return messages
-        }
+        return conv(body) as? Map<String, Any?> ?: linkedMapOf()
     }
 
     /**
@@ -3513,6 +3423,10 @@ data class ControlKeys(
     val phoneWriteKey: ByteArray,
     val phoneReadKey: ByteArray,
     val sharedSecret: ByteArray,
+    /** Events 双钥（fw: CreateEncryptionKeysForContext Events-Salt 族，Rust Done 交付）——
+     *  事件通道加密态直用，Kotlin 不再本地 HKDF（M5：事件通道加解密全 Rust）。 */
+    val eventsWriteKey: ByteArray = ByteArray(0),
+    val eventsReadKey: ByteArray = ByteArray(0),
 )
 
 /**

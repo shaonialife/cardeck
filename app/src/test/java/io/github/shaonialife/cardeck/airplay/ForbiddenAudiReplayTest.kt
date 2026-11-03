@@ -121,17 +121,16 @@ class ForbiddenAudiReplayTest {
                 ipAddresses = listOf("127.0.0.1"),
             )
         val client = AirPlayClient(endpoint, log = { println("AIRPLAY-TEST: $it") }, context = null)
-        val keys =
+        val setup =
             try {
-                client.runPairing(windowMillis = 12_000)
+                client.runFlow(windowMs = 12_000, noPairingHint = false)
             } finally {
                 runCatching { server.close() }
                 runCatching { acceptor.join(1_000) }
             }
 
-        assertNull("403 窗口内不可能建立密钥", keys)
+        assertNull("403 窗口内不可能建立会话", setup)
         assertTrue("verify/认证段的 403 也必须置位 pairingForbidden", client.pairingForbidden)
-        assertTrue(client.attemptedPairing)
 
         val stamps =
             synchronized(lock) { requestAtNs.sorted() }.map { it / 1_000_000 }

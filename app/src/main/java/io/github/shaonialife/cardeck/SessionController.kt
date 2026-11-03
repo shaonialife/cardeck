@@ -6,7 +6,6 @@ import android.net.Network
 import android.os.SystemClock
 import android.view.KeyEvent
 import io.github.shaonialife.cardeck.airplay.AirPlayClient
-import io.github.shaonialife.cardeck.airplay.ControlKeys
 import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioProfileMemory
 import io.github.shaonialife.cardeck.audio.AudioSender
@@ -107,18 +106,11 @@ object SessionController {
     /** 端点不完整时等 mDNS 缓存命中：绑网时已开始发现，通常几百毫秒内命中。 */
     private const val ENDPOINT_RESOLVE_WAIT_MS = 3_000L
 
-    /**
-     * 明文 SETUP 被拒后「加密升级」补配对的上限（catplay handle_setup_result 路径）。
-     * 只在实际被拒时才走到这里，正常车机零成本；不支持配对的接收端会在
-     * pair-setup 收到 404/405/455 后立刻放弃，不会等满这个窗口。
-     */
-    private const val PAIRING_UPGRADE_WINDOW_MS = 30_000L
-
-    /**
-     * 明文会话初始 SETUP 的重试窗口。pre-HomeKit 车机的 AirPlay 端口常在
-     * 「用户点车机上的手机图标」后才开放；端口晚开 1~2 秒不该让整轮失败。
-     */
-    private const val INITIAL_SETUP_WINDOW_MS = 30_000L
+    /** 连接编排窗口（fw: 决策在 fw::airplay::flow；窗口 = 车机 AirPlay 窗口
+     *  「用户点车机图标/收到 ctrl 邀请才开」的等待上界，宿主连接策略层。
+     *  决策机内部自带各阶段退避节奏：403→5s / 其余→0.5s / 明文 SETUP→2s）。
+     *  加密升级等分支由决策机管理，此处不再单设子窗口。 */
+    private const val CONNECTION_WINDOW_MS = 120_000L
 
     /**
      * 端点已到但手机还没切到车机热点时的等待上限。
@@ -2374,45 +2366,6 @@ object SessionController {
             advertisedFeatures = late.advertisedFeatures ?: fallback.advertisedFeatures,
         )
 
-    /**
-     * 初始 SETUP（带重连重试）。
-     *
-     * 已配对路径：配对循环刚连通过，SETUP 一次即可（失败就是真失败，交给降级/收尾）。
-     * 明文会话路径：车机的 AirPlay 端口可能要到「用户点车机图标」后才开，
-     * catplay 同样是「收到邀请才连」；这里在 [INITIAL_SETUP_WINDOW_MS] 内每 2s
-     * 重连一次并重试 SETUP，避免端口晚开 1~2 秒就整轮失败。
-     */
-    private fun runInitialSetup(
-        client: AirPlayClient,
-        plainSession: Boolean,
-        noPairing: Boolean,
-    ): AirPlayClient.SetupInfo? {
-        val first = client.runSetup()
-        if (first != null || !plainSession) return first
-        val deadline = android.os.SystemClock.uptimeMillis() + INITIAL_SETUP_WINDOW_MS
-        var attempt = 1
-        while (android.os.SystemClock.uptimeMillis() < deadline && !connectCancelled) {
-            attempt++
-            appendLog("AIRPLAY: 明文 SETUP 第 ${attempt - 1} 次未通过——2s 后重连重试（车机 AirPlay 端口可能尚未开放）")
-            try {
-                Thread.sleep(2_000)
-            } catch (_: InterruptedException) {
-                return null
-            }
-            if (connectCancelled) return null
-            client.close()
-            if (!client.reconnect(2_000)) continue
-            val retried = client.runSetup()
-            if (retried != null) {
-                appendLog("AIRPLAY: ✓ 明文 SETUP 在第 $attempt 次尝试成功")
-                return retried
-            }
-            // 端口开了但 SETUP 仍被拒：TXT 判断可能错了，交给调用方的加密升级路径
-            if (!noPairing) return null
-        }
-        return null
-    }
-
     /** BT 会话交接点：拿到 0x5703/0x4301 后两条路径流程一致——绑 WiFi → AirPlay 配对 → SETUP → 推流。 */
     private fun onCarPlayEndpoint(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
@@ -2626,521 +2579,443 @@ object SessionController {
                     // 会话静默降噪（2026-10-10）：从交接点起暂停其它接收端的出站连接探测
                     // （典型：连着 DiPlay 测试台时不再噪音式探测 Audi）。会话结束/断开时解除。
                     BtSessionGate.sessionActive = true
-                    // 第一阶段：保持 BT 在位直接配对 + SETUP（协议上正确的形态）
-                    phaseHint = "AirPlay 配对中…"
-                    var client = newClient()
+                    // 连接编排 = Rust fw::airplay::flow 决策机（固件骨架
+                    // ensureConnectedInternal @0x22775f8a0 + Stage1StartTransaction
+                    // @0x2276ce288）。配对路径/明文降级/加密升级/403 退避/放弃
+                    // 全部决策在 Rust，本处只泵（连接窗口 120s——车机 AirPlay
+                    // 窗口「用户点车机图标/收到 ctrl 邀请才开」的等待上界）。
+                    phaseHint = "AirPlay 连接中…"
+                    val client = newClient()
                     currentClient = client
                     drainPendingEndpoint(client)
                     // pre-HomeKit 老车机（CarPlay 210.81 时代，奥迪 4xxx 固件）在
-                    // `_airplay._tcp` 里**不声明** HK_PAIRING_AND_ENCRYPT：它们只接受
-                    // 明文 SETUP（et=NONE）+ AES-CTR 屏幕流，走 pair-setup 必然失败。
-                    // catplay 的接收端分类 1 即此形态；旧实现会在这里空转 120s 配对窗口，
-                    // 用户看到的就是「连不上」。
-                    val noPairing =
+                    // `_airplay._tcp` 里**不声明** HK_PAIRING_AND_ENCRYPT——决策机
+                    // 据此跳过注定失败的 pair-setup（兼容层初值；判错由明文 SETUP
+                    // 被拒后的加密升级路径兜底，决策在 flow.rs）。
+                    val noPairingHint =
                         AirPlayFeatures.supportsPairing(client.currentEndpoint.advertisedFeatures) == false
-                    var keys: ControlKeys? =
-                        if (noPairing) {
-                            client.skipPairing("TXT features 未声明 HK_PAIRING_AND_ENCRYPT")
-                            client.reconnect()
-                            null
-                        } else {
-                            client.runPairing()
-                        }
+                    val setup = client.runFlow(CONNECTION_WINDOW_MS, noPairingHint)
                     if (connectCancelled) {
                         retireSession()
-                        appendLog("AIRPLAY: 用户已取消——中止配对")
+                        appendLog("AIRPLAY: 用户已取消——中止连接")
                         sessionStarting.set(false)
                         return@run
                     }
-                    // 配对失败后的兜底路径（纯函数决策，真机抓包场景由 PairingFallbackTest 钉死）
-                    val fallbackAfterFirstRound =
-                        pairingFallback(
-                            keysEstablished = keys != null,
-                            noPairing = noPairing,
-                            pairSetupRejected = client.pairSetupRejected,
-                            pairingForbidden = client.pairingForbidden,
-                            attemptedPairing = client.attemptedPairing,
-                            pairingUnsupported = client.pairingUnsupported,
-                        )
-                    if (fallbackAfterFirstRound.useBtRetireHack) {
-                        // 第二阶段（仅测试台 DiPlay）：复现「BT 控制已结束」状态再试一次。
-                        // 真车（Audi）绝不能断 BT——真无线 CarPlay 的 BT 控制通道全程保活，
-                        // 断开会让车机拆掉整轮 AirPlay 窗口（实车实测）。
-                        // pairingForbidden（任意段 403，含 verify/认证段——2026-10-21 真机
-                        // sysdiagnose 定谳：首连被 403 是车机固有状态，它 18~20s 后自动
-                        // 重邀、第二次即成）时同样禁用：断 BT 会让车机整栈重建、恰好错过
-                        // 即将到来的重邀窗口。
-                        // 门槛：仅当本轮真的连上过接收端 RTSP（attemptedPairing）才用此 hack；
-                        // 端点未解析（无 IP）/端口未开时绝不值得断 BT（2026-10-11 踩过：
-                        // mDNS 失败也触发 detach，白白拆掉车机窗口）。
-                        detachActiveBtSessions()
-                        client = newClient()
-                        currentClient = client
-                        drainPendingEndpoint(client)
-                        keys = client.runPairing()
-                        if (connectCancelled) {
-                            retireSession()
-                            appendLog("AIRPLAY: 用户已取消——中止配对")
-                            sessionStarting.set(false)
-                            return@run
-                        }
-                    }
-                    // keys == null 时仍有合法路径：**catplay 的 et=NONE 明文会话**。
-                    //  - 接收端明确不支持配对（pre-HomeKit / TXT 无 HK_PAIRING_AND_ENCRYPT）；
-                    //  - 配对彻底失败但 RTSP 确实连上过（有些车只认明文会话，
-                    //    pair-setup/pair-verify 全拒——catplay 正是「先试明文、失败才配对」，
-                    //    我们反过来：优先配对（保住 DiPlay/已知车机），失败后降级明文兜底）。
-                    //  - **403 证据（pairingForbidden）除外**（真机抓包 2026-10-21 定谳，决策
-                    //    见 pairingFallback）：车机在等自身就绪、~20s 后重邀即成——明文必被
-                    //    拒且消耗重邀窗口，不降级。
-                    // hack 段可能已重跑拿到 keys：决策以重跑后的状态为准。
-                    val plainSession =
-                        pairingFallback(
-                            keysEstablished = keys != null,
-                            noPairing = noPairing,
-                            pairSetupRejected = client.pairSetupRejected,
-                            pairingForbidden = client.pairingForbidden,
-                            attemptedPairing = client.attemptedPairing,
-                            pairingUnsupported = client.pairingUnsupported,
-                        ).usePlainSession
-                    if (plainSession) {
-                        phaseHint = "建立明文会话…"
-                        appendLog(
-                            "AIRPLAY: 配对不可用（${if (client.pairingUnsupported) "接收端不支持" else "配对失败"}）" +
-                                "——改用 et=NONE 明文会话 + AES-CTR 屏幕流（catplay 接收端分类 1/2）",
-                        )
-                        // 配对循环结束时 socket 已关/状态机不可用：SETUP 前必须重连一次。
-                        // 失败不直接判死：车机 AirPlay 端口可能还没开，下面会按窗口重试。
-                        if (!client.reconnect()) {
-                            appendLog("AIRPLAY: 明文会话首次重连未成功——继续按窗口重试 SETUP")
-                        }
-                    }
-                    // keys 是 lambda 内的可变捕获变量：Kotlin 无法智能转换，先固化成不可变值。
-                    val pairedKeys = keys
-                    if (pairedKeys != null || plainSession) {
-                        phaseHint = if (pairedKeys != null) "配对完成，建立 CarPlay 会话…" else "建立明文会话…"
+                    val pairedKeys = client.lastKeys
+                    if (setup != null) {
+                        phaseHint = "建立 CarPlay 会话…"
                         if (pairedKeys != null) {
                             appendLog(
-                                "AIRPLAY: ✓ 配对完成 writeKey=" +
-                                    pairedKeys.phoneWriteKey.joinToString("") { "%02x".format(it) }.take(16) + "… " +
-                                    "readKey=" + pairedKeys.phoneReadKey.joinToString("") { "%02x".format(it) }.take(16) + "…",
+                                "AIRPLAY: ✓ 配对完成（flow 决策机）writeKey=" +
+                                    pairedKeys.phoneWriteKey.joinToString("") { "%02x".format(it) }.take(16) + "…",
                             )
+                        } else {
+                            appendLog("AIRPLAY: 明文会话建立（et=NONE + AES-CTR 屏幕流）")
                         }
-                        // 已配对 → 共享密钥；明文会话 → null（流加密降级为 AES-CTR 零密钥）
-                        var sessionKey = pairedKeys?.sharedSecret
-                        var setup = runInitialSetup(client, plainSession, noPairing)
-                        if (setup == null && plainSession && noPairing) {
-                            // catplay 的「加密升级」路径：只有在**我们主动跳过配对**（TXT 未声明
-                            // HK_PAIRING_AND_ENCRYPT）且明文 SETUP 仍失败时才补做。
-                            // 反过来（配对先试过且失败）再试一次没有意义，只会多等 30s。
-                            val upgraded = client.retryWithPairing(PAIRING_UPGRADE_WINDOW_MS)
-                            if (upgraded != null) {
-                                sessionKey = upgraded.sharedSecret
-                                setup = client.runSetup()
-                            }
-                        }
-                        if (setup != null) {
-                            // 记录会话凭据：投影授权晚于连接时用于动态补启音频。
-                            // 用 client.currentEndpoint 而非 effectiveEndpoint：配对期间
-                            // mDNS 刷新过端点时，真正连上的是 client 里的地址（2026-10-18：
-                            // 0x4301 的定长 IP 字段带 NUL，mDNS 给的是干净地址，取旧值
-                            // 会让视频端口/keepAlive 用脏地址 → 一律解析失败）。
-                            currentSharedSecret = sessionKey
-                            currentAudioHost =
-                                client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
-                            client.connectEventChannel(sessionKey, setup) { command ->
-                                when (command["type"]) {
-                                    "hidSendReport" -> {
-                                        val uuid = command["uuid"]?.toString()
-                                        val report = command["hidReport"] as? ByteArray
-                                        // 车机媒体键（Consumer Control）走 hidSendReport 通路，
-                                        // 判定**以设备描述符为准**（不按 uuid、不按车机型号写死）：
-                                        // 描述符声明了 Consumer 页(0x0C)的设备才当媒体键，报告字节是
-                                        // Usage 数组下标（HID Array 语义）。触摸/旋钮/电话设备的描述符
-                                        // 分别是 Digitizer/GenericDesktop/Telephony 页，一律不走这里——
-                                        // DiPlay 的 knob(4B) 与 telephony(1B) 报告长度与媒体键重叠，
-                                        // 只靠长度会误判（如 telephony usage 0xB3 会误发「快进」）。
-                                        val descriptor = uuid?.let { setup.hidDescriptors[it] }
-                                        val keyMap =
-                                            descriptor?.let(ConsumerKeys::parseDescriptor)
-                                        val rawValue =
-                                            report
-                                                ?.takeIf { it.isNotEmpty() }
-                                                ?.let { it[0].toInt() and 0xFF }
-                                        val consumerUsage =
-                                            when {
-                                                // 有描述符：只有 Consumer 设备才解析（非 Consumer → null）
-                                                descriptor != null -> keyMap?.let { rawValue?.let(it::usageFor) }
-                                                // 描述符缺失（未知车机）：保守回退——仅 1 字节报告，
-                                                // 值当 Usage ID 直读
-                                                report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
-                                                else -> null
-                                            }
-                                        // 旋钮/四向拨杆（Generic Desktop 页的 Wheel/Hat）：
-                                        // 不是 Consumer 设备才走这里；输出 DPAD_* 注入虚拟屏。
-                                        val navKeys =
-                                            if (consumerUsage == null && report != null) {
-                                                if (HidNavigation.rawLogEnabled) {
-                                                    appendLog(
-                                                        "HID-RAW: uuid=$uuid bytes=" +
-                                                            report.joinToString(" ") { "%02X".format(it) } +
-                                                            " desc=${descriptor?.size ?: 0}B",
-                                                    )
-                                                }
-                                                HidNavigation.handle(uuid.orEmpty(), descriptor, report)
-                                            } else {
-                                                emptyList()
-                                            }
-                                        val contacts =
-                                            if (consumerUsage == null && navKeys.isEmpty() && report != null) {
-                                                // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
-                                                // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
-                                                val touchFormat =
-                                                    descriptor?.let(TouchReports::formatFromDescriptor)
-                                                TouchReports.parse(report, touchFormat)
-                                            } else {
-                                                null
-                                            }
-                                        if (navKeys.isNotEmpty()) {
-                                            navKeys.forEach(::injectNavigationKey)
-                                            appendLog(
-                                                "EVENT: 旋钮/导航键 " +
-                                                    navKeys.joinToString("+") { HidNavigation.nameOf(it) } +
-                                                    "（uuid=$uuid）",
-                                            )
-                                        } else if (consumerUsage != null) {
-                                            val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
-                                            if (keyCode != 0) {
-                                                dispatchMediaKey(keyCode)
-                                                appendLog(
-                                                    "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                        "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
-                                                            .format(consumerUsage),
-                                                )
-                                            } else {
-                                                appendLog(
-                                                    "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                        "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
-                                                            .format(consumerUsage),
-                                                )
-                                            }
-                                        } else if (keyMap != null && report != null) {
-                                            // Consumer 设备的「无按键」/释放报文（值为 0 或下标越界）：
-                                            // 静默计数，避免释放事件刷屏
-                                            consumerReleaseCount++
-                                        } else if (contacts != null) {
-                                            if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
-                                                appendLog(
-                                                    "EVENT: 触摸 " +
-                                                        contacts.joinToString {
-                                                            "#${it.slot}(${it.xPixels},${it.yPixels})${if (it.down) "↓" else "↑"}"
-                                                        },
-                                                )
-                                            }
-                                            touchLogCount++
-                                            contacts.forEach {
-                                                TouchRouter.onContact(
-                                                    context.applicationContext,
-                                                    it,
-                                                )
-                                            }
-                                        } else if (report != null) {
-                                            appendLog(
-                                                "EVENT: 其他 HID 报告 uuid=$uuid bytes=${report.size}" +
-                                                    " hex=${report.joinToString(" ") { "%02x".format(it) }}",
-                                            )
+                        // 已配对 → 共享密钥 + Events 双钥；明文会话 → null（流加密降级为 AES-CTR）
+                        val sessionKey = pairedKeys?.sharedSecret
+                        val eventsWrite = pairedKeys?.eventsWriteKey
+                        val eventsRead = pairedKeys?.eventsReadKey
+                        // 记录会话凭据：投影授权晚于连接时用于动态补启音频。
+                        // 用 client.currentEndpoint 而非 effectiveEndpoint：配对期间
+                        // mDNS 刷新过端点时，真正连上的是 client 里的地址（2026-10-18：
+                        // 0x4301 的定长 IP 字段带 NUL，mDNS 给的是干净地址，取旧值
+                        // 会让视频端口/keepAlive 用脏地址 → 一律解析失败）。
+                        currentSharedSecret = sessionKey
+                        currentAudioHost =
+                            client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
+                        client.connectEventChannel(eventsWrite, eventsRead, setup) { command ->
+                            when (command["type"]) {
+                                "hidSendReport" -> {
+                                    val uuid = command["uuid"]?.toString()
+                                    val report = command["hidReport"] as? ByteArray
+                                    // 车机媒体键（Consumer Control）走 hidSendReport 通路，
+                                    // 判定**以设备描述符为准**（不按 uuid、不按车机型号写死）：
+                                    // 描述符声明了 Consumer 页(0x0C)的设备才当媒体键，报告字节是
+                                    // Usage 数组下标（HID Array 语义）。触摸/旋钮/电话设备的描述符
+                                    // 分别是 Digitizer/GenericDesktop/Telephony 页，一律不走这里——
+                                    // DiPlay 的 knob(4B) 与 telephony(1B) 报告长度与媒体键重叠，
+                                    // 只靠长度会误判（如 telephony usage 0xB3 会误发「快进」）。
+                                    val descriptor = uuid?.let { setup.hidDescriptors[it] }
+                                    val keyMap =
+                                        descriptor?.let(ConsumerKeys::parseDescriptor)
+                                    val rawValue =
+                                        report
+                                            ?.takeIf { it.isNotEmpty() }
+                                            ?.let { it[0].toInt() and 0xFF }
+                                    val consumerUsage =
+                                        when {
+                                            // 有描述符：只有 Consumer 设备才解析（非 Consumer → null）
+                                            descriptor != null -> keyMap?.let { rawValue?.let(it::usageFor) }
+                                            // 描述符缺失（未知车机）：保守回退——仅 1 字节报告，
+                                            // 值当 Usage ID 直读
+                                            report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
+                                            else -> null
                                         }
-                                    }
-
-                                    "iAPSendMessage" -> {
-                                        // 事件通道上的 iAP2 虚拟链路字节（车机先发 marker 开场）。
-                                        // 喂给链路引擎：握手 → EA 会话 → 触摸 HID。
-                                        val params = command["params"] as? Map<*, *>
-                                        val data = params?.get("data") as? ByteArray
-                                        if (data == null) {
-                                            appendLog("EVENT: iAPSendMessage 无 data（params=$params）")
+                                    // 旋钮/四向拨杆（Generic Desktop 页的 Wheel/Hat）：
+                                    // 不是 Consumer 设备才走这里；输出 DPAD_* 注入虚拟屏。
+                                    val navKeys =
+                                        if (consumerUsage == null && report != null) {
+                                            if (HidNavigation.rawLogEnabled) {
+                                                appendLog(
+                                                    "HID-RAW: uuid=$uuid bytes=" +
+                                                        report.joinToString(" ") { "%02X".format(it) } +
+                                                        " desc=${descriptor?.size ?: 0}B",
+                                                )
+                                            }
+                                            HidNavigation.handle(uuid.orEmpty(), descriptor, report)
                                         } else {
-                                            iapEventMessageCount++
-                                            client.onIapEventBytes(data)
+                                            emptyList()
                                         }
-                                    }
-
-                                    "forceKeyFrame" -> {
-                                        // 车机解不出画面时会要 I 帧。必须立即响应：
-                                        // 拖到下一个周期 I 帧（1s）车机可能一直卡在等帧状态。
-                                        val forced = videoSender?.requestKeyFrame() == true
+                                    val contacts =
+                                        if (consumerUsage == null && navKeys.isEmpty() && report != null) {
+                                            // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
+                                            // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
+                                            val touchFormat =
+                                                descriptor?.let(TouchReports::formatFromDescriptor)
+                                            TouchReports.parse(report, touchFormat)
+                                        } else {
+                                            null
+                                        }
+                                    if (navKeys.isNotEmpty()) {
+                                        navKeys.forEach(::injectNavigationKey)
                                         appendLog(
-                                            "EVENT: 车机请求关键帧（forceKeyFrame）→ " +
-                                                if (forced) "已强制编码 I 帧" else "编码器未就绪，等周期 I 帧",
+                                            "EVENT: 旋钮/导航键 " +
+                                                navKeys.joinToString("+") { HidNavigation.nameOf(it) } +
+                                                "（uuid=$uuid）",
+                                        )
+                                    } else if (consumerUsage != null) {
+                                        val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
+                                        if (keyCode != 0) {
+                                            dispatchMediaKey(keyCode)
+                                            appendLog(
+                                                "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
+                                                    "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
+                                                        .format(consumerUsage),
+                                            )
+                                        } else {
+                                            appendLog(
+                                                "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
+                                                    "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
+                                                        .format(consumerUsage),
+                                            )
+                                        }
+                                    } else if (keyMap != null && report != null) {
+                                        // Consumer 设备的「无按键」/释放报文（值为 0 或下标越界）：
+                                        // 静默计数，避免释放事件刷屏
+                                        consumerReleaseCount++
+                                    } else if (contacts != null) {
+                                        if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
+                                            appendLog(
+                                                "EVENT: 触摸 " +
+                                                    contacts.joinToString {
+                                                        "#${it.slot}(${it.xPixels},${it.yPixels})${if (it.down) "↓" else "↑"}"
+                                                    },
+                                            )
+                                        }
+                                        touchLogCount++
+                                        contacts.forEach {
+                                            TouchRouter.onContact(
+                                                context.applicationContext,
+                                                it,
+                                            )
+                                        }
+                                    } else if (report != null) {
+                                        appendLog(
+                                            "EVENT: 其他 HID 报告 uuid=$uuid bytes=${report.size}" +
+                                                " hex=${report.joinToString(" ") { "%02x".format(it) }}",
                                         )
                                     }
-
-                                    "changeModes" -> {
-                                        // 车机请求资源仲裁：状态更新与带 status+params 的 200 应答
-                                        // 已在 AirPlayClient 事件循环完成（空 200 曾让奥迪黑屏拆链）；
-                                        // 归还类事件（UNBORROW/UNTAKE）的补发由 onModesRestored 驱动。
-                                    }
-
-                                    else ->
-                                        appendLog(
-                                            // 未识别的命令必须带参数：车机的私有命令（如 requestUI）
-                                            // 到底要什么，全在 params 里——只打 type 等于没打。
-                                            "EVENT: 命令 type=${command["type"]} " +
-                                                command.entries
-                                                    .filter { it.key?.toString() != "type" }
-                                                    .joinToString(" ") { (key, value) ->
-                                                        "$key=" +
-                                                            when (value) {
-                                                                is ByteArray -> value.joinToString("") { "%02x".format(it) }
-                                                                else -> value.toString().take(240)
-                                                            }
-                                                    }.take(600),
-                                        )
                                 }
+
+                                "iAPSendMessage" -> {
+                                    // 事件通道上的 iAP2 虚拟链路字节（车机先发 marker 开场）。
+                                    // 喂给链路引擎：握手 → EA 会话 → 触摸 HID。
+                                    val params = command["params"] as? Map<*, *>
+                                    val data = params?.get("data") as? ByteArray
+                                    if (data == null) {
+                                        appendLog("EVENT: iAPSendMessage 无 data（params=$params）")
+                                    } else {
+                                        iapEventMessageCount++
+                                        client.onIapEventBytes(data)
+                                    }
+                                }
+
+                                "forceKeyFrame" -> {
+                                    // 车机解不出画面时会要 I 帧。必须立即响应：
+                                    // 拖到下一个周期 I 帧（1s）车机可能一直卡在等帧状态。
+                                    val forced = videoSender?.requestKeyFrame() == true
+                                    appendLog(
+                                        "EVENT: 车机请求关键帧（forceKeyFrame）→ " +
+                                            if (forced) "已强制编码 I 帧" else "编码器未就绪，等周期 I 帧",
+                                    )
+                                }
+
+                                "changeModes" -> {
+                                    // 车机请求资源仲裁：状态更新与带 status+params 的 200 应答
+                                    // 已在 AirPlayClient 事件循环完成（空 200 曾让奥迪黑屏拆链）；
+                                    // 归还类事件（UNBORROW/UNTAKE）的补发由 onModesRestored 驱动。
+                                }
+
+                                else ->
+                                    appendLog(
+                                        // 未识别的命令必须带参数：车机的私有命令（如 requestUI）
+                                        // 到底要什么，全在 params 里——只打 type 等于没打。
+                                        "EVENT: 命令 type=${command["type"]} " +
+                                            command.entries
+                                                .filter { it.key?.toString() != "type" }
+                                                .joinToString(" ") { (key, value) ->
+                                                    "$key=" +
+                                                        when (value) {
+                                                            is ByteArray -> value.joinToString("") { "%02x".format(it) }
+                                                            else -> value.toString().take(240)
+                                                        }
+                                                }.take(600),
+                                    )
                             }
-                            // 资源声明（must）：真车对未声明资源的屏幕流 SETUP 直接 400
-                            client.assertModes()
-                            // HID 输入模式武装：/info hidDevices（奥迪字符串 "0"/"1"，触摸="1"）。
-                            // display features=0x08（高保真触摸）已声明，缺这步车机不发 hidSendReport。
-                            setup.hidDeviceUuids.forEach { uuid ->
-                                client.sendHidSetInputMode(uuid, mode = 0)
-                            }
-                            // iAP 隧道（type-130）协商在屏幕流 SETUP **之前**（2026-10-26
-                            // 对照参考实现时序）：8015 类车机在隧道上完成 iAP2 协商后
-                            // 才进入 CarPlay 激活窗口；且隧道成功后 armMib3VirtualLink 的
-                            // 「隧道形态不布防」门禁才能在屏幕流 SETUP 时生效（顺序颠倒会
-                            // 先按事件通道形态发 DETECT）。失败不阻塞（返回 null 继续）。
-                            // modernAuth：接收端 SETUP 应答声明了 iAPChannel（8015 类）
-                            // → 全双工「现代认证」形态（两步式 0xAA00 + 记忆挑战 +
-                            // runtime 问候）；未声明（DiPlay）→ 旧半双工行为。
-                            val tunnelModern = setup.enabledFeatures.contains("iAPChannel")
+                        }
+                        // 资源声明（must）：真车对未声明资源的屏幕流 SETUP 直接 400
+                        client.assertModes()
+                        // HID 输入模式武装：/info hidDevices（奥迪字符串 "0"/"1"，触摸="1"）。
+                        // display features=0x08（高保真触摸）已声明，缺这步车机不发 hidSendReport。
+                        setup.hidDeviceUuids.forEach { uuid ->
+                            client.sendHidSetInputMode(uuid, mode = 0)
+                        }
+                        // iAP 隧道（type-130）协商在屏幕流 SETUP **之前**（2026-10-26
+                        // 对照参考实现时序）：8015 类车机在隧道上完成 iAP2 协商后
+                        // 才进入 CarPlay 激活窗口；且隧道成功后 armMib3VirtualLink 的
+                        // 「隧道形态不布防」门禁才能在屏幕流 SETUP 时生效（顺序颠倒会
+                        // 先按事件通道形态发 DETECT）。失败不阻塞（返回 null 继续）。
+                        // modernAuth：接收端 SETUP 应答声明了 iAPChannel（8015 类）
+                        // → 全双工「现代认证」形态（两步式 0xAA00 + 记忆挑战 +
+                        // runtime 问候）；未声明（DiPlay）→ 旧半双工行为。
+                        val tunnelModern = setup.enabledFeatures.contains("iAPChannel")
+                        appendLog(
+                            "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}" +
+                                " iAPChannel=$tunnelModern",
+                        )
+                        val tunnel = client.runIapTunnel(sessionKey, modernAuth = tunnelModern)
+                        if (tunnel != null && tunnelModern) {
+                            // 现代隧道形态：屏幕流 SETUP 前等待隧道控制会话完成
+                            // （识别+MFi+runtime，参考实现同款 6s 门；超时继续——
+                            // 隧道并发协商，屏幕流不无限等）
+                            val startedAt = SystemClock.elapsedRealtime()
+                            val ready = client.awaitModernTunnelSession(6_000L)
                             appendLog(
-                                "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}" +
-                                    " iAPChannel=$tunnelModern",
+                                "TUNNEL: 现代认证等待 " +
+                                    (if (ready) "完成" else "超时（继续屏幕流）") +
+                                    "（${SystemClock.elapsedRealtime() - startedAt}ms）",
                             )
-                            val tunnel = client.runIapTunnel(sessionKey, modernAuth = tunnelModern)
-                            if (tunnel != null && tunnelModern) {
-                                // 现代隧道形态：屏幕流 SETUP 前等待隧道控制会话完成
-                                // （识别+MFi+runtime，参考实现同款 6s 门；超时继续——
-                                // 隧道并发协商，屏幕流不无限等）
-                                val startedAt = SystemClock.elapsedRealtime()
-                                val ready = client.awaitModernTunnelSession(6_000L)
+                        }
+                        tunnel?.onIapMessage = { frame ->
+                            // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
+                            if (frame.messageId != 0x0000) {
+                                val hex = frame.body.joinToString(" ") { "%02x".format(it) }
                                 appendLog(
-                                    "TUNNEL: 现代认证等待 " +
-                                        (if (ready) "完成" else "超时（继续屏幕流）") +
-                                        "（${SystemClock.elapsedRealtime() - startedAt}ms）",
+                                    "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
+                                        "(${Iap2MessageIds.nameOf(
+                                            frame.messageId,
+                                        )}) ${frame.body.size}B" +
+                                        if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
                                 )
                             }
-                            tunnel?.onIapMessage = { frame ->
-                                // 触摸证据采集：先全量记录，格式确认后接 TouchRouter
-                                if (frame.messageId != 0x0000) {
-                                    val hex = frame.body.joinToString(" ") { "%02x".format(it) }
-                                    appendLog(
-                                        "TUNNEL: rx 0x${frame.messageId.toString(16)} " +
-                                            "(${Iap2MessageIds.nameOf(
-                                                frame.messageId,
-                                            )}) ${frame.body.size}B" +
-                                            if (frame.body.isNotEmpty()) " hex=${hex.take(120)}" else "",
-                                    )
-                                }
+                        }
+                        val screen = client.runScreenStream(sessionKey, setup.displayUuid)
+                        if (screen != null) {
+                            // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
+                            // 视频数据端口与 keepAlive 都按它建 socket；IPv6 端点也算
+                            // 可用地址（EndpointHosts 统一排序：IPv4 → 全局 IPv6 → 链路本地 IPv6）。
+                            val host = client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
+                            // 心跳双保险（缺失任一都会被车机 ~10s 看门狗拆会话，2026-10-11 实测）：
+                            //   keepAlive UDP ping（车机 SETUP 返回的 keepAlivePort，10s 周期）
+                            //   + RTSP POST /feedback（1s 周期，catplay FEEDBACK_INTERVAL）
+                            if (host != null && setup.keepAlivePort != null) {
+                                client.startKeepAlive(host, setup.keepAlivePort!!)
                             }
-                            val screen = client.runScreenStream(sessionKey, setup.displayUuid)
-                            if (screen != null) {
-                                // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
-                                // 视频数据端口与 keepAlive 都按它建 socket；IPv6 端点也算
-                                // 可用地址（EndpointHosts 统一排序：IPv4 → 全局 IPv6 → 链路本地 IPv6）。
-                                val host = client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
-                                // 心跳双保险（缺失任一都会被车机 ~10s 看门狗拆会话，2026-10-11 实测）：
-                                //   keepAlive UDP ping（车机 SETUP 返回的 keepAlivePort，10s 周期）
-                                //   + RTSP POST /feedback（1s 周期，catplay FEEDBACK_INTERVAL）
-                                if (host != null && setup.keepAlivePort != null) {
-                                    client.startKeepAlive(host, setup.keepAlivePort!!)
-                                }
-                                client.startFeedbackLoop()
-                                // 关键时序（2026-10-17 奥迪定谳）：屏幕 SETUP 后必须尽快连上
-                                // dataPort——车机有 ~2s 看门狗。音频 SETUP 实测要 ~2.1s，
-                                // 若排在前面，端口连接迟到即触发车机 reset 控制通道
-                                // （日志特征：`音频 SETUP 往返 2091ms` 与 `EVENT 读取结束
-                                // - Connection reset` 同一毫秒）。故先建 VideoSender 并
-                                // openDataPort()，再协商音频，最后 RECORD + 启动编码器。
-                                var pendingVideoW = 0
-                                var pendingVideoH = 0
-                                var pendingVideoDensity = 0
-                                if (host != null) {
-                                    // 「显示」偏好：流画布/虚拟屏按车机分辨率百分比生成。
-                                    // 只在会话建立时生效——编码器与虚拟屏尺寸此时定型；
-                                    // 密度同步缩放，逻辑布局（dp）与 100% 完全一致。
-                                    val scalePct =
-                                        appContext
-                                            ?.let {
-                                                DisplayPrefs
-                                                    .scalePercent(it)
-                                            } ?: 100
-                                    val scale = scalePct / 100f
-                                    // 缩放后向下对齐偶数（H.264 要求）：虚拟屏/合成器/编码器
-                                    // 三方必须同一尺寸，故在源头对齐（VideoSender 内另有兜底）
-                                    val streamW =
-                                        ((setup.displayWidth * scale).toInt().coerceAtLeast(320) / 2) * 2
-                                    val streamH =
-                                        ((setup.displayHeight * scale).toInt().coerceAtLeast(180) / 2) * 2
-                                    val fps =
-                                        appContext
-                                            ?.let {
-                                                DisplayPrefs
-                                                    .fps(it)
-                                            } ?: 30
-                                    activeScalePercent = scalePct
-                                    activeTargetFps = fps
-                                    // 车机触摸在通告视图坐标系（如 1160×540），流已按比例
-                                    // 缩放（如 1450×674）——注入前需映射，否则点击漂移
-                                    TouchRouter
-                                        .setCoordinateScale(
-                                            setup.displayWidth,
-                                            setup.displayHeight,
-                                            streamW,
-                                            streamH,
+                            client.startFeedbackLoop()
+                            // 关键时序（2026-10-17 奥迪定谳）：屏幕 SETUP 后必须尽快连上
+                            // dataPort——车机有 ~2s 看门狗。音频 SETUP 实测要 ~2.1s，
+                            // 若排在前面，端口连接迟到即触发车机 reset 控制通道
+                            // （日志特征：`音频 SETUP 往返 2091ms` 与 `EVENT 读取结束
+                            // - Connection reset` 同一毫秒）。故先建 VideoSender 并
+                            // openDataPort()，再协商音频，最后 RECORD + 启动编码器。
+                            var pendingVideoW = 0
+                            var pendingVideoH = 0
+                            var pendingVideoDensity = 0
+                            if (host != null) {
+                                // 「显示」偏好：流画布/虚拟屏按车机分辨率百分比生成。
+                                // 只在会话建立时生效——编码器与虚拟屏尺寸此时定型；
+                                // 密度同步缩放，逻辑布局（dp）与 100% 完全一致。
+                                val scalePct =
+                                    appContext
+                                        ?.let {
+                                            DisplayPrefs
+                                                .scalePercent(it)
+                                        } ?: 100
+                                val scale = scalePct / 100f
+                                // 缩放后向下对齐偶数（H.264 要求）：虚拟屏/合成器/编码器
+                                // 三方必须同一尺寸，故在源头对齐（VideoSender 内另有兜底）
+                                val streamW =
+                                    ((setup.displayWidth * scale).toInt().coerceAtLeast(320) / 2) * 2
+                                val streamH =
+                                    ((setup.displayHeight * scale).toInt().coerceAtLeast(180) / 2) * 2
+                                val fps =
+                                    appContext
+                                        ?.let {
+                                            DisplayPrefs
+                                                .fps(it)
+                                        } ?: 30
+                                activeScalePercent = scalePct
+                                activeTargetFps = fps
+                                // 车机触摸在通告视图坐标系（如 1160×540），流已按比例
+                                // 缩放（如 1450×674）——注入前需映射，否则点击漂移
+                                TouchRouter
+                                    .setCoordinateScale(
+                                        setup.displayWidth,
+                                        setup.displayHeight,
+                                        streamW,
+                                        streamH,
+                                    )
+                                appendLog(
+                                    "DISPLAY: 流 ${setup.displayWidth}x${setup.displayHeight} → " +
+                                        "${streamW}x$streamH（$scalePct%）@${fps}fps",
+                                )
+                                pendingVideoW = streamW
+                                pendingVideoH = streamH
+                                // dock 屏密度随画布短边等比（设计基准 1160×540@420dpi，
+                                // 见 design/launcher-proto.html：dock 48dp=126px）：高分辨率
+                                // 车机（测试台 2320×1080=2×）下 dock 文字/图标与奥迪同比例
+                                // 放大——此前固定 420dpi，dock 相对画布减半显小（2026-10-17）。
+                                // 上限 4×（4K 级画布）。
+                                pendingVideoDensity =
+                                    (420f * minOf(streamW, streamH) / 540f)
+                                        .toInt()
+                                        .coerceIn(120, 1680)
+                                videoSender =
+                                    VideoSender(
+                                        host = host,
+                                        dataPort = screen.dataPort,
+                                        frameCipher = screen.cipher,
+                                        width = streamW,
+                                        height = streamH,
+                                        targetFps = fps,
+                                        log = { line -> appendLog(line) },
+                                        keepAliveWithStats = setup.keepAliveSendStatsAsBody,
+                                        onEnded = {
+                                            // MIB3 移交收口（「两端收口」铁律）：车机拆链
+                                            // 是最常见的离场方式，此处必须复位移交豁免并
+                                            // 恢复入站监听——否则下次上车的 ACL 自动重连被
+                                            // 豁免吞掉、server 停摆无人重启（暗幕当年同款
+                                            // 「只挂一端」教训）。移交形态下 BT 已无会话可
+                                            // 接续端点，音频一并停止：改动前靠
+                                            // ACL_DISCONNECTED 全量收摊，移交后该路径被
+                                            // 豁免，熄火后音频会无限空转（审查定谳）。
+                                            if (btHandoffActive) {
+                                                resetBtHandoffState()
+                                                appendLog(
+                                                    "IAPLINK: 移交形态会话结束——恢复 ACL 常规语义与入站监听，停止音频采集",
+                                                )
+                                                audioSender?.stop()
+                                                audioSender = null
+                                                Bg.run("bt-server-restore") {
+                                                    runCatching { bluetoothServer?.start() }
+                                                }
+                                            }
+                                            // 会话真实结束：解除静默降噪（客户端恢复探测/重连）
+                                            appendLog(">>> CarPlay 会话结束（推流终止）——恢复蓝牙探测")
+                                            BtSessionGate.sessionActive = false
+                                            // 车机掉线类结束（无用户断开操作）：暗幕/常亮必须一起收掉。
+                                            // 这条路径不经过 retireSession（VirtualLauncher 仍挂着），
+                                            // 漏掉它就会出现「会话早就断了、45s 后手机屏突然变黑」
+                                            // （2026-10-19 用户实测）。
+                                            ScreenDimmer.setSessionActive(false)
+                                            // 车机侧断开：人在车外，让手机直接休眠（面板保持黑），
+                                            // 而不是先点亮再等 60s 超时
+                                            restorePhoneScreen(sleepIfCarSide = true)
+                                            // 同样复原横屏覆盖。这里跑在推流收尾线程，不是连接
+                                            // 关键路径，但统一走异步口以保持「串行、不重入」的语义。
+                                            appContext?.let { ctx ->
+                                                AppOrientationCompat.resetAllAsync(ctx, ::appendLog)
+                                            }
+                                            // shell 兜底存的系统网络也要在这里还原：车机拆链是
+                                            // 最常见的离场方式（熄火），用户未必点「断开」——只挂
+                                            // disconnect 一端必遗留（2026-10-23 审阅定谳）。下一轮
+                                            // 若走深度兜底会重新登记，语义自洽。
+                                            cleanupShellFallbackNetwork()
+                                            // 音频拆链归因：起过音频却很快被拆 → 记下该档位
+                                            // 不兼容，下次连接自动换档（见 attributeAudioTeardown）。
+                                            attributeAudioTeardown()
+                                        },
+                                    )
+                                // 先连端口（车机看门狗），编码器等 RECORD 后再启动
+                                videoSender?.openDataPort()
+                            }
+                            // 先 RECORD 激活会话并起视频，再协商音频（2026-10-17 奥迪定谳）：
+                            // 车机在「屏幕流 SETUP 之后」有约 2s 看门狗，等不到 RECORD/数据流即
+                            // 拆掉整轮会话。音频 SETUP 实测本身要 ~2.05-2.16s（车机侧音频通路
+                            // 初始化），排在 RECORD 之前必然超时——日志里 reset 与音频 SETUP
+                            // 返回同一毫秒、且 5 次实测全部复现。故顺序改为：
+                            //   屏幕 SETUP → 连数据端口 → RECORD → 起编码器（出帧）→ 音频 SETUP
+                            // 音频 SETUP 失败只丢声音，视频会话保持。
+                            client.record()
+                            if (host != null) {
+                                val videoW = pendingVideoW
+                                val videoH = pendingVideoH
+                                val videoDensity = pendingVideoDensity
+                                videoSender?.start { surface ->
+                                    // 唯一模式：隐形屏（双屏启动器：dock + 应用屏）
+                                    val source =
+                                        HiddenDisplaySource(
+                                            context.applicationContext,
+                                            log = { line -> appendLog(line) },
+                                        )
+                                    currentHiddenSource = source
+                                    val ok =
+                                        source.attach(
+                                            surface,
+                                            videoW,
+                                            videoH,
+                                            videoDensity,
                                         )
                                     appendLog(
-                                        "DISPLAY: 流 ${setup.displayWidth}x${setup.displayHeight} → " +
-                                            "${streamW}x$streamH（$scalePct%）@${fps}fps",
+                                        "MODE: 隐形屏 ${if (ok) "已启动（高德车机版优先）display=${source.displayId}" else "启动失败（Shizuku 就绪？）"}",
                                     )
-                                    pendingVideoW = streamW
-                                    pendingVideoH = streamH
-                                    // dock 屏密度随画布短边等比（设计基准 1160×540@420dpi，
-                                    // 见 design/launcher-proto.html：dock 48dp=126px）：高分辨率
-                                    // 车机（测试台 2320×1080=2×）下 dock 文字/图标与奥迪同比例
-                                    // 放大——此前固定 420dpi，dock 相对画布减半显小（2026-10-17）。
-                                    // 上限 4×（4K 级画布）。
-                                    pendingVideoDensity =
-                                        (420f * minOf(streamW, streamH) / 540f)
-                                            .toInt()
-                                            .coerceIn(120, 1680)
-                                    videoSender =
-                                        VideoSender(
-                                            host = host,
-                                            dataPort = screen.dataPort,
-                                            frameCipher = screen.cipher,
-                                            width = streamW,
-                                            height = streamH,
-                                            targetFps = fps,
-                                            log = { line -> appendLog(line) },
-                                            keepAliveWithStats = setup.keepAliveSendStatsAsBody,
-                                            onEnded = {
-                                                // MIB3 移交收口（「两端收口」铁律）：车机拆链
-                                                // 是最常见的离场方式，此处必须复位移交豁免并
-                                                // 恢复入站监听——否则下次上车的 ACL 自动重连被
-                                                // 豁免吞掉、server 停摆无人重启（暗幕当年同款
-                                                // 「只挂一端」教训）。移交形态下 BT 已无会话可
-                                                // 接续端点，音频一并停止：改动前靠
-                                                // ACL_DISCONNECTED 全量收摊，移交后该路径被
-                                                // 豁免，熄火后音频会无限空转（审查定谳）。
-                                                if (btHandoffActive) {
-                                                    resetBtHandoffState()
-                                                    appendLog(
-                                                        "IAPLINK: 移交形态会话结束——恢复 ACL 常规语义与入站监听，停止音频采集",
-                                                    )
-                                                    audioSender?.stop()
-                                                    audioSender = null
-                                                    Bg.run("bt-server-restore") {
-                                                        runCatching { bluetoothServer?.start() }
-                                                    }
-                                                }
-                                                // 会话真实结束：解除静默降噪（客户端恢复探测/重连）
-                                                appendLog(">>> CarPlay 会话结束（推流终止）——恢复蓝牙探测")
-                                                BtSessionGate.sessionActive = false
-                                                // 车机掉线类结束（无用户断开操作）：暗幕/常亮必须一起收掉。
-                                                // 这条路径不经过 retireSession（VirtualLauncher 仍挂着），
-                                                // 漏掉它就会出现「会话早就断了、45s 后手机屏突然变黑」
-                                                // （2026-10-19 用户实测）。
-                                                ScreenDimmer.setSessionActive(false)
-                                                // 车机侧断开：人在车外，让手机直接休眠（面板保持黑），
-                                                // 而不是先点亮再等 60s 超时
-                                                restorePhoneScreen(sleepIfCarSide = true)
-                                                // 同样复原横屏覆盖。这里跑在推流收尾线程，不是连接
-                                                // 关键路径，但统一走异步口以保持「串行、不重入」的语义。
-                                                appContext?.let { ctx ->
-                                                    AppOrientationCompat.resetAllAsync(ctx, ::appendLog)
-                                                }
-                                                // shell 兜底存的系统网络也要在这里还原：车机拆链是
-                                                // 最常见的离场方式（熄火），用户未必点「断开」——只挂
-                                                // disconnect 一端必遗留（2026-10-23 审阅定谳）。下一轮
-                                                // 若走深度兜底会重新登记，语义自洽。
-                                                cleanupShellFallbackNetwork()
-                                                // 音频拆链归因：起过音频却很快被拆 → 记下该档位
-                                                // 不兼容，下次连接自动换档（见 attributeAudioTeardown）。
-                                                attributeAudioTeardown()
-                                            },
-                                        )
-                                    // 先连端口（车机看门狗），编码器等 RECORD 后再启动
-                                    videoSender?.openDataPort()
-                                }
-                                // 先 RECORD 激活会话并起视频，再协商音频（2026-10-17 奥迪定谳）：
-                                // 车机在「屏幕流 SETUP 之后」有约 2s 看门狗，等不到 RECORD/数据流即
-                                // 拆掉整轮会话。音频 SETUP 实测本身要 ~2.05-2.16s（车机侧音频通路
-                                // 初始化），排在 RECORD 之前必然超时——日志里 reset 与音频 SETUP
-                                // 返回同一毫秒、且 5 次实测全部复现。故顺序改为：
-                                //   屏幕 SETUP → 连数据端口 → RECORD → 起编码器（出帧）→ 音频 SETUP
-                                // 音频 SETUP 失败只丢声音，视频会话保持。
-                                client.record()
-                                if (host != null) {
-                                    val videoW = pendingVideoW
-                                    val videoH = pendingVideoH
-                                    val videoDensity = pendingVideoDensity
-                                    videoSender?.start { surface ->
-                                        // 唯一模式：隐形屏（双屏启动器：dock + 应用屏）
-                                        val source =
-                                            HiddenDisplaySource(
-                                                context.applicationContext,
-                                                log = { line -> appendLog(line) },
-                                            )
-                                        currentHiddenSource = source
-                                        val ok =
-                                            source.attach(
-                                                surface,
-                                                videoW,
-                                                videoH,
-                                                videoDensity,
-                                            )
-                                        appendLog(
-                                            "MODE: 隐形屏 ${if (ok) "已启动（高德车机版优先）display=${source.displayId}" else "启动失败（Shizuku 就绪？）"}",
-                                        )
-                                        // 暗幕/常亮只在真正开始投屏后生效（见 ScreenDimmer.sessionActive）：
-                                        // 应用启动时只挂触摸探针，避免「会话早断了、手机过一会儿还是变暗」。
-                                        if (ok) {
-                                            ScreenDimmer.setSessionActive(true)
-                                            // 视频起流（虚拟屏已就绪）——实验模式下重申的触发源
-                                            client.onStreamingStarted?.invoke()
-                                            // 虚拟屏已建好 → 按「连接时真息屏」开关决定是否硬件断电
-                                            if (DisplayPrefs.screenOffOnConnect(context)) {
-                                                enterPhoneScreenOff()
-                                            } else {
-                                                appendLog("SCREEN: 「连接时真息屏」已关闭——本次仅用暗幕")
-                                            }
+                                    // 暗幕/常亮只在真正开始投屏后生效（见 ScreenDimmer.sessionActive）：
+                                    // 应用启动时只挂触摸探针，避免「会话早断了、手机过一会儿还是变暗」。
+                                    if (ok) {
+                                        ScreenDimmer.setSessionActive(true)
+                                        // 视频起流（虚拟屏已就绪）——实验模式下重申的触发源
+                                        client.onStreamingStarted?.invoke()
+                                        // 虚拟屏已建好 → 按「连接时真息屏」开关决定是否硬件断电
+                                        if (DisplayPrefs.screenOffOnConnect(context)) {
+                                            enterPhoneScreenOff()
+                                        } else {
+                                            appendLog("SCREEN: 「连接时真息屏」已关闭——本次仅用暗幕")
                                         }
                                     }
                                 }
-                                // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
-                                // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
-                                val audioStarted = startAudioChannel(context, client, sessionKey, host)
-                                if (audioStarted) {
-                                    // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
-                                    // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200
-                                    // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：
-                                    // 音频包持续发送、采集内容非零，车机无声）。
-                                    appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
-                                    client.record()
-                                }
                             }
-                        } else {
-                            // 会话级 SETUP 被拒（典型：接收端按设备过滤回 403，见
-                            // AirPlayClient.runSetup 的 deviceID 说明）。主动关闭控制通道：
-                            // 否则接收端要等约 45s 视频超时才拆 BT 链路，用户只看到
-                            // 「连上之后自动断开」，无从判断是会话建立失败。
-                            phaseHint = "接收端拒绝了会话建立（SETUP 未通过）"
-                            appendLog("AIRPLAY: 会话建立失败——主动关闭控制通道，本轮结束")
-                            uiHintSink?.invoke("接收端拒绝了会话建立（SETUP）——请查看日志中的 deviceID 提示")
-                            runCatching { client.close() }
+                            // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
+                            // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
+                            val audioStarted = startAudioChannel(context, client, sessionKey, host)
+                            if (audioStarted) {
+                                // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
+                                // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200
+                                // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：
+                                // 音频包持续发送、采集内容非零，车机无声）。
+                                appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
+                                client.record()
+                            }
                         }
+                    } else {
+                        // 会话级 SETUP 被拒（典型：接收端按设备过滤回 403——
+                        // flow 已按决策机在窗口内重试，走到这里是结构失败）。
+                        // 主动关闭控制通道：否则接收端要等约 45s 视频超时才
+                        // 拆 BT 链路，用户只看到「连上之后自动断开」。
+                        phaseHint = "接收端拒绝了会话建立（SETUP 未通过）"
+                        appendLog("AIRPLAY: 会话建立失败——主动关闭控制通道，本轮结束")
+                        uiHintSink?.invoke("接收端拒绝了会话建立（SETUP）——请查看日志中的 deviceID 提示")
+                        runCatching { client.close() }
                     }
                 } catch (error: Throwable) {
                     // 配对线程任何异常都不能留下「已有会话在处理中」的卡死状态
@@ -3260,33 +3135,4 @@ object SessionController {
 
     @Volatile
     private var iapEventMessageCount = 0
-}
-
-/** 配对失败后的兜底路径决策（纯函数，真机抓包场景由 PairingFallbackTest 钉死）。 */
-internal data class PairingFallback(
-    /** 「断 BT 复现控制结束再试」二段 hack（仅测试台 DiPlay 形态）。 */
-    val useBtRetireHack: Boolean,
-    /** et=NONE 明文会话降级（pre-HomeKit 老车机 / 配对全拒但 RTSP 连上过的兜底）。 */
-    val usePlainSession: Boolean,
-)
-
-/**
- * 决策依据（2026-10-21 真机 sysdiagnose，docs/PROTOCOL-NOTES.md §13a）：
- * 任意阶段 403 = 「iAP2 信任已建立的车机在等自身就绪」——首连被拒是车机固有状态，
- * 它 18~20s 后自动重邀、第二次即成。此状态下断 BT（整栈重建 30~40s，恰好错过重邀
- * 窗口）与明文降级（必被拒且空耗重邀窗口）都是反向操作，两条兜底一律禁用；
- * 配对循环以 5s 退避在窗口内原地重试（见 pairingRetryBackoffMs）。
- */
-internal fun pairingFallback(
-    keysEstablished: Boolean,
-    noPairing: Boolean,
-    pairSetupRejected: Boolean,
-    pairingForbidden: Boolean,
-    attemptedPairing: Boolean,
-    pairingUnsupported: Boolean,
-): PairingFallback {
-    if (keysEstablished) return PairingFallback(useBtRetireHack = false, usePlainSession = false)
-    val useBtRetireHack = !noPairing && !pairSetupRejected && !pairingForbidden && attemptedPairing
-    val usePlainSession = !pairingForbidden && (pairingUnsupported || attemptedPairing)
-    return PairingFallback(useBtRetireHack = useBtRetireHack, usePlainSession = usePlainSession)
 }
