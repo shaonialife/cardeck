@@ -47,7 +47,7 @@ class AudioSender(
     private val context: android.content.Context? = null,
     /**
      * 采集采样率（Hz）：必须与 SETUP 协商出的格式一致（48k 主选，车机只支持
-     * 44.1k 时由 AirPlayClient 协商下发）。默认 48k。
+     * 44.1k 时由 AirPlayLink 协商下发）。默认 48k。
      */
     private val sampleRate: Int = 48_000,
     /** 负载编码：PCM（type=100 通路）或 AAC-LC（type=102 通路）。 */

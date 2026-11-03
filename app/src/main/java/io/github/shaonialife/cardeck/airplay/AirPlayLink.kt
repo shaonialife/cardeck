@@ -21,13 +21,14 @@ import java.util.Base64
 import java.util.UUID
 
 /**
- * AirPlay 客户端（Phase 2）：
- *  - /info 能力清单拉取与 bplist 解析
- *  - /pair-setup + /pair-verify 完整配对（持久 RTSP 连接上顺序 POST TLV8）
- * 控制器长期身份（ed25519 + 配对 ID）首次生成后存入 SharedPreferences。
- * 后续在此叠加 SETUP/RECORD 流媒体会话。
+ * AirPlay 链路壳（R2 平台层定形 2026-11-04，替代 AirPlayClient）：
+ * **零协议逻辑**——TCP socket + nativeAirplay* 泵搬运 + keepalive UDP +
+ * Timing socket + 事件通道命令；连接序/配对/流 SETUP/加密全在 Rust
+ * （cardeck-protocol fw::airplay，协议决策不过 Kotlin 边界）。
+ * 壳只做三件事：搬字节（OnBytes/TakeOutbound）、执行平台动作（socket/UDP/
+ * 线程）、把 Rust 事件 JSON 分发给媒体硬件与主控。
  */
-class AirPlayClient(
+class AirPlayLink(
     initialEndpoint: Iap2SenderSession.CarPlayEndpoint,
     private val log: (String) -> Unit,
     private val context: Context? = null,
@@ -85,19 +86,7 @@ class AirPlayClient(
      */
     private val timingServer = TimingServer(log)
 
-    /** pair-verify 之后启用：所有后续 RTSP 报文整体加密封装。 */
-    private var cipher: ControlCipher? = null
-
-    /** 握手阶段缓存的 /info（音频协商用：audioType/格式/延迟按车机声明选）。 */
-    @Volatile
-    private var negotiatedInfo: Map<*, *>? = null
-
     // ---- 对外流程 ----
-
-    /** pair-setup 是否被 403 拒绝（真车特征）；主控据此决定是否使用 BT 退役 hack。 */
-    @Volatile
-    var pairSetupRejected: Boolean = false
-        private set
 
     /**
      * 配对期间**任意阶段**出现 403（pair-setup / pair-verify / 认证段）。
@@ -457,8 +446,8 @@ class AirPlayClient(
                     // Events 双钥（Rust 会话 verify M4 同域派生）——事件通道直用
                     val eventsWrite = hexToBytes(json.optString("eventsWriteKey")) ?: ByteArray(0)
                     val eventsRead = hexToBytes(json.optString("eventsReadKey")) ?: ByteArray(0)
-                    // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
-                    cipher = ControlCipher(read, write)
+                    // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）——
+                    // 加密封装全在 Rust 会话泵内，Kotlin 无密文面
                     log("AIRPLAY: 配对完成，控制通道加密已启用")
                     // M5.2：会话句柄存活跨连接序（fw: apsession 生命周期——
                     // 控制建立/流 SETUP/事件通道全走同一加密会话）
@@ -617,10 +606,6 @@ class AirPlayClient(
         startRustFeedbackLoop()
     }
 
-    /** 解析并打印 /feedback 应答（bplist）。字段对照 catplay `StreamFeedback`：
-     *  sr / type / streamConnectionID / sampleTime / timestamp / timestampRawNs
-     *  （没有包计数——车机回的是自己侧的播放时钟，可据此判断音频流是否被推进）。 */
-
     /** 心跳线程的存活判据：RTSP socket 仍连着。 */
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
 
@@ -629,9 +614,6 @@ class AirPlayClient(
         socket = null
         activeHost = null
         activeAddress = null
-        // 新连接总是从**明文**开始（pair-verify 成功后才切加密）：旧连接的 cipher 必须
-        // 清掉，否则重连后的读线程会把明文应答当密文帧解，后续所有请求超时。
-        cipher = null
         iapLink = null
     }
 
@@ -660,13 +642,6 @@ class AirPlayClient(
         log("AIRPLAY: hidSetInputMode(事件通道) uuid=$deviceUuidHex mode=$mode ok=$sent")
         return sent
     }
-
-    /**
-     * 声明资源归属（modesChanged）：手机持有主屏 + 主音频（对照 catplay assert_modes）。
-     * 真车验证的顺序：modesChanged → 屏幕流 SETUP。跳过此声明时 Audi MIB3 对
-     * 屏幕流 SETUP 直接 400（资源仲裁未通过）。appStates：话机/导航归 None（0）、
-     * 语音 None（-1）；resources：主屏(1)/主音频(2)，entity=permanent=Controller(1)。
-     */
 
     // ---- 事件通道命令发送（对照 DiPlay sendCommandLocked）----
     // 车机命令双向都走事件通道 socket 上的 POST /command（不是 RTSP 控制连接！）：
@@ -736,9 +711,9 @@ class AirPlayClient(
 
     /**
      * 车机资源/应用状态快照（/info 自报与 changeModes 事件共同更新）。
-     * 语义出自 catplay change_modes.rs（镜像 Apple 配件框架枚举）：
-     * appStateID 1=Speech/2=PhoneCall/3=TurnByTurn，speechMode -1=None/1=Speaking，
-     * transferType 3=Borrow（主屏被借用）。
+     * 语义派生已下沉 Rust（fw::airplay::event_channel `ModesState::semantics`
+     * ——appStateID 1=Speech/2=PhoneCall、speechMode -1=None；借属域在
+     * FigStarkModeController XPC 侧，fw 字典表示无该键，保守 false）。
      */
     data class ModesState(
         val phoneCall: Boolean,
@@ -759,17 +734,22 @@ class AirPlayClient(
     var onModesRestored: (() -> Unit)? = null
 
     /**
-     * 事件通道 changeModes 请求的状态更新。返回 true = 车机归还了资源
-     * （从占用 → 空闲）：这是切屏窗口，宿主应在 ~80ms 后补发 modesChanged。
+     * changeModes 事件状态更新（R2 起语义布尔由 Rust 事件 JSON 直给）。
+     * 返回 true = 车机归还了资源（从占用 → 空闲）：这是切屏窗口，宿主应在
+     * ~80ms 后补发 modesChanged。
      */
-    fun onCarModesEvent(params: Map<*, *>?): Boolean {
+    fun onCarModesEvent(
+        phoneCall: Boolean,
+        speechActive: Boolean,
+        screenBorrowed: Boolean,
+    ): Boolean {
         val previous = modesState
-        val next = parseModesState(params, previous)
+        val next = ModesState(phoneCall, speechActive, screenBorrowed)
         modesState = next
         val restored = previous.busy && !next.busy
         log(
-            "AIRPLAY: changeModes 事件 → 通话=${next.phoneCall} 语音=${next.speechActive} " +
-                "主屏借用=${next.screenBorrowed}" + if (restored) "（归还——切屏窗口）" else "",
+            "AIRPLAY: changeModes 事件 → 通话=$phoneCall 语音=$speechActive " +
+                "主屏借用=$screenBorrowed" + if (restored) "（归还——切屏窗口）" else "",
         )
         return restored
     }
@@ -777,27 +757,12 @@ class AirPlayClient(
     fun assertModes(): Boolean {
         // §10.56：命令走**事件通道**（DiPlay 同款——命令双向都在事件通道
         // POST /command；控制通道明文直写会绕过 Rust 会话加密 → 接收端
-        // BAD_DECRYPT 断连，真机 2026-11-02 实证）
-        val sent =
-            postEventCommand(
-                linkedMapOf(
-                    "type" to "modesChanged",
-                    "params" to
-                        linkedMapOf(
-                            "appStates" to
-                                listOf(
-                                    linkedMapOf<String, Any?>("appStateID" to 2L, "entity" to 0L),
-                                    linkedMapOf<String, Any?>("appStateID" to 3L, "entity" to 0L),
-                                    linkedMapOf<String, Any?>("appStateID" to 1L, "entity" to 0L, "speechMode" to -1L),
-                                ),
-                            "resources" to
-                                listOf(
-                                    linkedMapOf<String, Any?>("resourceID" to 1L, "entity" to 1L, "permanentEntity" to 1L),
-                                    linkedMapOf<String, Any?>("resourceID" to 2L, "entity" to 1L, "permanentEntity" to 1L),
-                                ),
-                        ),
-                ),
-            )
+        // BAD_DECRYPT 断连，真机 2026-11-02 实证）。R2 起命令体在 Rust
+        // （EventChannel::send_modes_assert——catplay assert_modes 镜像）。
+        val result = NativeBridge.nativeAirplayAssertModes(controlSessionHandle)
+        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
+        if (!sent) log("EVENT: modesChanged 发送失败(rust) - $result")
+        pumpEventOutbound()
         log("AIRPLAY: modesChanged（声明持有主屏/主音频资源）[事件通道] ok=$sent")
         return sent
     }
@@ -818,10 +783,10 @@ class AirPlayClient(
      * 流 SETUP（'stup' /）由后续批接入（AudioSender 换装同批）。
      */
 
-    /** ANNOUNCE 参数装配（fw: sdpsession_sendAnnounce @0x22779ddd4 宿主注入域——
-     *  uuid = 传输会话 UUID 首 8B BE、地址 = 本端 socket、键/IV = 随机 16B
-     *  base64（KeyHolder 数据面真身待接）、音频位 15 = 48kHz lpcm 16-bit
-     *  立体声（fw::airplay::asbd 表）、latency = 装机校准初值）。 */
+    /** ANNOUNCE 参数装配——**只注平台数据**（R2 壳层定形）：uuid = 传输会话
+     *  UUID 首 8B BE、地址 = 本端 socket、设备名。协议常量（音频位 15、
+     *  authType 8、latency 512/2048）与 KeyHolder 随机键 IV 的缺省域已下沉
+     *  Rust（session::send_announce 固件锚注释）。 */
     private fun buildAnnounceParams(socket: java.net.Socket?): String {
         val ia = (socket?.localSocketAddress as? java.net.InetSocketAddress)?.address
         val ip = ia?.hostAddress?.replace("%.*".toRegex(), "") ?: "0.0.0.0"
@@ -835,27 +800,11 @@ class AirPlayClient(
                     .take(16)
                     .toLong(16)
             }.getOrDefault(0L)
-        val rnd = java.security.SecureRandom()
-
-        fun b64(n: Int): String {
-            val b = ByteArray(n)
-            rnd.nextBytes(b)
-            return java.util.Base64
-                .getEncoder()
-                .encodeToString(b)
-        }
         val params = org.json.JSONObject()
         params.put("uuidU64", uuidU64)
         params.put("localIp", ip)
         params.put("ip6", ip6)
         params.put("deviceName", android.os.Build.MODEL ?: "CarDeck")
-        params.put("audioFormatBit", 15)
-        params.put("authType", 8)
-        params.put("aesKeyB64", b64(16))
-        params.put("aesIvB64", b64(16))
-        // fw: 流字典 LatencyMin/LatencyMax（Int64）——初值装机校准
-        params.put("latencyMin", 512)
-        params.put("latencyMax", 2048)
         return params.toString()
     }
 
@@ -997,14 +946,7 @@ class AirPlayClient(
         )
     }
 
-    /**
-     * iAP 隧道（type-130 DataStream，对照 DiPlay IapTunnel）：现代 CarPlay 的 iAP2
-     * EA 数据通道——**车机→手机的 iAP2 消息（含触摸 HID）走这条加密 TCP**，
-     * 手机→车机走事件通道 iAPSendMessage 命令（[sendIap]）。
-     * 线格式：ChaCha 帧（2B LE 长度作 AAD + 密文 + 16B tag，nonce=8B LE 计数器，
-     * 密钥 = HKDF(shared, "DataStream-Salt$seed", "DataStream-Output-Encryption-Key")）
-     * ⊃ APTransportPackage（4B BE 总长，32B 头，偏移 16 处 type="comm"）→ body = iAP2 消息。
-     */
+    /** 会话级 SETUP 装配产物（controlSetup 端口域 + info displays——宿主数据面消费）。 */
     class SetupInfo(
         val eventPort: Int,
         val timingPort: Int,
@@ -1037,19 +979,6 @@ class AirPlayClient(
         val cipher: StreamFrameCipher,
     )
 
-    /**
-     * SETUP type-130 iAP 隧道并连接车机 dataPort。失败返回 null（会话继续，触摸不可用）。
-     * 手机→车机方向用 [sendIap]（事件通道 iAPSendMessage）。
-     *
-     * 请求字段对照参考实现（2026-10-26）补齐
-     * `controlType/channelID/clientUUID/wantsDedicatedSocket/sendMessageAsIs`——
-     * 旧请求只有 type/clientTypeUUID/seed，标准接收端要求 wantsDedicatedSocket 才给
-     * 专用端口。channelID 用本机蓝牙 MAC（与会话 SETUP 的 deviceID 同源，接收端按它对账）。
-     *
-     * [modernAuth] = 接收端 SETUP 应答 enabledFeatures 声明了 iAPChannel：隧道走
-     * 全双工「现代认证」形态（两步式 0xAA00 + 记忆挑战 + runtime 问候，详见
-     * [VirtualIap2Link.tunnelModernAuth]）；未声明（DiPlay）维持旧半双工行为。
-     */
     private var sendIapCount = 0
 
     /**
@@ -1106,10 +1035,6 @@ class AirPlayClient(
     /** 视频起流回调（屏幕上第一帧发出后）——实验模式下重申的触发源。 */
     var onStreamingStarted: (() -> Unit)? = null
 
-    /** MIB3 控制会话是否完成过（auth+burst 已发）。 */
-    var mib3ControlSessionDone: Boolean = false
-        private set
-
     /** 隧道链路唯一实例（原生会话薄层，协议行为全在 cardeck-protocol）。 */
     private fun obtainIapLink(): NativeTunnelIap2Link =
         iapLink ?: synchronized(this) {
@@ -1122,7 +1047,6 @@ class AirPlayClient(
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
                     it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
                     it.onControlSessionComplete = {
-                        mib3ControlSessionDone = true
                         onTunnelControlSessionComplete?.invoke()
                     }
                     iapLink = it
@@ -1144,85 +1068,15 @@ class AirPlayClient(
         val sampleRate: Int = 48_000,
     )
 
-    /** plist 端口是 u16 但以 2 字节有符号整数编码（>32767 读出为负），按位掩出真实值。 */
-
     companion object {
-        /**
-         * MIB3 隧道布防开关（2026-10-25 实验 C）：false = CLASSIC_MIB3 不发 DETECT。
-         * 实验结论出来后：切屏则永久改为「不发隧道」路线；不切则恢复 true 并转向
-         * 隧道内数据通路（仪表盘订阅/0x5201 等）。
-         */
+        // D7 基线三常量（audioCandidates 的兜底档；位图/流类型语义在 Rust
+        // audio_semantics 模块——R2 壳层定形）。
 
-        /** 从 /info 或 changeModes 的 modes 结构解析状态；缺失的清单沿用 [base]。 */
-        internal fun parseModesState(
-            modes: Map<*, *>?,
-            base: ModesState,
-        ): ModesState {
-            if (modes == null) return base
-            var phoneCall = base.phoneCall
-            var speechActive = base.speechActive
-            var screenBorrowed = base.screenBorrowed
-            (modes["appStates"] as? List<*>)?.forEach { entry ->
-                val item = entry as? Map<*, *> ?: return@forEach
-                when ((item["appStateID"] as? Number)?.toLong()) {
-                    2L -> {
-                        // 注意 Elvis 与比较的优先级：`a ?: b != 0L` 会解析成 (a ?: b) != 0L——
-                        // Boolean 的 false 被拿去和 0L 比较恒为 true（实测踩过：state=false
-                        // 被解析成「车机正在通话」，重申被错误冻结）
-                        val stateFlag = item["state"] as? Boolean
-                        phoneCall =
-                            stateFlag ?: (((item["entity"] as? Number)?.toLong() ?: 0L) != 0L)
-                    }
-
-                    1L -> speechActive = (item["speechMode"] as? Number)?.toLong() != -1L
-                }
-            }
-            (modes["resources"] as? List<*>)?.forEach { entry ->
-                val item = entry as? Map<*, *> ?: return@forEach
-                if ((item["resourceID"] as? Number)?.toLong() == 1L) {
-                    val transferType = (item["transferType"] as? Number)?.toLong()
-                    screenBorrowed =
-                        transferType == 3L ||
-                        (transferType == null && item.containsKey("borrowID"))
-                }
-            }
-            return ModesState(phoneCall, speechActive, screenBorrowed)
-        }
-
-        /** 主屏视频流类型（对照接收端 STREAM_TYPE_MAIN_SCREEN；100 是音频、130 是数据/iAP 隧道）。 */
-        const val SCREEN_STREAM_TYPE = 110L
-
-        /** 主音频流类型（DiPlay STREAM_TYPE_MAIN_AUDIO；PCM 通路）。 */
-        const val AUDIO_STREAM_TYPE = 100L
-
-        /**
-         * 高质量主音频流类型（catplay `StreamType::MainHighAudio`）。
-         *
-         * 部分车机（2026-10-20 Honda HFT / Alpine 8A250-30A 实测）的**真媒体通路**在这条：
-         * `type=102 media` 只声明 AAC-LC，而 `type=100 media` 只声明 PCM——往 100 推 PCM
-         * 时车机 SETUP 回 200、给 dataPort，却不消费（`/feedback` 的 sampleTime 恒 0），
-         * 约 6.5s 后把整条会话拆掉。
-         */
-        const val AUDIO_STREAM_TYPE_MAIN_HIGH = 102L
+        /** 媒体音频通道的 audioType（真 iPhone 媒体音频走这条）。 */
+        const val AUDIO_TYPE_MEDIA = "media"
 
         /** 音频格式位：PCM 48000Hz 16bit 立体声（catplay AudioFormat 定义 1<<15）。 */
         const val AUDIO_FORMAT_PCM_48K_STEREO = 1L shl 15
-
-        /** 音频格式位：PCM 44100Hz 16bit 立体声（1<<11；48k 不可用时的回退）。 */
-        const val AUDIO_FORMAT_PCM_44K_STEREO = 1L shl 11
-
-        /** AAC-LC 44100Hz 立体声（1<<22；catplay `AAC_LC_44100_STEREO`）。 */
-        const val AUDIO_FORMAT_AAC_LC_44K_STEREO = 1L shl 22
-
-        /** AAC-LC 48000Hz 立体声（1<<23；catplay `AAC_LC_48000_STEREO`）。 */
-        const val AUDIO_FORMAT_AAC_48K_STEREO = 1L shl 23
-
-        /**
-         * 媒体音频通道的 audioType（真 iPhone 媒体音频走这条）。
-         * 具体选哪个由 [negotiateAudio] 按车机 /info 的 audioFormats 决定——这里只是
-         * 「有 media 档时优先」的判据与其在 /info 缺失时的协议基线值。
-         */
-        const val AUDIO_TYPE_MEDIA = "media"
 
         /**
          * 音频延迟兜底值（ms）：车机 /info 的 audioLatencies 里没给 outputLatencyMicros 时用。
@@ -1233,26 +1087,11 @@ class AirPlayClient(
         /** 配对重试期间调用 [retryTick] 的间隔（次）：每轮回 2s，10 次 ≈ 每 20s 重新公告一次。 */
         private const val RETRY_TICK_ATTEMPTS = 10
 
-        /** 发送端自报的 AirPlay 版本（catplay 真车验证值，iOS 15.0.2 时代；勿用车机的版本）。 */
-        private const val SENDER_SOURCE_VERSION = "566.25.21"
-
         /**
          * UDP keepAlive 间隔。catplay 用 10s，但那是它自家接收端的口径；真车（奥迪
          * MMI 3315）看门狗同为 10s，等长即必输（sleep 抖动让心跳晚 1ms 到）。
          */
         private const val KEEPALIVE_INTERVAL_MS = 5_000L
-
-        /** 读线程结束/连接关闭时投递给等待者的哨兵状态行（非真实 RTSP 应答）。 */
-        private const val RTSP_CLOSED_MARK = "__closed__"
-
-        /** 屏幕流延迟（catplay c2a car_manager 实测值）。 */
-        private const val SCREEN_LATENCY_MS = 25L
-
-        /** iAP DataStream 的 clientTypeUUID（DiPlay IAP_DATASTREAM_UUID，真 iPhone 同款）。 */
-        private const val IAP_DATASTREAM_UUID = "E9459FD0-BCAD-4C45-820F-1E72447EF2F2"
-
-        /** 隧道 APTransportPackage 头长（4B BE 总长 + 12B 保留 + 4B type="comm" + 12B 保留）。 */
-        private const val TUNNEL_PACKAGE_HEADER_BYTES = 32
     }
 
     /**
@@ -1264,68 +1103,41 @@ class AirPlayClient(
      *
      * 字段按 catplay 发送端（`StreamDescriptionAudio::new`）对齐：
      *  - `audioLatencyMs` 必填（接收端会读；漏发会让严格实现拆会话）
-     *  - `audioType` **按车机 /info 声明协商**（见 [negotiateAudio]）：媒体音频优先
-     *    `media` 通道；曾经写死 `compatibility` 时车机接受 SETUP、给端口、照收包，
-     *    但不接入播放通路（无声）——这是 2026-10-17 的主根因之一
+     *  - `audioType` **按车机 /info 声明协商**（D7 候选 = Rust 选择，[audioCandidates]）：
+     *    媒体音频优先 `media` 通道；曾经写死 `compatibility` 时车机接受 SETUP、给端口、
+     *    照收包，但不接入播放通路（无声）——这是 2026-10-17 的主根因之一
      *  - `streamConnectionID` 用随机正 i64（catplay 同款 `rand::random::<u64>()`）：时间戳
      *    余数在短时间重连时会撞号
      *  - 不额外 GET /info（实测多花 ~2.5s；/info 已在握手阶段拉过并缓存复用）
      *
-     * 格式：优先 PCM 48k 立体声（bit15），车机只声明 44.1k 时退 bit11；采样率下发给
-     * [AudioSender] 保持一致。
+     * 格式由候选档给定（Rust D7 选择）；采样率下发给 [AudioSender] 保持一致。
      */
     fun runAudioStream(
         sharedSecret: ByteArray,
         profile: AudioProfile,
         tuning: AudioTuning = AudioTuning.RAW_SPF,
     ): AudioStreamInfo? {
-        // 档位由调用方按「车机 /info 声明的候选 + 本车机历史记忆」选定后传进来：
-        // 同一台车机上不同 audioType 档位的可用性完全不同（见 AudioProfile 注释），
-        // 单档失败就换下一档，而不是每次连接都盲试同一档。
-        val negotiation = profile
+        // 档位由调用方按「车机 /info 声明的候选（Rust D7 选择）+ 本车机历史记忆」
+        // 选定后传进来：同一台车机上不同 audioType 档位的可用性完全不同（见
+        // AudioProfile 注释），单档失败就换下一档，而不是每次连接都盲试同一档。
         log(
             "AIRPLAY: 音频协商 → audioType=${profile.audioType} " +
                 "format=0x${profile.formatBit.toString(16)} ${profile.sampleRate}Hz " +
                 "latency=${profile.latencyMs}ms（档位=${profile.label}，" +
                 "封装=${tuning.detail}）",
         )
-        // 随机正 i64：BinaryPlist 按有符号整数编码，掩掉符号位避免负数
+        // 随机正 i64：掩掉符号位避免负数（plist 有符号整数编码）
         val connectionId = (SecureRandom().nextLong() and Long.MAX_VALUE).coerceAtLeast(1L)
         // spf 取值：AAC 一帧 1024 采样；PCM 与发送端每包 352 帧保持一致
+        // （2026-10-20 Honda 实测：不声明 spf 时车机照样收包但喇叭无声）
         val spfValue =
             tuning.spf?.let {
                 if (profile.codec == AudioCodec.AAC_LC) it.toLong() else AudioSender.SAMPLES_PER_PACKET.toLong()
             }
-        val body =
-            BinaryPlist.encode(
-                linkedMapOf(
-                    "streams" to
-                        listOf(
-                            linkedMapOf<String, Any?>().apply {
-                                put("type", profile.streamType)
-                                put("streamConnectionID", connectionId)
-                                put("audioFormat", negotiation.formatBit)
-                                put("audioType", negotiation.audioType)
-                                put("audioLatencyMs", negotiation.latencyMs)
-                                // 与 catplay 发送端（StreamDescriptionAudio::new）逐字段对齐：
-                                // input=false（只下行，无麦克风上行）、
-                                // supportsRTPPacketRedundancy=false（我们不打包冗余帧）。
-                                // 缺这两个布尔时部分严格实现的接收端会按「未声明=不支持」处理，
-                                // 在音频通路初始化阶段就放弃该流。
-                                put("input", false)
-                                put("supportsRTPPacketRedundancy", false)
-                                put("supportsHighAccuracyTimestamps", tuning.highAccuracyTimestamps)
-                                // spf = 每包样本帧数：AAC 一帧 1024，PCM 走 352。
-                                // 2026-10-20 Honda 实测：不声明 spf 时车机照样收包并按 44.1k
-                                // 实时消费，但喇叭无声——「按固定 SPF 排播」的实现需要这个值。
-                                spfValue?.let { put("spf", it) }
-                            },
-                        ),
-                ),
-            )
         // §10.60：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）。
         // connectionId 本端生成并**随请求携带**（fw: 调用方流字典原样并入
         // @0x2276c5428；DataStream 解密钥两侧同值域），Rust 尊重调用方值并回带。
+        // input/redundancy/highAccuracy 缺省已下沉 Rust（R2 壳层定形）。
         var controlPortFromEv = 0
         if (sessionPumpHandle != 0L) {
             val connIdJson = connectionId.toString()
@@ -1334,8 +1146,7 @@ class AirPlayClient(
                 rustStreamSetupWait(
                     "{\"streamType\":${profile.streamType},\"streamConnectionID\":\"" + connIdJson +
                         "\",\"audioFormat\":${profile.formatBit},\"audioType\":\"${profile.audioType}\"" +
-                        ",\"audioLatencyMs\":${profile.latencyMs},\"input\":false" +
-                        ",\"supportsRTPPacketRedundancy\":false" +
+                        ",\"audioLatencyMs\":${profile.latencyMs}" +
                         ",\"supportsHighAccuracyTimestamps\":${tuning.highAccuracyTimestamps}" +
                         spfJson + "}",
                     timeoutMs = 8_000,
@@ -1364,7 +1175,7 @@ class AirPlayClient(
                         "DataStream-Salt$connectionId".toByteArray(Charsets.US_ASCII),
                         "DataStream-Output-Encryption-Key".toByteArray(Charsets.US_ASCII),
                     ),
-                sampleRate = negotiation.sampleRate,
+                sampleRate = profile.sampleRate,
             )
         }
         // legacy RTSP 直写段已删（§10.62：泵恒在，Rust 快路唯一路径）。
@@ -1372,148 +1183,62 @@ class AirPlayClient(
     }
 
     /**
-     * 按车机 `/info` 的 audioFormats / audioLatencies 生成**候选音频档位**（有序）。
+     * D7 音频候选（R2 起全在 Rust）：会话 'info' 存档 → fw::airplay::session
+     * `InfoReply::audio_candidates`（位图匹配 + media 优先 + 250ms 钳制，
+     * Honda/Alpine 定谳语义见 Rust 侧注释）。Kotlin 只做 JSON→AudioProfile
+     * 映射；无会话句柄 / info 未取得 / 解析失败 → 协议基线（media+PCM48k）。
      *
-     * 与旧实现（只返回一个「协商结果」）的差别（2026-10-19 Honda HFT 实测）：
-     * 车机常常「接受某档位的 SETUP、给 dataPort、照收 UDP 包，但内部音频通路起不来」，
-     * 几秒后整条会话被拆。因此调用方必须能**换档重试**，这里返回全部合法档位。
-     *
-     * 规则：
-     *  1. 只取 `type=100`（主音频）；
-     *  2. 每个 `audioType` 档位按自己的 `audioOutputFormats` 位图匹配 PCM 格式
-     *     （48k 立体声 bit15 优先，其次 44.1k 立体声 bit11）；
-     *  3. 排序：默认 `media` 档优先（真 iPhone 媒体音频通路，奥迪实测唯一能出声的档）；
-     *     [preferCompat]=true 时反过来把非 media（compatibility 等）排前面——
-     *     部分车机 media 档只声明 44.1k 且其音频通路只吃 48k，只能用兼容档；
-     *  4. 延迟取该 (type, audioType) 在 audioLatencies 的 outputLatencyMicros，
-     *     取不到用 [AUDIO_LATENCY_FALLBACK_MS]。
-     * 拿不到 /info 时回退协议基线（media + PCM48k + 250ms），与改动前一致。
+     * 调用方必须能**换档重试**：车机常常「接受 SETUP、给端口、照收包，但内部
+     * 音频通路起不来」几秒后拆会话（2026-10-19 Honda HFT 实测）。
      */
     fun audioCandidates(preferCompat: Boolean = false): List<AudioProfile> {
         val baseline =
             listOf(
                 AudioProfile(AUDIO_TYPE_MEDIA, AUDIO_FORMAT_PCM_48K_STEREO, 48_000, AUDIO_LATENCY_FALLBACK_MS),
             )
-        val info = negotiatedInfo ?: return baseline
-        val declared =
-            (info["audioFormats"] as? List<*>)
-                ?.mapNotNull { it as? Map<*, *> }
-                .orEmpty()
-        if (declared.isEmpty()) {
-            log("AIRPLAY: 车机 /info 未声明 audioFormats → 按协议基线尝试")
+        val h = controlSessionHandle
+        if (h == 0L) return baseline
+        val json =
+            runCatching {
+                NativeBridge.nativeAirplayAudioCandidates(h, preferCompat)
+            }.getOrNull()
+        if (json.isNullOrEmpty() || json == "[]") {
+            log("AIRPLAY: D7 候选不可用（info 未取得/声明为空）→ 按协议基线尝试")
             return baseline
         }
-
-        // ---- 1) AAC-LC 通路：MainHighAudio(102) 优先，其次 type=100 ----
-        // 车机若在 102/media 上声明 AAC-LC，说明它有一条独立的高质量媒体音频通路
-        // （真 iPhone 媒体音频走这条）。往 100 推 PCM 的表现为：SETUP 回 200、给 dataPort、
-        // 但 controlPort=0、/feedback 里 sampleTime 恒 0，约 6.5s 后整条会话被拆。
-        val aac = mutableListOf<AudioProfile>()
-        val aacOptions =
-            listOf(
-                Triple(AUDIO_STREAM_TYPE_MAIN_HIGH, AUDIO_FORMAT_AAC_LC_44K_STEREO, 44_100),
-                Triple(AUDIO_STREAM_TYPE_MAIN_HIGH, AUDIO_FORMAT_AAC_48K_STEREO, 48_000),
-                Triple(AUDIO_STREAM_TYPE, AUDIO_FORMAT_AAC_LC_44K_STEREO, 44_100),
-                Triple(AUDIO_STREAM_TYPE, AUDIO_FORMAT_AAC_48K_STEREO, 48_000),
-            )
-        aacOptions.forEach { (streamType, bit, rate) ->
-            declared
-                .filter { ((it["type"] as? Number)?.toLong()) == streamType }
-                .forEach { channel ->
-                    val output = (channel["audioOutputFormats"] as? Number)?.toLong() ?: 0L
-                    if ((output and bit) == 0L) return@forEach
-                    val audioType = (channel["audioType"] as? String)?.lowercase() ?: return@forEach
-                    // 媒体音频只走 media 档；compatibility/default 是提示音/兼容场景
-                    if (audioType != AUDIO_TYPE_MEDIA) return@forEach
-                    aac +=
-                        AudioProfile(
-                            audioType = audioType,
-                            formatBit = bit,
-                            sampleRate = rate,
-                            latencyMs = latencyFor(info, audioType, streamType),
-                            streamType = streamType,
-                            codec = AudioCodec.AAC_LC,
-                        )
+        val mapped =
+            runCatching {
+                val arr = org.json.JSONArray(json)
+                (0 until arr.length()).mapNotNull { i ->
+                    val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                    AudioProfile(
+                        audioType = o.optString("audioType"),
+                        formatBit = o.optLong("formatBit"),
+                        sampleRate = o.optInt("sampleRate"),
+                        latencyMs = o.optLong("latencyMs"),
+                        streamType = o.optLong("streamType"),
+                        codec = AudioCodec.valueOf(o.optString("codec", "PCM")),
+                    )
                 }
-        }
-
-        // ---- 2) PCM 通路（只存在于 type=100）----
-        val formats = declared.filter { ((it["type"] as? Number)?.toLong()) == AUDIO_STREAM_TYPE }
-        val pcm = mutableListOf<AudioProfile>()
-        // 只考虑「媒体类」档位：车机还会声明 telephony / speechRecognition / alert 等档，
-        // 它们位图里同样有 PCM48k，但把媒体流推进语音/提示音通路只会得到怪声或无声。
-        // media / compatibility / default 这三档是收发两端都当作媒体通路的档位。
-        val mediaTypes =
-            formats.filter { channel ->
-                val type = (channel["audioType"] as? String)?.lowercase()
-                type == AUDIO_TYPE_MEDIA || type == "compatibility" || type == "default"
+            }.getOrElse {
+                log("AIRPLAY: D7 候选解析失败 - ${it.message} → 基线")
+                return baseline
             }
-        val pool = mediaTypes.ifEmpty { formats }
-        // 外层按格式（48k → 44.1k），内层按车机声明顺序：同档位时 48k 自然排在前面
-        listOf(AUDIO_FORMAT_PCM_48K_STEREO to 48_000, AUDIO_FORMAT_PCM_44K_STEREO to 44_100)
-            .forEach { (bit, rate) ->
-                pool.forEach { channel ->
-                    val output = (channel["audioOutputFormats"] as? Number)?.toLong() ?: 0L
-                    if ((output and bit) == 0L) return@forEach
-                    val type = (channel["audioType"] as? String)?.lowercase() ?: return@forEach
-                    pcm += AudioProfile(type, bit, rate, latencyFor(info, type, AUDIO_STREAM_TYPE))
-                }
-            }
-        // 媒体档最优先；其余按 compatibility → default 的熟悉度排序（组内保持 48k 先）
-        val priority = { type: String ->
-            when {
-                type == AUDIO_TYPE_MEDIA && !preferCompat -> 0
-                type == "compatibility" && !preferCompat -> 1
-                type == "compatibility" && preferCompat -> 0
-                type == AUDIO_TYPE_MEDIA && preferCompat -> 2
-                else -> 3
-            }
-        }
-        // 「兼容档」= 强制走 PCM 旧通路（跳过 AAC）：AAC-LC 在某些车机上会被 SETUP 直接
-        // 拒掉，留一个人工入口，免得自动候选每次都先撞一次墙。
-        val ordered =
-            (if (preferCompat) emptyList() else aac.distinctBy { it.key }) +
-                pcm.sortedBy { priority(it.audioType) }
-        if (ordered.isEmpty()) {
-            log(
-                "AIRPLAY: 车机未声明可用的 AAC-LC / PCM 立体声格式" +
-                    "（共 ${declared.size} 档）→ 仍按基线尝试",
-            )
-            return baseline
-        }
-        log("AIRPLAY: 音频候选（按偏好）=${ordered.map { it.label }}")
-        return ordered.distinctBy { it.key }
-    }
-
-    /** 该 (type, audioType) 档位声明的输出延迟（ms）；无有效值用兜底。 */
-    private fun latencyFor(
-        info: Map<*, *>,
-        audioType: String,
-        streamType: Long = AUDIO_STREAM_TYPE,
-    ): Long {
-        val declaredMs =
-            (info["audioLatencies"] as? List<*>)
-                ?.mapNotNull { it as? Map<*, *> }
-                ?.firstOrNull {
-                    ((it["type"] as? Number)?.toLong()) == streamType &&
-                        (it["audioType"] as? String)?.lowercase() == audioType
-                }?.let { (it["outputLatencyMicros"] as? Number)?.toLong() }
-                ?.takeIf { it > 0 }
-                ?.let { it / 1000 }
-        // 下限 250ms：车机声明的 outputLatencyMicros 只是它自己的输出延迟（实测 35ms），
-        // 拿它当端到端缓冲会让 WiFi 抖动直接变成欠载。catplay 对 AirPlay 镜像同样是
-        // `max(声明值, 250ms)`。
-        return declaredMs?.coerceAtLeast(AUDIO_LATENCY_FALLBACK_MS) ?: AUDIO_LATENCY_FALLBACK_MS
+        if (mapped.isEmpty()) return baseline
+        log("AIRPLAY: 音频候选（Rust D7 选择）=${mapped.map { it.label }}")
+        return mapped
     }
 
     /**
      * 车机身份文本（音频档位记忆的键来源）：只用 /info 里稳定的 model + manufacturer，
      * 蓝牙名/固件串会随重连变化，不能进键。
+     * R2 修复：读 Rust info 事件（此前 negotiatedInfo 从未赋值 → 恒 "unknown"，
+     * AudioProfileMemory 键退化）。
      */
     fun receiverIdentity(): String {
-        val info = negotiatedInfo ?: return "unknown"
-        val manufacturer = (info["manufacturer"] as? String).orEmpty().trim()
-        val model = (info["model"] as? String).orEmpty().trim()
+        val info = rustInfoEvent
+        val manufacturer = info?.optString("manufacturer").orEmpty().trim()
+        val model = info?.optString("model").orEmpty().trim()
         return "$manufacturer $model".trim().ifBlank { "unknown" }
     }
 
@@ -1528,8 +1253,6 @@ class AirPlayClient(
         sessionKey: ByteArray?,
         displayUuid: String? = null,
     ): ScreenStreamInfo? {
-        // 对照 catplay（真车验证）：streamConnectionID = 随机 u64（+1 保证非零）
-        val connectionId = java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L
         val streamUuid =
             displayUuid ?: java.util.UUID
                 .randomUUID()
@@ -1542,28 +1265,14 @@ class AirPlayClient(
                     "（来自 /info displays[].uuid）"
                 },
         )
-        val body =
-            BinaryPlist.encode(
-                linkedMapOf(
-                    "streams" to
-                        listOf(
-                            linkedMapOf<String, Any?>(
-                                "type" to SCREEN_STREAM_TYPE, // 110 = 主屏（100 是音频，DiPlay 会开 UDP 端口）
-                                "streamConnectionID" to connectionId,
-                                // 真实 iPhone / catplay 发送端：uuid 与 latencyMs 都必带。
-                                // uuid 必须是接收端 /info displays[] 声明的显示屏 UUID（真车会校验；
-                                // 随机值曾致 Audi 直接 400 拆会话）。latencyMs=25 为 catplay 实测值。
-                                "uuid" to streamUuid,
-                                "latencyMs" to SCREEN_LATENCY_MS,
-                            ),
-                        ),
-                ),
-            )
-        // §10.57：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）
+        // §10.57：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）。
+        // streamType=110/latencyMs=25 协议常量已下沉 Rust（R2 壳层定形）；
+        // uuid 必须是接收端 /info displays[] 声明的显示屏 UUID（真车会校验；
+        // 随机值曾致 Audi 直接 400 拆会话）。
         if (sessionPumpHandle != 0L) {
             val ev =
                 rustStreamSetupWait(
-                    "{\"streamType\":110,\"uuid\":\"$streamUuid\",\"latencyMs\":$SCREEN_LATENCY_MS}",
+                    "{\"streamType\":110,\"uuid\":\"$streamUuid\"}",
                 ) ?: run {
                     log("AIRPLAY: 流协商失败（Rust 泵超时/断开）")
                     return null
@@ -1675,9 +1384,14 @@ class AirPlayClient(
                             when (ev.optString("type")) {
                                 "modesChanged" -> {
                                     // 车机 changeModes：状态镜像 + 归还窗口回调
-                                    // （200+status+params 应答已由 Rust 自动排入出站）
+                                    // （200+status+params 应答已由 Rust 自动排入出站；
+                                    // 语义布尔由 Rust 下沉直给——R2 壳层定形）
                                     val restored =
-                                        onCarModesEvent(ev.optJSONObject("params")?.let { jsonToCommandMap(it) })
+                                        onCarModesEvent(
+                                            ev.optBoolean("phoneCall"),
+                                            ev.optBoolean("speechActive"),
+                                            ev.optBoolean("screenBorrowed"),
+                                        )
                                     if (restored) onModesRestored?.invoke()
                                 }
                                 "command" -> {
@@ -1904,10 +1618,15 @@ class AirPlayClient(
             .filter { (key, _) -> key.toString().contains("hid", ignoreCase = true) }
             .forEach { (key, value) -> log("AIRPLAY: /info $key=$value") }
         // 车机资源/应用状态（2026-10-24 8015 定谳）：通话/语音/借用期间 modesChanged
-        // 会被资源仲裁拒绝（HTTP 仍 200，拒绝在响应体）——重申必须冻结至归还
+        // 会被资源仲裁拒绝（HTTP 仍 200，拒绝在响应体）——重申必须冻结至归还。
+        // 语义布尔由 Rust 下沉（info 事件 modes 对象直给——R2 壳层定形）
         (root["modes"] as? Map<*, *>)?.let { modes ->
-            val previous = modesState
-            modesState = parseModesState(modes, previous)
+            modesState =
+                ModesState(
+                    modes["phoneCall"] as? Boolean ?: false,
+                    modes["speechActive"] as? Boolean ?: false,
+                    modes["screenBorrowed"] as? Boolean ?: false,
+                )
             if (modesState.busy) {
                 log(
                     "AIRPLAY: /info modes——车机通话=${modesState.phoneCall} " +
@@ -1966,13 +1685,6 @@ class AirPlayClient(
         }
     }
 }
-
-/**
- * 配对失败重试退避（纯函数，回放测试钉死）：403 = 真车「信任已建立、车机未就绪」
- * 状态（真机 sysdiagnose：就绪窗约 18~20s，期间高频重试可能一直重置其状态机）；
- * 其余失败（端口未开等）保持快速轮询等邀请。
- */
-internal fun pairingRetryBackoffMs(failureMessage: String): Long = if (failureMessage.contains("403")) 5_000L else 500L
 
 /**
  * 配对产物密钥（fw: `_coreUtilsKeyHolder_CreateEncryptionKeysForContext`

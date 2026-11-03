@@ -18,11 +18,11 @@ import kotlin.concurrent.thread
  * 重邀、第二次即成）。
  *
  * 脚本化接收端 = 回环 ServerSocket，对所有 pair-setup / pair-verify 请求
- * 恒回 `HTTP/1.1 403 Forbidden`，驱动真实 [AirPlayClient] 配对循环，断言：
+ * 恒回 `HTTP/1.1 403 Forbidden`，驱动真实 [AirPlayLink] 配对循环，断言：
  *  1. `pairingForbidden` 被置位（verify/认证段的 403 也要标记——旧实现只认
  *     pair-setup 段，导致主控误走「断 BT 重试」与「明文降级」两条歧路）；
  *  2. 退避节奏：403 后 ≥4.5s 才进入下一轮尝试（5s 退避，见
- *     [pairingRetryBackoffMs]），不再以 500ms 猛攻可能重置车机就绪状态机；
+ *     ——退避节奏由 Rust flow 决策机给（wait 动作），不再以 500ms 猛攻可能重置车机就绪状态机；
  *  3. 12s 窗口内 2~4 轮尝试、不产出密钥（对 403 车机没有可成功的路径）。
  */
 class ForbiddenAudiReplayTest {
@@ -120,7 +120,7 @@ class ForbiddenAudiReplayTest {
                 sourceVersion = null,
                 ipAddresses = listOf("127.0.0.1"),
             )
-        val client = AirPlayClient(endpoint, log = { println("AIRPLAY-TEST: $it") }, context = null)
+        val client = AirPlayLink(endpoint, log = { println("AIRPLAY-TEST: $it") }, context = null)
         val setup =
             try {
                 client.runFlow(windowMs = 12_000, noPairingHint = false)

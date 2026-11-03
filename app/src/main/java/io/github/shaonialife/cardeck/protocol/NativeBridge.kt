@@ -383,6 +383,17 @@ object NativeBridge {
         bodyJson: ByteArray,
     ): String?
 
+    /** 事件通道发资源归属声明（modesChanged，命令体协议常量在 Rust
+     *  EventChannel::send_modes_assert）。返回 "" 或错误 JSON。 */
+    external fun nativeAirplayAssertModes(handle: Long): String?
+
+    /** D7 音频候选（从会话 'info' 存档选择——fw::airplay::session
+     *  InfoReply::audio_candidates）。返回 JSON 数组，空 = 基线回退。 */
+    external fun nativeAirplayAudioCandidates(
+        handle: Long,
+        preferCompat: Boolean,
+    ): String?
+
     /** 取走事件通道出站（应答/命令帧；null = 无）。 */
     external fun nativeAirplayEventTakeOutbound(handle: Long): ByteArray?
 

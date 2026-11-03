@@ -5,7 +5,7 @@ import android.content.Context
 import android.net.Network
 import android.os.SystemClock
 import android.view.KeyEvent
-import io.github.shaonialife.cardeck.airplay.AirPlayClient
+import io.github.shaonialife.cardeck.airplay.AirPlayLink
 import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioProfileMemory
 import io.github.shaonialife.cardeck.audio.AudioSender
@@ -278,7 +278,7 @@ object SessionController {
     var audioSender: AudioSender? = null
 
     @Volatile
-    var currentClient: AirPlayClient? = null
+    var currentClient: AirPlayLink? = null
 
     @Volatile
     var currentHiddenSource: HiddenDisplaySource? = null
@@ -306,7 +306,7 @@ object SessionController {
     @Volatile
     private var activeAudioProfile: AudioProfile? = null
 
-    /** 音频档位记忆的键（车机身份文本，见 [AirPlayClient.receiverIdentity]）。 */
+    /** 音频档位记忆的键（车机身份文本，见 [AirPlayLink.receiverIdentity]）。 */
     @Volatile
     private var activeAudioReceiverKey: String = ""
 
@@ -1692,7 +1692,7 @@ object SessionController {
      */
     fun startAudioChannel(
         context: Context,
-        client: AirPlayClient,
+        client: AirPlayLink,
         sharedSecret: ByteArray?,
         host: String?,
     ): Boolean {
@@ -1746,7 +1746,7 @@ object SessionController {
             // 试完，不必等下一次连接。这一点对当前场景很关键：102/AAC-LC 与 100/PCM 是
             // 两条完全不同的通路，前者不被接受时应当立刻退到后者，而不是让用户白连一次。
             var chosen: AudioProfile? = null
-            var streamInfo: AirPlayClient.AudioStreamInfo? = null
+            var streamInfo: AirPlayLink.AudioStreamInfo? = null
             for (candidate in ordered) {
                 val result = client.runAudioStream(sharedSecret, candidate, tuning)
                 if (result != null) {
@@ -1879,7 +1879,7 @@ object SessionController {
     @Volatile
     private var modesReclaimEpoch = 0L
 
-    private fun scheduleModesReclaim(client: AirPlayClient) {
+    private fun scheduleModesReclaim(client: AirPlayLink) {
         val epoch = ++modesReclaimEpoch
         Bg.run("modes-reclaim") {
             val start = android.os.SystemClock.uptimeMillis()
@@ -2058,7 +2058,7 @@ object SessionController {
                     }
 
                     fun newClient() =
-                        AirPlayClient(
+                        AirPlayLink(
                             effective,
                             log = { line -> appendLog(line) },
                             context = context.applicationContext,
@@ -2295,7 +2295,7 @@ object SessionController {
 
                                 "changeModes" -> {
                                     // 车机请求资源仲裁：状态更新与带 status+params 的 200 应答
-                                    // 已在 AirPlayClient 事件循环完成（空 200 曾让奥迪黑屏拆链）；
+                                    // 已在 AirPlayLink 事件循环完成（空 200 曾让奥迪黑屏拆链）；
                                     // 归还类事件（UNBORROW/UNTAKE）的补发由 onModesRestored 驱动。
                                 }
 
