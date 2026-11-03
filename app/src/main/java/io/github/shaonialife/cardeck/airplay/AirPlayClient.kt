@@ -129,22 +129,6 @@ class AirPlayClient(
     private var rustInfoEvent: org.json.JSONObject? = null
         private set
 
-    /** 本轮是否真正开始过配对（TCP 连上过接收端）。DiPlay 断链 hack 的启用条件。 */
-    @Volatile
-    var attemptedPairing: Boolean = false
-        private set
-
-    /**
-     * 接收端**根本不支持** HomeKit 配对（/pair-setup 回 404/405/501 或 455）。
-     *
-     * 这类是 pre-HomeKit 老车机（CarPlay 210.81 时代，catplay 的接收端分类 1）：
-     * 它们只接受 `et=NONE` 明文会话 + AES-CTR 屏幕流。继续在配对窗口里重试
-     * 120 秒毫无意义——实测用户看到的就是「一直连不上」（2026-10-19 奥迪 4xxx）。
-     */
-    @Volatile
-    var pairingUnsupported: Boolean = false
-        private set
-
     /** 控制通道是否已加密（pair-verify 完成）。false = 明文会话（老车机 / 未配对）。 */
     val controlEncrypted: Boolean get() = cipher != null
 
@@ -157,14 +141,6 @@ class AirPlayClient(
      * 不试 pair-setup 可以省掉注定失败的请求；若 TXT 判断有误，配对仍会在
      * SETUP 被拒后由调用方回退（不会比旧行为更差）。
      */
-    fun skipPairing(reason: String) {
-        pairingUnsupported = true
-        log("AIRPLAY: 跳过 HomeKit 配对（$reason）——使用 et=NONE 明文会话 + AES-CTR 屏幕流")
-    }
-
-    /** 重新建立控制通道（配对失败/跳过配对后，SETUP 之前必须有一次新连接）。 */
-    fun reconnect(timeoutMillis: Int = 5_000): Boolean = ensureConnected(timeoutMillis)
-
     /**
      * 配对：先试 pair-setup（注册长期公钥）→ pair-verify（派生控制密钥）；
      * 若 pair-setup 被 **403** 拒绝（真车 Audi MIB3 实测：iAP2 阶段已完成 MFi 信任，
@@ -656,9 +632,6 @@ class AirPlayClient(
         // 清掉，否则重连后的读线程会把明文应答当密文帧解，后续所有请求超时。
         cipher = null
         iapLink = null
-        // 注意：controlIapTx 不在这里 shutdown——close() 会被同实例的重试路径
-        // （retryWithPairing 等）复用，杀掉执行器会废掉重连后的 MIB3 出站；
-        // 守护线程常驻的代价可忽略（每客户端实例一根）
     }
 
     /**
@@ -1158,24 +1131,6 @@ class AirPlayClient(
     /** 车机 iAPSendMessage 字节入口（SessionController 事件命令处理器调用）。 */
     fun onIapEventBytes(data: ByteArray) {
         obtainIapLink().onCarBytes(data)
-    }
-
-    /**
-     * 控制通道 iAPSendMessage 出站（MIB3）：手机侧 iAP2 链路帧**必须**走 RTSP 控制
-     * 连接上的 POST /command——写在事件通道上时 MIB3 根本不读（DiPlay 宽容，奥迪
-     * 不宽容；AADisplay Frida 结论）。串行执行器：不阻塞链路节拍线程，与
-     * /feedback 心跳共用 request() 的 CSeq/写锁（线程安全设计见 AirPlayClient）。
-     */
-    private val controlIapTx =
-        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-            Thread(r, "mib3-iap-tx").apply { isDaemon = true }
-        }
-    private var controlIapCount = 0
-
-    fun postControlIap(frame: ByteArray) {
-        // MIB3 控制通道直写已退役（§10.62：控制通道写单持有者=Rust，Kotlin
-        // 明文直写加密通道 = BAD_DECRYPT 拆会话）。链路出站走事件通道（sendIap）。
-        log("IAPLINK: 控制通道直写已退役（帧丢弃——出站走事件通道）")
     }
 
     /** 音频流协商结果（RTP over UDP；密钥同视频流规则，盐用音频连接 ID）。 */
