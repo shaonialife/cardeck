@@ -83,6 +83,36 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
 
 ## 五、进度
 
-- [ ] R1 编排段收缩（onCarPlayEndpoint/AirPlayLink 壳）
-- [ ] R2 AirPlayLink 流壳
-- [ ] R3 删除日
+### 已完成（2026-11-03 Phase A 四刀，随刀装机验证 PID 存活零崩溃）
+- ✅ pass1（2af36ae）：MIB3 隧道 handoff 死链（armMib3 族/IapTunnelClient
+  250 行/btHandoff 状态族/detachBtForMib3Handoff）+ **routeOutbound Audi
+  出站丢弃 bug 修复**（收敛事件通道 iAPSendMessage）
+- ✅ pass2（6e29b4c）：skipPairing/reconnect/postControlIap+controlIapTx 族/
+  pairingUnsupported/attemptedPairing/Iap2MessageIds.kt 孤儿文件
+- ✅ pass3（70047e5）：setupDeviceId/persistentTunnelChannelMac/uuidText +
+  **/info modes 断链修复**（logInfoSummary 零调用致 modesState 初始化源
+  丢失——info 事件派发处恢复调用，JSONObject→Map 适配）
+- ✅ pass4（6c3e652）：CONTROLLER_FEATURES/音量探测族/PAIRING 窗口族常量 +
+  controlEncrypted/pairSetupRejected/cSeq/hidEvents 孤儿属性
+- ✅ protocol 侧 host.rs（b177816）：拉模型残留退役，trait 收缩到
+  {bt_write, uptime_ms}——推模型对接说明见 src/host.rs 头注释
+
+### 待做（压缩后按序开工）
+- [ ] **R1 编排段收缩**：SessionController 删端点合并族（enrichEndpointFromBrowser/
+      mergeBrowserEndpoint/preferEndpoint/drainPendingEndpoint/
+      watchForPendingStartSession/onLateEndpoint/txtValue）、awaitCtrlInvite、
+      resolveEndpointHost（B11 定谳后简化——地址集 Rust 透传，连接时直接用）；
+      onCarPlayEndpoint 保留流启动时序（SETUP→连端口→RECORD→编码器→音频
+      SETUP 2s 看门狗序=平台调度）
+- [ ] **R2 AirPlayLink 壳**：新文件替代 AirPlayClient（2011 行）——TCP socket +
+      nativeAirplay* 泵搬运 + keepalive UDP + Timing socket + 事件通道命令
+      POST；ControlCipher/AirPlayCrypto 暂以传输组件保留（E3 双界验证）；
+      AudioSender/VideoSender 调度接线
+- [ ] **R3 删除日**：SessionController 残余编排/AirPlayClient/NativeTunnelIap2Link/
+      Iap2SenderSession/Iap2Csm/BinaryPlist/AudioProfileMemory/TimingServer
+      （~3000 行）——新壳接线验证后整文件退役
+- [ ] **JNI 注入面接线**：set_platform_values（设备名/语言/时区）、
+      set_vehicle_status_categories（0xA100 类别）、set_location_requests/
+      set_nmea_sentences（0xFFFA/0xFFF0）——Kotlin 对接调用
+- [ ] **真机差分清单**（§11 坐标）：E3 HKDF 内参 / D7 位域枚举 / D8 流描述 /
+      B10 0x5001 copyDefault 字节域
