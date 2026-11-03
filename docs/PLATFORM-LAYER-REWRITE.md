@@ -135,7 +135,7 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
       - 退役：ControlCipher（网络面加密早已全 Rust）+ ControlCipherTest +
         ModesStateParseTest（迁 Rust）+ 两处死 BinaryPlist 体 + 5 死常量 +
         4 孤儿注释块 + pairingRetryBackoffMs
-      - 验证：Rust 194 全绿；Kotlin compile/JVM/spotless/lint 全绿；
+      - 验证：Rust 194 全绿；Kotlin compile/JVM 测试+spotless+lint 全绿；
         **装机/真机回归待平板重连**（D7 候选恢复 + 会话全链）
 - [x] **R3 删除日**（2026-11-03 完成，android-carplay（R3 提交）+ protocol（R3
       Rust 提交））：消费面复核后删除面收敛——
@@ -161,5 +161,43 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
       0xFFF0 位置集是协议数据（非平台值）——归位 Rust 引擎缺省域（Audi
       真车抓包，工单1/3 集字节钉死，runtime::session_create 注入），
       Kotlin 无更优数据源，覆盖注入口留 Rust 不设死 JNI
-- [ ] **真机差分清单**（§11 坐标）：E3 HKDF 内参 / D7 位域枚举 / D8 流描述 /
-      B10 0x5001 copyDefault 字节域
+- [x] **注入面首连失败修复**（2026-11-03 完成，protocol 9a8a618）：CFString
+      参数补 NUL 终止符（C 串语义归位——`_iAP2MsgAddCFStringParam`；
+      R1 修 0x4301 时已实证真机字符串域带尾 NUL）。通知波五处字符串参数
+      （4E0C/4E09/4E0A/4E0E/4300 bluetoothIdentifier）此前裸值无 NUL——
+      注入面让 4E0E/4300-MAC 首次上线即触发台架 readString 的 NUL 铁律
+      （Iap2WireCodec "not NUL terminated"）→ 控制循环死 → 整栈拆链。
+      诊断链：注入轮 vs 工作轮出站帧逐字节对比 → T1 二分（抑制 4E0E 全链
+      绿，隔离 offender）→ 台架源码定罪。修复后 4E0E 回归，5703+4301 双至
+      （失败轮缺的正是这两帧），推流稳定（帧 #1800/keepAlive #60）。
+      196 lib 测试全绿
+
+## 六、收尾状态（2026-11-03）
+
+- **台架可验证范围已推到底**：连接链路协议决策 100% 在 Rust（iAP2 全链/
+  AirPlay 控制域/配对/事件通道/timing/keepalive/流 SETUP）；Kotlin 只剩
+  平台能力（socket/UDP 搬运、媒体硬件、WiFi 加入、UI 粘合）+ 数据面加密
+  （E3，Phase B）
+- 剩余三件（非「做」能推进）：
+  1. jniLibs so 入库——待用户「提交」
+  2. **真机差分清单**（§11 坐标）：E3 HKDF 内参 / D7 位域枚举 / D8 流描述 /
+     B10 0x5001 copyDefault——需真车，台架验不了
+  3. **Phase B**：数据面加密统一入 Rust——刻意留到 E3 真车双界验证后
+
+## 七、纪律（重写期间同样有效）
+
+- 新壳内**零协议逻辑**：任何字节构造/决策疑问都以 `fw:` 锚定在 Rust 侧
+  加能力，Kotlin 只搬运与执行
+- 每步：Kotlin compile + JVM 测试 + spotless/lint + 装机存活
+- 真机差分清单不变（§11）：E3 HKDF 内参 / D7 位域 / D8 流描述 / B10 0x5001
+
+## 附：R2/R3 消费面复核定谳（防后续误删）
+
+- **NativeTunnelIap2Link 留**：第二 Rust iAP2 会话的事件通道薄层
+  （nativeSessionCreate 0x2000 + feed/tick + 0x6800/0x6802 事件）——媒体键
+  /旋钮通路，协议行为全在原生；Kotlin 只剩 marker 应答（传输层探测 6 字节
+  常量）+ HID 平台注入 + 线格式 TLV 参数遍历
+- **TimingServer 留**：AudioSender/AudioSyncPacket 共用的平台时间工具
+  （ntpFromNanos）；UDP 服务面为 AirPlayLink 消费
+- **Iap2SenderSession/Iap2Csm 留**：iAP2 会话泵（R1 已收缩纯驱动层——
+  事件直通 + 镜像帧日志）；Iap2Csm 只剩解析侧
