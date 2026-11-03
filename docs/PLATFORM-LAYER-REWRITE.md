@@ -137,9 +137,26 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
         4 孤儿注释块 + pairingRetryBackoffMs
       - 验证：Rust 194 全绿；Kotlin compile/JVM/spotless/lint 全绿；
         **装机/真机回归待平板重连**（D7 候选恢复 + 会话全链）
-- [ ] **R3 删除日**：SessionController 残余编排/NativeTunnelIap2Link/
-      Iap2SenderSession/Iap2Csm/BinaryPlist/AudioProfileMemory/TimingServer
-      （~3000 行）——新壳接线验证后整文件退役
+- [x] **R3 删除日**（2026-11-03 完成，android-carplay（R3 提交）+ protocol（R3
+      Rust 提交））：消费面复核后删除面收敛——
+      - **否决删除**（清单前提过时）：NativeTunnelIap2Link（第二 Rust iAP2
+        会话的事件通道薄层，媒体键/旋钮通路）、TimingServer（AudioSender
+        共用平台时间工具）、Iap2SenderSession/Iap2Csm（iAP2 会话泵，R1
+        已收缩纯驱动层）
+      - **已删**：AudioProfileMemory + Test + SessionController 记忆族
+        （attributeAudioTeardown/audioCandidateKeys/activeAudio 三字段/
+        AUDIO_PROFILE_PROBE_MS/audioPreferCompat vestige——D7 候选序已全
+        Rust，净 -700 行）；BinaryPlist + 2 测试（keepAlive 统计体迁 Rust
+        fw::airplay::screen，nativeAirplayKeepAliveStatsBody）
+      - **断链恢复**：keepAliveSendStatsAsBody（M5.2 起 SetupInfo 硬编码
+        false，/info 该键无人读——奥迪 3315 声明 true）；CarPlay 210.81
+        「根对象落字节 8」布局钉迁 Rust（plist crate 实测合规）
+      - 验证：Rust 196 全绿；Kotlin JVM 143 全绿 + spotless/lint 绿；装机
+        0.1.28.46 真机全链绿（R2 modes 语义域首现真值 speechActive=true→
+        busy 冻结有数据源）
+- [ ] **JNI 注入面接线**：set_platform_values（设备名/语言/时区）、
+      set_vehicle_status_categories（0xA100 类别）、set_location_requests/
+      set_nmea_sentences（0xFFFA/0xFFF0）——Kotlin 对接调用
 - [ ] **JNI 注入面接线**：set_platform_values（设备名/语言/时区）、
       set_vehicle_status_categories（0xA100 类别）、set_location_requests/
       set_nmea_sentences（0xFFFA/0xFFF0）——Kotlin 对接调用
