@@ -10,7 +10,6 @@ import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.TcpLiveness
 import io.github.shaonialife.cardeck.protocol.NativeBridge
-import io.github.shaonialife.cardeck.util.DeviceIdentity
 import java.io.IOException
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -420,6 +419,12 @@ class AirPlayClient(
                     if (!pairingStarted) {
                         pairingStarted = true
                         rustInfoEvent = json
+                        runCatching {
+                            val map = mutableMapOf<String, Any?>()
+                            val keys = json.keys()
+                            while (keys.hasNext()) map[keys.next()] = json.opt(keys.next())
+                            logInfoSummary(map)
+                        }
                         log("AIRPLAY: info deviceID=${json.optString("deviceID")}")
                         // startPairing 返回事件（pinRequired = PIN 流已起，
                         // setup M1 未发——§10.49）：此前被丢弃，凭它进入等码期
@@ -1922,39 +1927,6 @@ class AirPlayClient(
      * 一直没暴露问题。BT 阶段必然已解析并缓存（0x4300/0x4E0E 也依赖它），
      * 这里优先读缓存避免再起 shell；缓存缺失才走一次阻塞解析。
      */
-    private fun setupDeviceId(): String {
-        val applicationContext = context ?: return DeviceIdentity.PLACEHOLDER_MAC
-        // 缓存命中即返回（BT 阶段已解析）；缺失时才允许一次阻塞查询。
-        return DeviceIdentity.cachedBluetoothMac()
-            ?: DeviceIdentity.bluetoothMac(applicationContext)
-    }
-
-    /**
-     * type-130 channelID 的伪 MAC（"02:xx:xx:xx:xx:xx"，冒号分隔大写）：SHA-256(本机
-     * 持久化 UUID) 前 5 字节。首次生成后跨会话不变（SharedPreferences）——接收端可能
-     * 把 channelID 当隧道对端标识记忆，每轮换值会造成「陌生客户端」。刻意与
-     * deviceID 的真实蓝牙 MAC 无关（参考实现同款，二者不对账）。
-     */
-    private fun persistentTunnelChannelMac(): String? =
-        runCatching {
-            val prefs =
-                context?.getSharedPreferences("airplay_identity", Context.MODE_PRIVATE)
-                    ?: return@runCatching null
-            var uuid = prefs.getString("tunnel_channel_uuid", null)
-            if (uuid == null) {
-                uuid =
-                    java.util.UUID
-                        .randomUUID()
-                        .toString()
-                prefs.edit().putString("tunnel_channel_uuid", uuid).apply()
-            }
-            val digest =
-                java.security.MessageDigest
-                    .getInstance("SHA-256")
-                    .digest(uuid.toByteArray())
-            return@runCatching "02:" + (0 until 5).joinToString(":") { "%02X".format(digest[it]) }
-        }.getOrNull()
-
     private fun typeName(value: Any?): String =
         when (value) {
             null -> "null"
@@ -1963,30 +1935,6 @@ class AirPlayClient(
             is Map<*, *> -> "dict(${value.size})"
             is String -> "str(${value.length})"
             else -> value.javaClass.simpleName
-        }
-
-    /**
-     * `/info displays[].uuid` 统一字符串化。
-     *
-     * 三种编码都见过：字符串（奥迪 "0"/"1"、部分固件给 36 位 UUID）、
-     * **16 字节 UUID 类型**（bplist 0xB，`toString()` 会变成 `[B@1f2e3d4` 这种垃圾）、
-     * CFKeyedArchiver 的 UID（整数）。屏幕流 SETUP 里的 `uuid` 必须与接收端声明的
-     * **完全一致**，否则车机可能收下流却不往任何屏上绑（表现为「连上了没画面」）。
-     */
-    private fun uuidText(value: Any?): String? =
-        when (value) {
-            null -> null
-            is String -> value.takeIf { it.isNotBlank() }
-            is ByteArray ->
-                if (value.size == 16) {
-                    val hex = value.joinToString("") { "%02x".format(it) }
-                    "${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-" +
-                        "${hex.substring(16, 20)}-${hex.substring(20)}"
-                } else {
-                    value.joinToString("") { "%02x".format(it) }
-                }
-            is Number -> value.toString()
-            else -> value.toString().takeIf { it.isNotBlank() }
         }
 
     private fun logInfoSummary(root: Map<*, *>) {
