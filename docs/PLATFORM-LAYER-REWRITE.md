@@ -154,11 +154,12 @@ JNI 注入面接线完成度盘点（set_platform_values 等）。
       - 验证：Rust 196 全绿；Kotlin JVM 143 全绿 + spotless/lint 绿；装机
         0.1.28.46 真机全链绿（R2 modes 语义域首现真值 speechActive=true→
         busy 冻结有数据源）
-- [ ] **JNI 注入面接线**：set_platform_values（设备名/语言/时区）、
-      set_vehicle_status_categories（0xA100 类别）、set_location_requests/
-      set_nmea_sentences（0xFFFA/0xFFF0）——Kotlin 对接调用
-- [ ] **JNI 注入面接线**：set_platform_values（设备名/语言/时区）、
-      set_vehicle_status_categories（0xA100 类别）、set_location_requests/
-      set_nmea_sentences（0xFFFA/0xFFF0）——Kotlin 对接调用
+- [x] **JNI 注入面接线**（2026-11-03 完成，protocol eb895ce + android-carplay
+      8383bff）：nativeSessionFlowStart 扩参（设备名/语言/时区/夏令时，
+      bytes 约定）→ 4E 通知波身份域；真机验证 name=lzh-荣耀Magic7 Pro
+      lang=zh-Hans-CN tz=480 直入。**范围定谳**：0xA100 类别与 0xFFFA/
+      0xFFF0 位置集是协议数据（非平台值）——归位 Rust 引擎缺省域（Audi
+      真车抓包，工单1/3 集字节钉死，runtime::session_create 注入），
+      Kotlin 无更优数据源，覆盖注入口留 Rust 不设死 JNI
 - [ ] **真机差分清单**（§11 坐标）：E3 HKDF 内参 / D7 位域枚举 / D8 流描述 /
       B10 0x5001 copyDefault 字节域
