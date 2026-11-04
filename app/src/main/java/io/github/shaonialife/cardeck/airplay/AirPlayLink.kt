@@ -620,27 +620,20 @@ class AirPlayLink(
     }
 
     /**
-     * 声明 HID 输入模式（hidSetInputMode，FromDevice 方向——手机→车机的触摸启用命令）。
-     * 对照 catplay CommandHidSetInputMode {hidInputMode u8, uuid string}；
-     * uuid 为 /info hidDevices[].uuid 的十六进制串（DiPlay sendHidReport 同款 uid.toString(16)）。
-     * 奥迪 display features=0x08（高保真触摸）+ hidDevices 齐备，触摸无报文的最大嫌疑
-     * 是缺这一步武装。
+     * 声明 HID 输入模式（hidSetInputMode——手机→车机的触摸启用命令）。
+     * **命令体在 Rust**（fw: SetHIDInputMode_block_invoke @0x22789351c——
+     * dict{uuid, hidInputMode} → sendCommandInternal）；uuid 为 /info
+     * hidDevices[].uuid 的十六进制串。奥迪 display features=0x08（高保真
+     * 触摸）+ hidDevices 齐备，缺这步武装车机不发 hidSendReport。
      */
     fun sendHidSetInputMode(
         deviceUuidHex: String,
         mode: Int = 0,
     ): Boolean {
-        val sent =
-            postEventCommand(
-                linkedMapOf(
-                    "type" to "hidSetInputMode",
-                    "params" to
-                        linkedMapOf<String, Any?>(
-                            "hidInputMode" to mode.toLong(),
-                            "uuid" to deviceUuidHex,
-                        ),
-                ),
-            )
+        val result = NativeBridge.nativeAirplaySendHidSetInputMode(controlSessionHandle, deviceUuidHex, mode)
+        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
+        if (!sent) log("EVENT: hidSetInputMode 发送失败(rust) - $result")
+        pumpEventOutbound()
         log("AIRPLAY: hidSetInputMode(事件通道) uuid=$deviceUuidHex mode=$mode ok=$sent")
         return sent
     }
@@ -676,40 +669,8 @@ class AirPlayLink(
         }
     }
 
-    /** 命令字典 → JSON（ByteArray 值 → 0..255 整数数组，Rust json_to_plist
-     *  还原为 plist Data——与 plist_to_json 输出互为双射）。 */
-    private fun eventCommandJson(command: Map<String, Any?>): org.json.JSONObject {
-        fun wrap(v: Any?): Any? =
-            when (v) {
-                is ByteArray -> org.json.JSONArray(v.map { it.toInt() and 0xFF })
-                is Map<*, *> ->
-                    org.json.JSONObject(
-                        v.entries.associate { it.key.toString() to wrap(it.value) },
-                    )
-                is List<*> -> org.json.JSONArray(v.map { wrap(it) })
-                else -> v
-            }
-        return org.json.JSONObject(command.entries.associate { it.key.toString() to wrap(it.value) })
-    }
-
-    /** 在事件通道上发 POST /command（Rust 组帧+加密入队）。未就绪/被拒返回 false。 */
-    fun postEventCommand(command: Map<String, Any?>): Boolean {
-        if (eventCommandSocket == null) return false
-        return try {
-            val json = eventCommandJson(command)
-            val result = NativeBridge.nativeAirplaySendCommand(controlSessionHandle, json.toString().toByteArray())
-            if (!result.isNullOrEmpty() && result.contains("\"type\":\"error\"")) {
-                log("EVENT: 命令发送失败(rust) - $result")
-                false
-            } else {
-                pumpEventOutbound()
-                true
-            }
-        } catch (error: IOException) {
-            log("EVENT: 命令发送失败 - ${error.message}")
-            false
-        }
-    }
+    /** 命令发送面已全 Rust 化（A10 清点——hidSetInputMode/iAPSendMessage/
+     *  modesChanged 各有专用 native 入口，dict 构造不过宿主）。 */
 
     /**
      * 车机资源/应用状态快照（/info 自报与 changeModes 事件共同更新）。
@@ -984,17 +945,15 @@ class AirPlayLink(
     private var sendIapCount = 0
 
     /**
-     * 手机→车机 iAP2 消息：事件通道 iAPSendMessage 命令（对照 DiPlay sendIapMessage，
-     * params 信封 + data 字节，catplay CommandIApSendMessage 同款）。
+     * 手机→车机 iAP2 消息：事件通道 iAPSendMessage 命令。
+     * **命令体在 Rust**（fw: setUpAPAccClientEndpointForIdType_block_invoke
+     * @0x227892c60——dict{data} → sendCommandInternal）。
      */
     fun sendIap(data: ByteArray): Boolean {
-        val sent =
-            postEventCommand(
-                linkedMapOf(
-                    "type" to "iAPSendMessage",
-                    "params" to linkedMapOf<String, Any?>("data" to data),
-                ),
-            )
+        val result = NativeBridge.nativeAirplaySendIap(controlSessionHandle, data)
+        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
+        if (!sent) log("EVENT: iAPSendMessage 发送失败(rust) - $result")
+        pumpEventOutbound()
         sendIapCount++
         if (sendIapCount <= 10) {
             log(

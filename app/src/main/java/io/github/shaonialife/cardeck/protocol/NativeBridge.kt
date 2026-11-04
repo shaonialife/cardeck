@@ -482,6 +482,23 @@ object NativeBridge {
         sealed: ByteArray,
     ): ByteArray?
 
+    /** HID 输入模式武装命令（fw: SetHIDInputMode_block_invoke @0x22789351c
+     *  ——dict{uuid, hidInputMode} → sendCommandInternal("hidSetInputMode")；
+     *  命令体在 Rust）。返回 "" 或错误 JSON。 */
+    external fun nativeAirplaySendHidSetInputMode(
+        handle: Long,
+        uuid: String,
+        mode: Int,
+    ): String?
+
+    /** iAP2 虚拟链路字节注入命令（fw: setUpAPAccClientEndpointForIdType_
+     *  block_invoke @0x227892c60——dict{data} → sendCommandInternal
+     *  ("iAPSendMessage")；命令体在 Rust）。返回 "" 或错误 JSON。 */
+    external fun nativeAirplaySendIap(
+        handle: Long,
+        data: ByteArray,
+    ): String?
+
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
 
     /** 建连接编排决策机（每轮 runFlow 一个；[noPairingHint] = TXT 未声明
