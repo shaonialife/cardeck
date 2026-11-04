@@ -139,6 +139,10 @@ class WifiCarPlayConnector(
         isCancelled: () -> Boolean = { false },
         /** 首窗无回调时的快速探测（毫秒级 shell 往返 + ≤3s 绑定，必须不阻塞重发）。 */
         quickFallback: (() -> Network?)? = null,
+        /** 首窗零回调且未连着热点 = 系统确认弹框可能在等用户应答——保持请求并提示
+         *  用户（**不 release 不重发**：重发会撤回展示中的弹框，2026-11-04 DiPlay
+         *  连公司网场景实测弹框等待形态）。 */
+        onPendingHint: (() -> Unit)? = null,
         /** 重发窗也无回调后的深度兜底（connect-network，10s 量级——本轮窗口已过，为下一轮省时间）。 */
         deepFallback: (() -> Network?)? = null,
     ): JoinResult {
@@ -159,34 +163,36 @@ class WifiCarPlayConnector(
         // 紧邻操作，请求**永久 pending** 零回调）各阶段的预算：
         //  ① 首窗 5s（正常入网实测 0.03~3s；5s 零回调即挂起特征）；
         //  ② 快速探测（quickFallback：系统已自己连上该 SSID 则直接绑定，≤3s）；
-        //  ③ 重发 specifier（实测挂起后 release→重发 1.6s 即入网——**被验证有效的
-        //     恢复手段，必须紧跟探测**），20s 窗；
+        //  ③ 弹框应答窗 8s（2026-11-04 DiPlay 连公司网场景定谳）：零回调 ≠ 死挂——
+        //     可能是**系统确认弹框在等用户应答**（未保存 SSID 首次必弹）。此时
+        //     **保持请求不 release 不重发**（重发会撤回展示中的弹框），置提示让用户
+        //     去点；用户应答 → onAvailable 直接成功。
         //  ④ 深度兜底（deepFallback：connect-network 直连，10s 量级）——本轮窗口必然
         //     已过，价值是让手机先挂上热点，下一轮（车机 0.17s 即重连 BT）走「已连着」近路。
+        // 旧「release→重发 1.6s 即入网」的 workaround 是已保存 SSID 场景的形态；对
+        // 弹框等待场景重发有害（撤框重出）。两类形态无法从零回调区分——先提示后兜底。
         // 旧 20s 首窗的教训：第 1 轮首窗没走完车机就拆链（15.2s），排在首窗**之后**的
         // 任何兜底都轮不到执行；第 2 轮 20s+1.6s=21.6s 入网时 7000 端口已拒绝连接。
-        // 已知代价：首次连接的系统授权弹窗若被用户攥过 5s，本轮请求会被撤回重发、
-        // 弹窗重出一次——一次性 UX 代价，远小于整车连接失败。
         val firstWindowMs = minOf(timeoutMillis, 5_000L)
-        val secondWindowMs = minOf(timeoutMillis - firstWindowMs, 20_000L).coerceAtLeast(0)
+        val pendingWindowMs = minOf(timeoutMillis - firstWindowMs, 8_000L).coerceAtLeast(0)
         val unavailable = AtomicBoolean(false)
         var network = requestAndAwait(ssid, request, firstWindowMs, isCancelled, unavailable)
-        // 系统明确拒绝（onUnavailable：用户拒了授权框/热点不在范围）后重发无意义，
-        // 只会再拒一次——与挂起（零回调）必须区分开。
-        if (network == null && !isCancelled() && !unavailable.get() && secondWindowMs > 0) {
-            release()
+        // 系统明确拒绝（onUnavailable：用户拒了授权框/热点不在范围）后兜底/等待无意义，
+        // 与挂起/弹框（零回调）必须区分开。
+        if (network == null && !isCancelled() && !unavailable.get() && pendingWindowMs > 0) {
+            // **此分支内不得 release**：撤请求 = 撤掉展示中的系统确认弹框。
             if (!isCancelled()) {
-                // 快速兜底成功 = 已绑定到车机热点（系统自动重连的场景），直接返回；
-                // 对「系统已保存并连着热点」的车型重发 specifier 只会再挂（已保存
-                // SSID 正是挂起条件之一），短路是正确行为。
+                // 快速兜底成功 = 已绑定到车机热点（系统自动重连的场景），直接返回。
                 quickFallback?.invoke()?.let { fallback ->
-                    log("WiFi: 快速兜底入网成功（$fallback）——跳过 specifier 重发")
+                    log("WiFi: 快速兜底入网成功（$fallback）——跳过弹框应答窗")
                     return JoinResult.Joined(fallback)
                 }
             }
             if (!isCancelled()) {
-                log("WiFi: 首窗 ${firstWindowMs / 1000}s 零回调——specifier 可能挂起，重发网络请求（实测重发 1.6s 可入网）")
-                network = requestAndAwait(ssid, request, secondWindowMs, isCancelled, unavailable)
+                // 弹框应答窗：同一请求保持活着，提示用户去点弹框。
+                log("WiFi: 首窗 ${firstWindowMs / 1000}s 零回调——保持 specifier 请求，提示用户应答系统弹框（${pendingWindowMs / 1000}s）")
+                onPendingHint?.invoke()
+                network = awaitSameRequest(request, unavailable, pendingWindowMs, isCancelled)
             }
             if (network == null && !isCancelled() && !unavailable.get()) {
                 release()
@@ -199,7 +205,7 @@ class WifiCarPlayConnector(
             }
         }
         if (network == null) {
-            log("WiFi: 等待加入 \"$ssid\" 失败（首窗 ${firstWindowMs / 1000}s + 重发窗 ${secondWindowMs / 1000}s + 两级兜底）")
+            log("WiFi: 等待加入 \"$ssid\" 失败（首窗 ${firstWindowMs / 1000}s + 弹框应答窗 ${pendingWindowMs / 1000}s + 深度兜底）")
             release()
             return JoinResult.Unavailable
         }
@@ -264,6 +270,33 @@ class WifiCarPlayConnector(
             }
         }
         return result.get()
+    }
+
+    /**
+     * 弹框应答窗：**同一请求/callback 继续等待**（不 release 不重发——重发会撤回
+     * 展示中的系统确认弹框）。等待期间每 200ms 分片检查取消。
+     */
+    private fun awaitSameRequest(
+        request: NetworkRequest,
+        unavailable: AtomicBoolean,
+        timeoutMillis: Long,
+        isCancelled: () -> Boolean,
+    ): Network? {
+        // callback 已由 requestAndAwait 注册并活着；这里只延后判定时间。
+        // result/latch 在 callback 闭包里——重新等待需要重新拿 latch/result，
+        // 简化实现：轮询 boundNetwork（callback onAvailable 已写入）。
+        val deadline = SystemClock.uptimeMillis() + timeoutMillis
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (isCancelled()) return null
+            if (unavailable.get()) return null
+            boundNetwork.get()?.let { return it }
+            try {
+                Thread.sleep(200)
+            } catch (_: InterruptedException) {
+                return null
+            }
+        }
+        return null
     }
 
     /** 构造 specifier；WEP 或参数不合法返回 null（走旧路径）。 */

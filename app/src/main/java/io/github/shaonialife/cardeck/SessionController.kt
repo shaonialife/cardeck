@@ -1044,7 +1044,11 @@ object SessionController {
                         timeoutMillis = SPECIFIER_JOIN_TIMEOUT_MS,
                         isCancelled = { connectCancelled },
                         quickFallback = { specifierQuickFallback(wifi) },
-                        deepFallback = { specifierDeepFallback(wifi) },
+                        onPendingHint = {
+                            phaseHint = "请在系统弹窗中确认连接车机热点"
+                            appendLog(">>> 请在系统弹窗中点「连接」以加入 \"${wifi.ssid}\"（弹框等待中）")
+                        },
+                        deepFallback = { joinViaConnectNetwork(wifi) },
                     )
                 }
             }
@@ -1106,10 +1110,9 @@ object SessionController {
     }
 
     /**
-     * specifier 重发窗也无回调后的深度兜底：`cmd wifi connect-network` 直连热点。
-     *
-     * 执行到这一步时本轮车机窗口（~15s）必然已过——价值是让手机先挂上车机热点，
-     * 下一轮（车机拆链后 0.17s 即重连 BT）走「系统已连着」快速兜底/近路，不再空转。
+     * shell 直连热点：`cmd wifi connect-network`（2026-11-04 升格为主路径——
+     * DiPlay 实测 specifier 双条件下两窗 25s 全挂而 connect-network 0.6s 入网；
+     * 作兜底时（specifier 路径内）执行到这一步本轮窗口必然已过，价值是为下一轮占位）。
      *
      * 清理登记的时机是**关键**：connect-network 返回 ok 的瞬间该热点已进系统配置，
      * 必须立即登记 [shellFallbackCleanupSsid]——若等「轮询到切网 + bind 成功」才
@@ -1121,7 +1124,7 @@ object SessionController {
      * 意愿的证据——可能正是我们自己上一轮遗留的保存；来历不明（存在但非用户保留）
      * 保守不删，由 specifier 入口的「清除/保留」询问流程正当解决。
      */
-    private fun specifierDeepFallback(wifi: Iap2SenderSession.WifiConfiguration): Network? {
+    private fun joinViaConnectNetwork(wifi: Iap2SenderSession.WifiConfiguration): Network? {
         if (!shellWifiReady()) return null
         val connector = wifiConnector ?: return null
         appendLog(
@@ -1193,7 +1196,16 @@ object SessionController {
         val ssid = shellFallbackCleanupSsid ?: return
         shellFallbackCleanupSsid = null
         Bg.run("wifi-fallback-cleanup") {
-            val r = Shell.exec("cmd wifi forget-network ${shellQuote(ssid)}", 5_000L)
+            // netId 形态优先（2026-11-04 DiPlay 实测：华为对 SSID 形态 forget
+            // 返回失败——cmd wifi list-networks 解析 netId 后按 id 删）
+            val ids = savedNetworkIds(ssid)
+            val r =
+                if (ids.isNotEmpty()) {
+                    val results = ids.map { Shell.exec("cmd wifi forget-network $it", 5_000L) }
+                    Shell.Result(if (results.all { it.ok }) 0 else 1, results.joinToString(";") { it.output.take(40) })
+                } else {
+                    Shell.exec("cmd wifi forget-network ${shellQuote(ssid)}", 5_000L)
+                }
             appendLog(
                 "WIFI: 会话末清除 shell 兜底保存的 \"$ssid\" ok=" + r.ok +
                     (if (!r.ok) "（请到 系统设置>WLAN 手动删除）" else ""),
