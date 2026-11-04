@@ -665,9 +665,14 @@ class AirPlayLink(
     /** 取走 Rust 事件通道出站（车机命令应答/我方命令帧）写网；无出站是常态空转。 */
     private fun pumpEventOutbound() {
         val socket = eventCommandSocket ?: return
-        val out = NativeBridge.nativeAirplayEventTakeOutbound(controlSessionHandle) ?: return
-        if (out.isEmpty()) return
+        // **take 必须在锁内**（2026-11-04 断连根因）：取帧与写网原子化——
+        // 两个线程并发 pump 时锁外 take 会帧序颠倒（A 取 nonce N、B 取
+        // nonce N+1、B 先写 A 后写）→ ChaCha 写计数乱序 → 接收端
+        // BAD_DECRYPT 拆链（K40 实测 10:41:59 encrypted=21741 帧解密失败，
+        // 持续触摸洪泛放大竞态）。锁内取 = 写网顺序 == Rust 出队序 == nonce 序。
         synchronized(eventWriteLock) {
+            val out = NativeBridge.nativeAirplayEventTakeOutbound(controlSessionHandle) ?: return
+            if (out.isEmpty()) return
             try {
                 socket.getOutputStream().apply {
                     write(out)
