@@ -210,7 +210,16 @@ class AirPlayLink(
         flowConnectTick = 0
         val identity = loadOrCreateIdentity()
         log("AIRPLAY: 控制器身份 pairingId=${identity.pairingId}")
-        val flowHandle = NativeBridge.nativeAirplayFlowBegin(noPairingHint)
+        // 会话墙钟锚（fw: NTPClockSetEpoch @0x19293f7a0 锚定语义——时钟
+        // 纪元 = 锚定时刻的 NTP-1900 秒，之后线性流逝）。会话内恒定：
+        // 单调平滑不受墙钟步进影响；与 timing 应答秒域同基（timing.rs
+        // respond 同加 NTP_EPOCH_OFFSET）。差值消费端无感（Audi 实测形态），
+        // 绝对锚消费端修复（Honda/Alpine「无锚不排播」口径）。
+        ntpEpochAnchorSecs =
+            System.currentTimeMillis() / 1000 +
+            NTP_EPOCH_OFFSET_SECS -
+            System.nanoTime() / 1_000_000_000
+        val flowHandle = NativeBridge.nativeAirplayFlowBegin(if (noPairingHint) 1 else 0)
         if (flowHandle == 0L) {
             log("AIRPLAY: ⚠ flow 决策机创建失败（so 未加载？）")
             pairingInProgress = false
@@ -1030,6 +1039,10 @@ class AirPlayLink(
     )
 
     companion object {
+        /** NTP 纪元偏移（1900→1970，秒）——墙钟锚计算（fw: NTPClockSetEpoch
+         *  锚定域；与 timing.rs respond 的 NTP_EPOCH_OFFSET 同值）。 */
+        const val NTP_EPOCH_OFFSET_SECS = 2_208_988_800L
+
         // D7 基线三常量（audioCandidates 的兜底档；位图/流类型语义在 Rust
         // audio_semantics 模块——R2 壳层定形）。
 
@@ -1517,6 +1530,13 @@ class AirPlayLink(
 
     /** 写侧串行：CSeq 分配 + 加密器写计数 + socket 写必须原子（读侧在独立线程）。 */
     private val rtspWriteLock = Any()
+
+    // ---- 会话时钟锚 ----
+
+    /** 会话墙钟锚（NTP-1900 秒 @ 进程时钟零点；runFlow 每连接轮刷新）。 */
+    @Volatile
+    var ntpEpochAnchorSecs: Long = 0L
+        private set
 
     // ---- 身份持久化 ----
 

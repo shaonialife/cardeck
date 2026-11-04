@@ -427,6 +427,7 @@ object NativeBridge {
         width: Int,
         height: Int,
         nowNanos: Long,
+        epochNtpSecs: Int,
     ): ByteArray?
 
     /** VideoFrame 密封整帧（128B 全量头 + 密封载荷；A4 下沉——fw:
@@ -437,6 +438,7 @@ object NativeBridge {
         handle: Long,
         payload: ByteArray,
         ptsNanos: Long,
+        epochNtpSecs: Int,
     ): ByteArray?
 
     /** 音频 RTP 密封整包（A1 下沉——fw: cryptor mode 1 @0x227969f68：
@@ -454,13 +456,16 @@ object NativeBridge {
     ): ByteArray?
 
     /** 音频同步包 20B（A2 下沉——RTCP PT=84/M=1，NTP=up_ticks_to_ntp
-     *  网络序 @0x192867a74-84，与 timing 应答同基）。纯函数。 */
+     *  网络序 @0x192867a74-84）。[epochNtpSecs] = 会话墙钟锚（NTP-1900 秒，
+     *  fw: NTPClockSetEpoch @0x19293f7a0 锚定语义——与 timing 应答同基）。
+     *  纯函数。 */
     external fun nativeAirplayAudioSyncPacket(
         seq: Int,
         currentTs: Int,
         nextTs: Int,
         uptimeNanos: Long,
         first: Int,
+        epochNtpSecs: Int,
     ): ByteArray?
 
     /** HID 报告分派（A6 下沉——fw::airplay::hid 判定树：media → nav →
@@ -502,8 +507,10 @@ object NativeBridge {
     // ---- 连接编排决策机（fw::airplay::flow——决策全在 Rust，Kotlin 只泵）----
 
     /** 建连接编排决策机（每轮 runFlow 一个；[noPairingHint] = TXT 未声明
-     *  HK_PAIRING_AND_ENCRYPT 的兼容层初值）。返回 flowHandle。 */
-    external fun nativeAirplayFlowBegin(noPairingHint: Boolean): Long
+     *  HK_PAIRING_AND_ENCRYPT 的兼容层初值）。返回 flowHandle。
+     *  **Int 约定（jboolean ABI 加固）**：Kotlin Boolean→JNI 高位垃圾隐患
+     *  （A1 期 AAC 回环实证）——0/1 显式传值。 */
+    external fun nativeAirplayFlowBegin(noPairingHint: Int): Long
 
     /** 决策机步进：[reportJson] = 上一个动作结果
      *  （begin/ok/connectFail/pairDone/pairForbidden/pairUnsupported/pairFail/

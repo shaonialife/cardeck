@@ -33,6 +33,8 @@ class VideoSender(
      * 域；streamSetup 应答时按车机 `et` 形态建立，宿主零钥面）。
      */
     private val sessionHandle: Long,
+    /** 会话墙钟锚（NTP-1900 秒——帧头/config 时间戳同基化，见 AirPlayLink）。 */
+    private val ntpEpochAnchorSecs: Long = 0L,
     /** H.264 4:2:0 要求偶数尺寸——奇数高度会让编码器在首帧输入时进错误态（125% 缩放实测踩坑）。 */
     width: Int,
     height: Int,
@@ -349,6 +351,7 @@ class VideoSender(
                 width,
                 height,
                 System.nanoTime(),
+                ntpEpochAnchorSecs.toInt(),
             ) ?: return
         output.write(header)
         output.write(body)
@@ -401,7 +404,7 @@ class VideoSender(
         // 密钥流跨帧连续；头只构造一次且作 AAD（0x2276b7300 指令级定谳），
         // 时间戳 = convert(帧 PTS + 屏流延迟)。null = 无封包态。
         val frame =
-            NativeBridge.nativeAirplayScreenSealFrame(sessionHandle, plain, ptsUs * 1000)
+            NativeBridge.nativeAirplayScreenSealFrame(sessionHandle, plain, ptsUs * 1000, ntpEpochAnchorSecs.toInt())
                 ?: run {
                     log("VIDEO: 封包态不可用（无 streamSetup 密态）——跳帧")
                     return

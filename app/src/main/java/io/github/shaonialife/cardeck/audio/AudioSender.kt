@@ -53,6 +53,8 @@ class AudioSender(
     private val codec: AudioCodec = AudioCodec.PCM,
     /** RTP 流类型，仅用于日志（PT 与 SETUP 的 type 保持一致）。 */
     private val streamType: Long = 100L,
+    /** 会话墙钟锚（NTP-1900 秒——同步包 NTP 秒域同基化，见 AirPlayLink）。 */
+    private val ntpEpochAnchorSecs: Long = 0L,
     /** AAC 帧是否补 ADTS 头（见 [AudioTuning.ADTS]，排查车机解码链用）。 */
     private val adtsFrames: Boolean = false,
     /**
@@ -375,6 +377,7 @@ class AudioSender(
                                     next.toInt(),
                                     System.nanoTime(),
                                     first = if (first) 1 else 0,
+                                    epochNtpSecs = ntpEpochAnchorSecs.toInt(),
                                 ) ?: continue
                             client.send(DatagramPacket(packet, packet.size))
                             syncSequence = (syncSequence + 1) and 0xFFFF
