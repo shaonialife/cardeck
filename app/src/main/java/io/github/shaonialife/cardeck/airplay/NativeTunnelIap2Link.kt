@@ -72,13 +72,16 @@ class NativeTunnelIap2Link(
         )
         Thread(
             {
-                while (alive()) {
+                // 循环挂 handle 生命周期（close() 置 0 退出）——不挂 alive()：
+                // 构造早于 RTSP socket 打开，首检 alive()=false 会出生即死，
+                // TimeSync 周期域（session_tick）随之失联（2026-11-04 装机实证）
+                while (handle != 0L) {
                     try {
                         Thread.sleep(200)
                     } catch (_: InterruptedException) {
                         return@Thread
                     }
-                    if (handle != 0L) NativeBridge.nativeSessionTick(handle)
+                    if (handle != 0L && alive()) NativeBridge.nativeSessionTick(handle)
                 }
             },
             "iap-tunnel-pacer",
