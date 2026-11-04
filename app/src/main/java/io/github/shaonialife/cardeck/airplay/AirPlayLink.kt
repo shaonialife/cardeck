@@ -1064,7 +1064,6 @@ class AirPlayLink(
      * 资源重申 burst（AADisplay r17 时序 +1.5/4/12/30s）。082446 定谳：不重申的
      * 话车机全程健康却永不切到 CarPlay 画面。
      */
-    var onTunnelControlSessionComplete: (() -> Unit)? = null
 
     /** 视频起流回调（屏幕上第一帧发出后）——实验模式下重申的触发源。 */
     var onStreamingStarted: (() -> Unit)? = null
@@ -1080,9 +1079,6 @@ class AirPlayLink(
                 ).also {
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
                     it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
-                    it.onControlSessionComplete = {
-                        onTunnelControlSessionComplete?.invoke()
-                    }
                     iapLink = it
                 }
         }

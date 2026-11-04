@@ -1827,43 +1827,6 @@ object SessionController {
     }
 
     /**
-     * modesChanged 资源重申调度（MIB3 控制会话完成事件驱动）。
-     *
-     * AADisplay r17 在奥迪上长播验证的时序：auth+burst 之后 **+1.5s 首发、+4s/+12s/
-     * +30s 各重申一次**（绝对时刻）。声明若落在 0xAA00/0xAA05 进行中，会与 iAP POST
-     * 抢控制通道、奥迪 ~12s 后死（AADisplay 注释原话）——所以只能由 burst 完成事件
-     * 触发，不能在会话建立时一次性发完。082446 定谳：第二控制会话会重置车机的资源
-     * 仲裁，早先那份 200 OK 的声明到订阅簇完成时已经失效，车机在等一份新的。
-     */
-    @Volatile
-    private var modesReclaimEpoch = 0L
-
-    private fun scheduleModesReclaim(client: AirPlayLink) {
-        val epoch = ++modesReclaimEpoch
-        Bg.run("modes-reclaim") {
-            val start = android.os.SystemClock.uptimeMillis()
-            for (atMs in longArrayOf(1_500, 4_000, 12_000, 30_000)) {
-                while (true) {
-                    if (epoch != modesReclaimEpoch || client.cancelled || connectCancelled) return@run
-                    val remain = atMs - (android.os.SystemClock.uptimeMillis() - start)
-                    if (remain <= 0) break
-                    Thread.sleep(minOf(remain, 200L))
-                }
-                if (epoch != modesReclaimEpoch || client.cancelled || connectCancelled) return@run
-                // 通话/语音/借用期间重申会被车机资源仲裁拒绝（HTTP 200 但响应体 status=1）：
-                // 反复顶撞疑似把 8015 的资源管理器打成锁存（连接入口置灰）。跳过本轮，
-                // 归还事件（onModesRestored）会触发补发。
-                if (client.modesBusy()) {
-                    appendLog("AIRPLAY: 车机通话/语音/借用占用资源——跳过本次 modesChanged 重申（归还后补发）")
-                    continue
-                }
-                if (!client.assertModes()) return@run
-                appendLog("AIRPLAY: modesChanged 资源重申（burst 后 +${atMs / 1000}s，AADisplay r17 时序）")
-            }
-        }
-    }
-
-    /**
      * 配对循环的端点刷新器（非阻塞）：只读浏览器缓存的 `_airplay._tcp`，
      * 有则并入 IP/端口/公钥等字段。返回 null = 无新信息（配对循环继续用当前端点）。
      */
@@ -2099,24 +2062,23 @@ object SessionController {
                             }
                             // 旋钮/四向拨杆（iAP2 0x6802 通路）：注入虚拟屏的 DPAD
                             created.onNavKey = { keyCode -> injectNavigationKey(keyCode) }
-                            // MIB3 控制会话完成 → modesChanged 资源重申 burst（082446 定谳：
-                            // 只在会话早期声明过一次的话，第二控制会话把车机资源仲裁重置，
-                            // 车机全程健康却永不切 CarPlay 画面）。
-                            created.onTunnelControlSessionComplete = {
-                                scheduleModesReclaim(created)
-                            }
-                            // 视频起流后立刻排一遍（时序与 AADisplay 的「起流 +1.5s」等价）。
+                            // modesChanged 触发 = 固件忠实形态（D9 定谳 2026-11-04：固件
+                            // modes 域=事件驱动单发，Stark 控制器状态变更驱动；无重申循环
+                            // ——iPhone→DiPlay sysdiagnose 实录：连接后 ~70s 零 modes 帧
+                            // 而画面照切，xcertplay 切屏由流驱动、忽略 modesChanged）。
+                            // ① 起流 = CarPlay 接入的模式状态变更（Stark 等价事件）
                             created.onStreamingStarted = {
-                                appendLog("AIRPLAY: 起流——排 modesChanged 重申")
-                                scheduleModesReclaim(created)
+                                Bg.run("modes-assert") {
+                                    if (!created.cancelled && created.assertModes()) {
+                                        appendLog("AIRPLAY: 起流——modesChanged 宣告完成（固件事件驱动）")
+                                    }
+                                }
                             }
-                            // 车机归还资源（UNBORROW/UNTAKE）= 切屏窗口：80ms 后补发
-                            // modesChanged（AADisplay CarPlayEventChannel 同款时序）
+                            // ② 车机归还资源（UNBORROW/UNTAKE）= 模式状态变更事件，即时补发
                             created.onModesRestored = {
                                 Bg.run("modes-restored") {
-                                    Thread.sleep(80)
                                     if (!created.cancelled && created.assertModes()) {
-                                        appendLog("AIRPLAY: 资源归还——modesChanged 补发完成（切屏窗口）")
+                                        appendLog("AIRPLAY: 资源归还——modesChanged 补发完成（固件事件驱动）")
                                     }
                                 }
                             }
