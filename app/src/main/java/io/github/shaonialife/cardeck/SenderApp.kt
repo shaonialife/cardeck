@@ -56,6 +56,11 @@ open class SenderApp : Application() {
                 try {
                     val bridge = io.github.shaonialife.cardeck.protocol.NativeBridge
                     if (bridge.ensureLoaded()) {
+                        // 原生日志路径注入（跨平台：crate 内零平台路径硬编码，
+                        // 鸿蒙等宿主注入自己的 files 目录即可）
+                        bridge.nativeSetLogFile(
+                            java.io.File(filesDir, "native_debug.log").absolutePath,
+                        )
                         // 日志桥排空线程：Rust 侧日志（fw:: 链路编排/RTSP 诊断/panic）
                         // 经旁路队列 + 200ms 轮询接 appendLog（logcat + main_debug.log +
                         // UI 缓冲 + 挂屏增量四路自动获得）。**形态定谳**：JNI 回调方向

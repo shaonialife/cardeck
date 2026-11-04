@@ -36,6 +36,10 @@ object NativeBridge {
     /** so 版本串（如 "cardeck-protocol 0.1.0"）。 */
     external fun nativeVersion(): String
 
+    /** 宿主注入原生日志文件路径（装载后尽早调；空串 = 停止落盘——
+     *  队列转发不受影响）。跨平台：crate 内零平台路径硬编码。 */
+    external fun nativeSetLogFile(path: String)
+
     // ---- 日志桥（Rust →「运行日志」区域，2026-11-04）----
 
     /** 排空 Rust 待转发日志行（`native_file_log` 的旁路队列；`UTF-8` 文本，
