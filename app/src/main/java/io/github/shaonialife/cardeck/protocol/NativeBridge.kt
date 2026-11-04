@@ -575,4 +575,49 @@ object NativeBridge {
         arrivalNanos: Long,
         epochSecsUnix: Long,
     ): Double
+
+    // ---- 通用格式/地址策略原语（跨平台下沉刀，fw::media_format + fw::netaddr）----
+
+    /** 地址候选排序 + 去重（fw::netaddr::candidates——平台连接策略层，
+     *  B11 定谳：固件应用层无地址评估序，见 FIRMWARE-LINK-AUDIT §11）。 */
+    external fun nativeNetaddrCandidates(addresses: Array<String>): Array<String>
+
+    /** 同网段判定（fw::netaddr::isSameNetwork：IPv4 /24 / 链路本地恒真 /
+     *  全局 v6 前 64 位）。 */
+    external fun nativeNetaddrIsSameNetwork(
+        host: String,
+        localIpv4: String?,
+        localIpv6: Array<String>,
+    ): Boolean
+
+    /** IPv4 形态判定（含 '.' 且不含 ':'）。 */
+    external fun nativeNetaddrIsIpv4(host: String): Boolean
+
+    /** 剥 `%iface` scope 后缀。 */
+    external fun nativeNetaddrStripScope(host: String): String
+
+    /** TXT features 位图解析（`低32hex,高32hex`）；返回
+     *  [Long.MIN_VALUE] = 解析失败（未知，调用方保持旧行为）。 */
+    external fun nativeAirplayFeaturesParse(txt: String): Long
+
+    /** 配对/加密能力判定——fw: _airPlayDescription_supportsCUPairingAndEncryption
+     *  @0x2276c6d98 四位或集（38∪46∪43∪48）。 */
+    external fun nativeAirplaySupportsPairing(features: Long): Boolean
+
+    /** csd（AnnexB）→ avcC（SPS 补丁 + ISO 14496-15 封装）；null = 缺 SPS/PPS。 */
+    external fun nativeMediaAvcC(annexB: ByteArray): ByteArray?
+
+    /** AnnexB → 「4B BE 长度前缀 NAL 序列」帧体（帧内 SPS 同步补丁）；
+     *  null = 空流。 */
+    external fun nativeMediaPackNals(annexB: ByteArray): ByteArray?
+
+    /** 7 字节 ADTS 头（ISO 14496-3；无 CRC）。 */
+    external fun nativeMediaAdtsHeader(
+        payloadSize: Int,
+        sampleRate: Int,
+        channels: Int,
+    ): ByteArray?
+
+    /** 剥 ADTS 头；null = 无 ADTS（原样使用入参，免拷贝）。 */
+    external fun nativeMediaStripAdts(frame: ByteArray): ByteArray?
 }

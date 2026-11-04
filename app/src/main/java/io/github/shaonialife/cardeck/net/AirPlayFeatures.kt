@@ -1,42 +1,25 @@
 package io.github.shaonialife.cardeck.net
 
+import io.github.shaonialife.cardeck.protocol.NativeBridge
+
 /**
- * `_airplay._tcp` TXT `features` 位图解析（形如 `0x44540380,0x61`）。
+ * `_airplay._tcp` TXT `features` 位图（形如 `0x44540380,0x61`）——**薄包装**，
+ * 解析与位判定在 Rust `fw::netaddr`（字节钉在 Rust 测试；2026-11-04 跨平台
+ * 下沉刀）。
  *
- * 低位在前：`低32位,高32位`，合并成 64 位。AirPlay 接收端用 bit38
- * `HK_PAIRING_AND_ENCRYPT` 表示「支持 HomeKit 配对/加密」——老车机
- * （CarPlay 210.81 时代）不声明该位，只接受 `et=NONE` 明文会话。
+ * **固件真身（2026-11-04 直切出土）**：配对/加密能力判定 =
+ * `_airPlayDescription_supportsCUPairingAndEncryption` @0x2276c6d98 =
+ * `hasFeature(0x26)|hasFeature(0x2e)|hasFeature(0x2b)|hasFeature(0x30)`
+ * ——位 **38∪46∪43∪48** 任一命中即支持。此前 Kotlin 单查 bit38 是固件
+ * 子集（bit38 车机行为不变；只声明 43/46/48 的接收端现在正确走配对路径）。
  *
- * 解析失败一律返回 null（未知），调用方按「保持旧行为」处理，
- * 绝不能把解析失败当成「不支持配对」——那会让正常车机也被降级成明文。
+ * 解析失败返回 null（未知），调用方按「保持旧行为」处理——绝不能把解析
+ * 失败当成「不支持配对」，那会让正常车机被降级成明文。
  */
 object AirPlayFeatures {
-    /** 支持 /pair-setup + /pair-verify（AirPlayFeature::HK_PAIRING_AND_ENCRYPT）。 */
-    const val HK_PAIRING_AND_ENCRYPT: Long = 1L shl 38
+    /** 解析失败 = null（Rust 侧 `Long.MIN_VALUE` 哨兵转译）。 */
+    fun parse(txt: String?): Long? = NativeBridge.nativeAirplayFeaturesParse(txt.orEmpty()).takeIf { it != Long.MIN_VALUE }
 
-    /** 支持屏幕镜像。 */
-    const val SCREEN: Long = 1L shl 7
-
-    /** 车机控制（CarPlay）。 */
-    const val CARPLAY_CONTROL: Long = 1L shl 37
-
-    fun parse(txt: String?): Long? {
-        val text = txt?.trim().orEmpty()
-        if (text.isEmpty()) return null
-        val parts = text.split(',').map { it.trim() }.filter { it.isNotEmpty() }
-        if (parts.isEmpty() || parts.size > 2) return null
-        val low = parseHex(parts[0]) ?: return null
-        val high = if (parts.size == 2) parseHex(parts[1]) ?: return null else 0L
-        if (low < 0 || high < 0) return null
-        return (high shl 32) or low
-    }
-
-    /** 接收端是否声明支持 HomeKit 配对/加密；null = TXT 缺失或不可解析。 */
-    fun supportsPairing(features: Long?): Boolean? = features?.let { (it and HK_PAIRING_AND_ENCRYPT) != 0L }
-
-    private fun parseHex(value: String): Long? {
-        val cleaned = value.removePrefix("0x").removePrefix("0X")
-        if (cleaned.isEmpty()) return null
-        return cleaned.toLongOrNull(16)
-    }
+    /** 接收端是否声明配对/加密能力（fw @0x2276c6d98 四位或集）；null = 未知。 */
+    fun supportsPairing(features: Long?): Boolean? = features?.let { NativeBridge.nativeAirplaySupportsPairing(it) }
 }

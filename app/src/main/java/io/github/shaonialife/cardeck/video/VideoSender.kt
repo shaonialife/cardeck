@@ -6,7 +6,6 @@ import android.media.MediaFormat
 import android.view.Surface
 import io.github.shaonialife.cardeck.net.TcpLiveness
 import io.github.shaonialife.cardeck.protocol.NativeBridge
-import java.io.ByteArrayOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
@@ -14,8 +13,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * CarPlay 主屏视频发送端（Phase 2-C2）。
  *
- * 线格式（A5+A4 起帧头/密封全在 Rust，fw:airplay::screen——本类只做
- * AnnexB→NAL 切分/SPS level 补丁/H.264 avcC 标准封装 + socket 泵）：
+ * 线格式（帧头/密封/格式域全在 Rust——fw:airplay::screen + fw::media_format：
+ * AnnexB→NAL 切分/SPS level 补丁/avcC 封装均为下沉的原生调用，本类只剩
+ * MediaCodec 泵 + socket 泵）：
  *  - 每条消息 = 128 字节头 + body；头部 = [0..3] u32LE body 长度、[4] opcode、
  *    [8..15] NTP 32.32 LE 发送时间（fw: sbpd 域 @0x2276b70ac）
  *  - opcode 1 = VideoConfig：明文 avcC 记录（H.264 标准封装）
@@ -309,34 +309,13 @@ class VideoSender(
     ) {
         val annexB = ByteArray(size)
         buffer.get(annexB)
-        val nalUnits = splitAnnexB(annexB)
-        val rawSps = nalUnits.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 7 }
-        val pps = nalUnits.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 8 }
-        if (rawSps == null || pps == null) {
-            log("VIDEO: csd 缺少 SPS/PPS（${nalUnits.size} 个 NAL），跳过 config")
+        // csd → avcC（SPS 补丁 + ISO 14496-15 封装）在 Rust
+        // fw::media_format::build_avcc；null = 缺 SPS/PPS
+        val body = NativeBridge.nativeMediaAvcC(annexB)
+        if (body == null) {
+            log("VIDEO: csd 缺少 SPS/PPS，跳过 config")
             return
         }
-        // level_idc 补丁到 4.0（关键帧内嵌 SPS 同样会打补丁，见 sendVideoFrame）。
-        // 2026-10-25 8015 实验开关：旁路补丁让 30fps 回编码器原始 level——隔离
-        // 「SPS 补丁是否是 8015 不切屏的因素」（0.1.31 因编辑事故开关未接线，实验作废）
-        // level：实验模式非空时强制改写；否则走正式补丁（只升不降，0628 依赖它）
-        val sps =
-            if (SPS_LEVEL_FORCE != null) patchSpsLevelForExperiment(rawSps) else patchSpsLevel(rawSps)
-        val avcc = ByteArrayOutputStream(8 + sps.size + pps.size)
-        avcc.write(1)
-        avcc.write(sps[1].toInt()) // profile
-        avcc.write(sps[2].toInt()) // compat
-        avcc.write(sps[3].toInt()) // level
-        avcc.write(0xFF) // 6 位保留 + 2 位长度尺寸-1（4 字节）
-        avcc.write(0xE1) // 3 位保留 + 5 位 SPS 数
-        avcc.write((sps.size ushr 8) and 0xFF)
-        avcc.write(sps.size and 0xFF)
-        avcc.write(sps)
-        avcc.write(1)
-        avcc.write((pps.size ushr 8) and 0xFF)
-        avcc.write(pps.size and 0xFF)
-        avcc.write(pps)
-        val body = avcc.toByteArray()
         // 头部必须与 catplay `ScreenFrame::config` 一致，否则部分车机（Audi/DELPHI 实测：
         // 连接与触摸都正常、车机屏全黑）会把后续加密帧按明文 NAL 解析 → 解码失败：
         //  - small_param[1] |= ScreenFlag::Encrypted(0x04)：声明「视频帧是加密的」
@@ -357,9 +336,10 @@ class VideoSender(
         output.write(body)
         output.flush()
         configSent = true
+        // avcC 前 4 字节 = version/profile/compat/level（与 SPS 同位——level 已补 4.0）
         log(
-            "VIDEO: ✓ VideoConfig 已发送 avcC=${body.size}B（SPS ${sps.size}B/PPS ${pps.size}B，" +
-                "profile=${sps[1].toInt() and 0xFF} level=${sps[3].toInt() and 0xFF} " +
+            "VIDEO: ✓ VideoConfig 已发送 avcC=${body.size}B，" +
+                "profile=${body[1].toInt() and 0xFF} level=${body[3].toInt() and 0xFF} " +
                 "flags=0x%02x ${width}x$height）".format(header[6].toInt() and 0xFF) +
                 "\n  ↳ 头部前 24 字节=" + header.take(24).joinToString(" ") { "%02x".format(it) },
         )
@@ -378,26 +358,10 @@ class VideoSender(
         }
         val annexB = ByteArray(size)
         buffer.get(annexB)
-        val nalUnits = splitAnnexB(annexB)
-        if (nalUnits.isEmpty()) return
-
-        // 关键帧内嵌的 SPS 同步打 level 补丁：车机会用帧内 SPS 更新解码器参数，
-        // 只改 csd 不改帧内 SPS 的话，收到第一个关键帧就又变回低 level 了
-        val packed = ByteArrayOutputStream(size)
-        for (nal in nalUnits) {
-            val out =
-                if (nal.isNotEmpty() && (nal[0].toInt() and 0x1F) == 7) {
-                    if (SPS_LEVEL_FORCE != null) patchSpsLevelForExperiment(nal) else patchSpsLevel(nal)
-                } else {
-                    nal
-                }
-            packed.write((out.size ushr 24) and 0xFF)
-            packed.write((out.size ushr 16) and 0xFF)
-            packed.write((out.size ushr 8) and 0xFF)
-            packed.write(out.size and 0xFF)
-            packed.write(out)
-        }
-        val plain = packed.toByteArray()
+        // 帧体打包（4B BE 长度前缀 NAL 序列 + 帧内 SPS 同步补丁——车机会用
+        // 帧内 SPS 更新解码器参数）在 Rust fw::media_format::pack_nals；
+        // null = 空流
+        val plain = NativeBridge.nativeMediaPackNals(annexB) ?: return
 
         // 帧头构造 + 密封全在 Rust（A4 全量形态——fw: cryptor 变换
         // @0x227969f68）：ChaCha nonce = 8B LE 帧计数（会话驻留态）/ CTR
@@ -467,51 +431,4 @@ class VideoSender(
         /** 128B 消息头（fw: `calloc(1, 0x80)` @0x2276b6964——布局/构造全在 Rust）。 */
         internal const val HEADER_LEN = 128
     }
-}
-
-/** H.264 level_idc 目标值：4.0（0x28）。真 iPhone 同款流形态。 */
-private const val TARGET_LEVEL_IDC = 40
-
-/**
- * 把 SPS 的 level_idc 补丁到 4.0（3.1→4.0 是放宽约束，安全）。
- *
- * 为什么不改用 MediaFormat.KEY_LEVEL：实测（MagicOS/Android 17）编码器**静默忽略**
- * 该键——不抛异常、SPS 里仍是 3.1。只能后处理。
- *
- * 为什么安全：① level_idc 在 SPS 的固定偏移（nal[3]），单字节改值不改长度；
- * ② 3.1→4.0 只放宽 maxMBPS/maxFS/maxBR 上限，解码器按 4.0 分配的资源对 3.1 编码
- * 的流只多不少；③ 0x28 非零且不会引入 emulation prevention 序列（00 00 0x）。
- * 若 SPS 本来就 ≥4.0（如 60fps 时自动选 4.2），保持原值不降级。
- *
- * 动机：奥迪 DELPHI 解码器对 level 3.1/3.2 的流静默不渲染（TCP 照收、会话正常、
- * 车机黑屏；2026-10-22 奥迪 0628 真机日志：同机 level=40 全部成功、level=32 首例黑屏）。
- */
-/**
- * SPS level 实验开关（2026-10-25，8015 不切屏排查）：
- *  - null = 不干预（编码器自选——MEIZU 对 1412x654@30 自报 4.0，无法产生低 level 流）
- *  - 非 null = 强制把 level_idc 写成该值（csd 与关键帧内嵌 SPS 双端），隔离
- *    「车机解码器对 level 4.0 不消费」假设。当前 32 = 强制 3.2 实验。
- */
-private val SPS_LEVEL_FORCE: Int? = null
-
-/**
- * 实验用 level 改写（[SPS_LEVEL_FORCE] 非空时把 level_idc 强制写成该值）。
- * 与 [patchSpsLevel] 的「只升不降」不同——本函数是**双向强制**（实验要产生
- * 低 level 流，验证车机解码器对 level 4.0 的消费行为）。
- */
-internal fun patchSpsLevelForExperiment(sps: ByteArray): ByteArray {
-    val target = SPS_LEVEL_FORCE ?: return sps
-    if (sps.size < 4) return sps
-    val patched = sps.copyOf()
-    patched[3] = target.toByte()
-    return patched
-}
-
-internal fun patchSpsLevel(sps: ByteArray): ByteArray {
-    if (sps.size < 4) return sps
-    val current = sps[3].toInt() and 0xFF
-    if (current >= TARGET_LEVEL_IDC) return sps
-    val patched = sps.copyOf()
-    patched[3] = TARGET_LEVEL_IDC.toByte()
-    return patched
 }

@@ -1,113 +1,38 @@
 package io.github.shaonialife.cardeck.net
 
+import io.github.shaonialife.cardeck.protocol.NativeBridge
+
 /**
- * 接收端地址候选的排序与判定（纯函数，单测覆盖）。
+ * 接收端地址候选的排序与判定——**薄包装**，全部逻辑在 Rust
+ * `fw::netaddr`（字节钉在 Rust 测试；2026-11-04 跨平台下沉刀）。
  *
- * 背景：安卓端很容易把「有地址」误判成「有 IPv4 地址」——奥迪 MIB3 的
- * `_airplay._tcp` 只发布链路本地 IPv6（`fe80::…%wlan0`）时，旧代码会把它整条
- * 丢掉，然后退到 `网关:7000` 兜底；而 4xxx 固件车机的网关/端口未必是
- * `10.174.189.1:7000`，于是永远连不上（2026-10-19 用户反馈的 4851 即此类）。
+ * 来源定谳（防跑偏）：地址排序 = **平台连接策略层**，不是固件行为域——
+ * B11 已定谳（FIRMWARE-LINK-AUDIT.md §11）：固件应用层无地址评估序，
+ * 连接端点真身 = `udpconnection_createRemoteEndpoint` @0x243d4a628 交
+ * `nw_endpoint_create_host`，地址族选择委托 Network.framework 系统评估器。
+ * 排序策略（IPv4 → 全局 IPv6 → 链路本地 IPv6，同址去重）= Android 无
+ * Network.framework 等价物时的宿主策略，下沉 Rust 仅为跨平台复用。
  *
- * 排序策略（真 iPhone / catplay 也是直接使用 Bonjour 给的地址）：
- *  1. IPv4 —— 安卓上最稳；
- *  2. 全局 IPv6；
- *  3. 链路本地 IPv6（必须带 scope 才能用，保留原样由调用方补 `%iface`）。
- * 同一个地址的带/不带 scope 形式视为重复，只保留先出现的。
+ * 背景：奥迪 MIB3 的 `_airplay._tcp` 只发布链路本地 IPv6（`fe80::…%wlan0`）
+ * 时，旧代码会把整条端点判成无地址退到网关兜底（2026-10-19 奥迪 4851 案）。
  */
 object EndpointHosts {
-    fun isIpv4(host: String): Boolean = host.contains('.') && !host.contains(':')
-
-    fun isIpv6(host: String): Boolean = host.contains(':')
-
-    fun isLinkLocalIpv6(host: String): Boolean {
-        val normalized = host.substringBefore('%').lowercase()
-        return normalized.startsWith("fe80:") ||
-            normalized == "fe80" ||
-            normalized.startsWith("fe8") ||
-            normalized.startsWith("fe9") ||
-            normalized.startsWith("fea") ||
-            normalized.startsWith("feb")
-    }
+    fun isIpv4(host: String): Boolean = NativeBridge.nativeNetaddrIsIpv4(host)
 
     /** 去掉 `%wlan0` / `%3` 这类 scope 后缀。 */
-    fun stripScope(host: String): String = host.substringBefore('%')
+    fun stripScope(host: String): String = NativeBridge.nativeNetaddrStripScope(host)
+
+    /** 排序 + 去重（空串/纯 scope/非法形态剔除；逻辑在 fw::netaddr）。 */
+    fun candidates(addresses: List<String>): List<String> = NativeBridge.nativeNetaddrCandidates(addresses.toTypedArray()).toList()
 
     /**
-     * 接收端是否给出了可尝试的地址（IPv4 或 IPv6 都算）。
-     * 供「端点是否自足」「是否需要 mDNS 补全」判断，勿再写 `contains('.')`。
-     */
-    fun hasUsable(addresses: List<String>): Boolean = candidates(addresses).isNotEmpty()
-
-    /** 排序 + 去重。空串/纯 scope 一律剔除。 */
-    fun candidates(addresses: List<String>): List<String> {
-        val seen = HashSet<String>()
-        val out = ArrayList<String>(addresses.size)
-
-        fun add(host: String) {
-            val trimmed = host.trim()
-            if (trimmed.isEmpty()) return
-            val base = stripScope(trimmed)
-            if (base.isEmpty()) return
-            if (!isIpv4(base) && !isIpv6(base)) return
-            val key = base.lowercase()
-            if (seen.add(key)) out += trimmed
-        }
-        addresses.filter(::isIpv4).forEach(::add)
-        addresses.filter { isIpv6(it) && !isLinkLocalIpv6(it) }.forEach(::add)
-        addresses.filter(::isLinkLocalIpv6).forEach(::add)
-        return out
-    }
-
-    /**
-     * 地址是否属于「本机所在的车机网段」。
-     *
-     * - IPv4：与本地 IPv4 的 /24 前缀一致（沿用旧过滤，防误连同一 WiFi 上的 Mac）；
-     * - IPv6 链路本地：天然只在本链路，直接接受；
-     * - IPv6 全局：与本地某个 IPv6 地址的前 64 位一致才接受（拿不到本地 IPv6 时拒绝，
-     *   宁可退回网关兜底，也不把公网/家庭网络的 AirPlay 设备当车机）。
+     * 地址是否属于「本机所在的车机网段」：IPv4 与本地 /24 前缀一致
+     * （拿不到本地 IPv4 时不设限）；链路本地 IPv6 恒真；全局 IPv6 需与
+     * 本地某个 IPv6 的前 64 位一致（否则宁可退回网关兜底）。
      */
     fun isSameNetwork(
         host: String,
         localIpv4: String?,
         localIpv6: List<String> = emptyList(),
-    ): Boolean {
-        if (isIpv4(host)) {
-            val prefix = localIpv4?.substringBeforeLast('.')?.plus(".")
-            return prefix == null || host.startsWith(prefix)
-        }
-        if (!isIpv6(host)) return false
-        if (isLinkLocalIpv6(host)) return true
-        val candidate = ipv6Prefix64(host) ?: return false
-        return localIpv6.any { ipv6Prefix64(it) == candidate }
-    }
-
-    /** IPv6 的前 64 位（前 4 组 hextet，展开后比较；解析失败返回 null）。 */
-    fun ipv6Prefix64(host: String): String? {
-        val groups = expandIpv6(stripScope(host)) ?: return null
-        return groups.take(4).joinToString(":")
-    }
-
-    /** 把 IPv6 文本展开为 8 组（处理 `::` 压缩），返回小写 hextet 列表。 */
-    private fun expandIpv6(host: String): List<String>? {
-        if (!host.contains(':')) return null
-        val doubleColon = host.indexOf("::")
-        val head: List<String>
-        val tail: List<String>
-        if (doubleColon >= 0) {
-            head = host.substring(0, doubleColon).split(':').filter { it.isNotEmpty() }
-            tail = host.substring(doubleColon + 2).split(':').filter { it.isNotEmpty() }
-        } else {
-            head = host.split(':')
-            tail = emptyList()
-        }
-        if (head.size + tail.size > 8) return null
-        val fill = 8 - head.size - tail.size
-        val groups = ArrayList<String>(8)
-        groups += head
-        repeat(fill) { groups += "0" }
-        groups += tail
-        if (groups.size != 8) return null
-        if (groups.any { it.length > 4 || it.any { c -> c.digitToIntOrNull(16) == null } }) return null
-        return groups.map { it.lowercase().padStart(4, '0') }
-    }
+    ): Boolean = NativeBridge.nativeNetaddrIsSameNetwork(host, localIpv4, localIpv6.toTypedArray())
 }

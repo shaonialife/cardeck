@@ -3,6 +3,7 @@ package io.github.shaonialife.cardeck.audio
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 
 /**
  * PCM → AAC-LC 编码器（type=102 MainHighAudio 通路用）。
@@ -34,67 +35,8 @@ class AacLcEncoder(
         /** 一帧 PCM 的字节数（16bit）。 */
         fun pcmBytes(channels: Int): Int = FRAME_SAMPLES * channels * 2
 
-        /** ADTS 头长度（无 CRC）。 */
-        private const val ADTS_HEADER_SIZE = 7
-
-        /** ADTS 里的 audioObjectType：AAC-LC = 2（存的是 AOT-1）。 */
-        private const val AAC_PROFILE_LC = 2
-
         private const val MIME = "audio/mp4a-latm"
         private const val TIMEOUT_US = 10_000L
-
-        /**
-         * 组 7 字节 ADTS 头（无 CRC）：MPEG-4 / AAC-LC / 对应采样率与声道数。
-         *
-         * 线上报文（RTP 负载）按 Apple 的约定是**裸 AAC 帧**，但个别车机的解码链是
-         * 按 ADTS 组织的（Android `audio/aac-adts`），裸帧喂进去会被判为非帧。
-         * 因此留一条可切换的封装路径（[AudioTuning.ADTS]）。
-         */
-        fun adtsHeader(
-            payloadSize: Int,
-            sampleRate: Int,
-            channels: Int,
-        ): ByteArray {
-            val frameLength = payloadSize + ADTS_HEADER_SIZE
-            val freqIndex = frequencyIndex(sampleRate)
-            val header = ByteArray(ADTS_HEADER_SIZE)
-            header[0] = 0xFF.toByte()
-            // syncword 剩余 4 位 + MPEG-4(0) + layer(00) + protection_absent(1)
-            header[1] = 0xF1.toByte()
-            // profile=LC(2) 存的是 AOT-1；采样率索引 <<2；声道配置高 2 位
-            header[2] =
-                (
-                    ((AAC_PROFILE_LC - 1) shl 6) or
-                        ((freqIndex and 0x0F) shl 2) or
-                        ((channels shr 2) and 0x03)
-                ).toByte()
-            // 声道配置低 2 位 + 帧长高 2 位
-            header[3] = (((channels and 0x03) shl 6) or ((frameLength shr 11) and 0x03)).toByte()
-            header[4] = ((frameLength shr 3) and 0xFF).toByte()
-            // 帧长低 3 位 + buffer_fullness=0x7FF（VBR 惯例）+ 单帧（低 2 位 0）
-            header[5] = (((frameLength and 0x07) shl 5) or 0x1F).toByte()
-            header[6] = 0xFC.toByte()
-            return header
-        }
-
-        /** 采样率 → ADTS 的 samplingFrequencyIndex。 */
-        fun frequencyIndex(rate: Int): Int =
-            when (rate) {
-                96_000 -> 0
-                88_200 -> 1
-                64_000 -> 2
-                48_000 -> 3
-                44_100 -> 4
-                32_000 -> 5
-                24_000 -> 6
-                22_050 -> 7
-                16_000 -> 8
-                12_000 -> 9
-                11_025 -> 10
-                8_000 -> 11
-                7_350 -> 12
-                else -> 4
-            }
 
         /**
          * 自检：用平台解码器把一帧裸 AAC 解回 PCM，返回 `(峰值, 样本数)`；解不出返回 null。
@@ -273,21 +215,16 @@ class AacLcEncoder(
      *
      * 线上格式要求是**裸 AAC 帧**（catplay `rtp_recorder` 直接把编码器输出当负载）。
      * 多数 MediaCodec 实现输出裸帧，但个别硬件编码器会带 7/9 字节 ADTS 头——带上就是
-     * 非法负载，车机解码器会整条流丢弃。这里按同步字识别并剥掉，属于防御性处理。
+     * 非法负载，车机解码器会整条流丢弃。同步字识别/剥头在 Rust
+     * （fw::media_format::strip_adts，ISO 14496-3 域），这里只留宿主日志。
      */
     private fun stripAdts(frame: ByteArray): ByteArray {
-        if (frame.size < 7) return frame
-        val b0 = frame[0].toInt() and 0xFF
-        val b1 = frame[1].toInt() and 0xFF
-        if (b0 != 0xFF || (b1 and 0xF0) != 0xF0) return frame
-        // ADTS 的 protection_absent 位在第二个字节最低位：1=无 CRC（7 字节头），0=9 字节
-        val headerSize = if ((b1 and 0x01) == 0x01) 7 else 9
-        if (frame.size <= headerSize) return frame
+        val stripped = NativeBridge.nativeMediaStripAdts(frame) ?: return frame
         if (!adtsStripped) {
             adtsStripped = true
-            log("AUDIO: 编码器输出带 ADTS 头（${headerSize}B）——已剥离，改发裸 AAC 帧")
+            log("AUDIO: 编码器输出带 ADTS 头（${frame.size - stripped.size}B）——已剥离，改发裸 AAC 帧")
         }
-        return frame.copyOfRange(headerSize, frame.size)
+        return stripped
     }
 
     /**
@@ -314,8 +251,10 @@ class AacLcEncoder(
         return out
     }
 
-    /** 组 7 字节 ADTS 头（无 CRC）：MPEG-4 / LC / 对应采样率与声道。 */
-    private fun buildAdts(raw: ByteArray): ByteArray = adtsHeader(raw.size, sampleRate, channels) + raw
+    /** 组 7 字节 ADTS 头（无 CRC）——fw::media_format::adts_header（ISO 域，
+     *  车机解码链兼容开关路径，见 [AudioTuning.ADTS]）。 */
+    private fun buildAdts(raw: ByteArray): ByteArray =
+        (NativeBridge.nativeMediaAdtsHeader(raw.size, sampleRate, channels) ?: ByteArray(0)) + raw
 
     fun stop() {
         val encoder = codec ?: return
