@@ -1037,14 +1037,6 @@ object SessionController {
                         appendLog(">>> WiFi 已绑定现有连接（系统已连着热点），ctrl 广播已重新注册")
                         return WifiCarPlayConnector.JoinResult.Joined(bound)
                     }
-                    // Suggestion 路径（2026-11-04——DiPlay 弹框卡死形态的主解）：
-                    // 系统自动连 + 无互联网不当默认网（specifier 的隔离性保持）+
-                    // 确定性远高于弹框关联。失败落回 specifier（弹框应答窗）。
-                    joinViaSuggestion(wifi)?.let { bound ->
-                        ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
-                        appendLog(">>> WiFi 已加入车机热点（suggestion），ctrl 广播已重新注册")
-                        return WifiCarPlayConnector.JoinResult.Joined(bound)
-                    }
                     connector.joinCarPlayNetwork(
                         ssid = wifi.ssid,
                         passphrase = wifi.passphrase,
@@ -1095,42 +1087,6 @@ object SessionController {
      */
     @Volatile
     private var shellFallbackCleanupSsid: String? = null
-
-    /**
-     * Suggestion 建议路径（2026-11-04 新增——DiPlay 弹框卡死形态的主解）：
-     * `addSuggestion` → 系统自动连（实测确定性远高于 specifier 弹框关联）。
-     * 隔离性：无互联网热点系统不当默认网，其它应用照常蜂窝——specifier 的
-     * 核心价值保持。SSID 校验必须走 shell（bindCurrentWifi 是盲绑，公司网
-     * 在连时会误绑）——shellWifiReady 守卫，无 Shizuku 落回 specifier。
-     *
-     * @return 已绑定的网络；null = 未批准/窗内未连上（调用方落回 specifier）。
-     */
-    private fun joinViaSuggestion(wifi: Iap2SenderSession.WifiConfiguration): Network? {
-        val connector = wifiConnector ?: return null
-        if (!shellWifiReady()) return null
-        if (!connector.addSuggestion(wifi.ssid, wifi.passphrase, wifi.securityType)) return null
-        appendLog(
-            ">>> 以 Suggestion 建议加入 \"${wifi.ssid}\"（系统自动连；无互联网不当默认网，" +
-                "其它应用照常蜂窝）",
-        )
-        phaseHint = "正在通过系统建议连接车机热点 ${wifi.ssid}…"
-        val deadline = android.os.SystemClock.uptimeMillis() + 12_000
-        while (android.os.SystemClock.uptimeMillis() < deadline && !connectCancelled) {
-            Thread.sleep(400)
-            // SSID 校验门（盲绑防护）：系统当前连接的就是车机热点才绑定
-            if (shellWifiStatus().second == wifi.ssid) {
-                val network = bindExistingCarWifi(connector, wifi.ssid)
-                if (network != null) {
-                    boundCarSsid = wifi.ssid
-                    appendLog("WIFI: suggestion 已连上 \"${wifi.ssid}\"")
-                    return network
-                }
-            }
-        }
-        appendLog("WIFI: suggestion 窗内未连上（未批准/热点不可达）——移除建议，落回 specifier")
-        connector.removeSuggestions()
-        return null
-    }
 
     /**
      * specifier 挂起时的快速兜底（首窗 5s 零回调后调用，运行于连接流程线程）。
@@ -1238,8 +1194,6 @@ object SessionController {
 
     /** 会话终态清理 shell 兜底存的系统网络（[disconnect] 与推流 onEnded 共用）。 */
     private fun cleanupShellFallbackNetwork() {
-        // suggestion 清理（自己的建议自己删——与 shell 网络清理独立、幂等）
-        wifiConnector?.removeSuggestions()
         val ssid = shellFallbackCleanupSsid ?: return
         shellFallbackCleanupSsid = null
         Bg.run("wifi-fallback-cleanup") {

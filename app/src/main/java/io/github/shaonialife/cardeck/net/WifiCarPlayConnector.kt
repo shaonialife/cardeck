@@ -50,56 +50,6 @@ class WifiCarPlayConnector(
     private val connectivityManager =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
-    private val wifiManager =
-        context.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-
-    /** 本轮 suggestion 登记的建议（会话末 [removeSuggestions] 还原系统列表）。 */
-    private val activeSuggestions =
-        AtomicReference<List<android.net.wifi.WifiNetworkSuggestion>?>(null)
-
-    /**
-     * Suggestion 建议路径原语（2026-11-04）：`addNetworkSuggestions` → 系统自动连。
-     *
-     * 隔离性与 specifier 同级：无互联网热点系统**不选为默认网**，其它应用照常
-     * 蜂窝（Android 原生 WiFi/蜂窝聚合策略）；连接是系统全局行为（WLAN 列表
-     * 可见一条），但确定性远高于 specifier（本 ROM 弹框关联卡死实测）。
-     * securityType 按 0x5703 映射：0=open 2=WPA2 3=WPA3过渡（按 WPA2 兼容）
-     * 4=WPA3 仅；WEP（1）suggestion API 不支持返回 false。
-     */
-    fun addSuggestion(
-        ssid: String,
-        passphrase: String,
-        securityType: Int,
-    ): Boolean {
-        val builder =
-            android.net.wifi.WifiNetworkSuggestion
-                .Builder()
-                .setSsid(ssid)
-        when (securityType) {
-            1 -> return false
-            4 -> builder.setWpa3Passphrase(passphrase)
-            2, 3 -> builder.setWpa2Passphrase(passphrase)
-            else -> if (passphrase.isNotEmpty()) builder.setWpa2Passphrase(passphrase)
-        }
-        val suggestion = builder.build()
-        val status = wifiManager.addNetworkSuggestions(listOf(suggestion))
-        val ok = status == android.net.wifi.WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS
-        if (ok) {
-            activeSuggestions.set(listOf(suggestion))
-        } else {
-            log("WIFI: suggestion 未被系统接受（status=$status）")
-        }
-        return ok
-    }
-
-    /** 移除本轮 suggestion（自己的建议自己删，无需 shell 权限；幂等）。 */
-    fun removeSuggestions() {
-        activeSuggestions.getAndSet(null)?.let { list ->
-            runCatching { wifiManager.removeNetworkSuggestions(list) }
-                .onFailure { log("WIFI: removeSuggestions 失败 - ${it.message}") }
-        }
-    }
-
     private val callback = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
 
     val currentNetwork: Network? get() = boundNetwork.get()
