@@ -135,10 +135,20 @@ object SessionController {
         Shell.violationSink = ::appendLog
         // HID 原始日志开关（键位校准）：静态标志从偏好初始化，进程冷启动也要生效
         HidNavigation.rawLogEnabled = DisplayPrefs.hidRawLog(appContext!!)
+        // 完整触摸日志开关（默认关=5s 汇总）：静态标志从偏好初始化，进程冷启动也要生效
+        // （单一事实源 = TouchRouter.fullLogEnabled——车机面板开关由 setter 实时更新）
+        TouchRouter.fullLogEnabled = DisplayPrefs.touchFullLog(appContext!!)
     }
 
     /** 追加一行日志：logcat + 文件 + 进程级缓冲 + 挂屏渲染（增量行直送）。任意线程可调。 */
-    fun appendLog(message: String) {
+    fun appendLog(message: String): Unit = appendLog(message, System.currentTimeMillis())
+
+    /** [atMs] = 行的原始发生时刻——Rust 日志桥批次排空时按 Rust 侧时刻渲染
+     *  （批次内各行时间不同是常态，重打时间戳会让整批时间重复）。 */
+    fun appendLog(
+        message: String,
+        atMs: Long,
+    ) {
         // NUL 会写进日志文件：文本编辑器/文件管理器打不开（Read 工具也会判为二进制），
         // 用户反馈日志时等于白导。0x4301 的定长地址字段曾原样打印出多个 NUL
         // （2026-10-18 实测 216 个），这里替换成可见占位符——顺带让「字符串里有脏字节」
@@ -147,12 +157,12 @@ object SessionController {
         android.util.Log.i("CarPlaySender", clean)
         appContext?.let {
             DebugFileLog
-                .append(it, clean)
+                .append(it, clean, atMs)
         }
         if (!logEnabled) return
         val line =
             synchronized(logLock) {
-                val stamped = '[' + timestamp.format(Date()) + "] " + clean + '\n'
+                val stamped = '[' + timestamp.format(Date(atMs)) + "] " + clean + '\n'
                 logBuilder.append(stamped)
                 if (logBuilder.length > 40_000) logBuilder.delete(0, logBuilder.length - 20_000)
                 stamped
@@ -2143,18 +2153,34 @@ object SessionController {
 
                                         else -> {
                                             val contacts = obj.getJSONArray("contacts")
-                                            if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
-                                                appendLog(
-                                                    "EVENT: 触摸 " +
-                                                        (0 until contacts.length())
-                                                            .joinToString { i ->
-                                                                val c = contacts.getJSONObject(i)
-                                                                "#${c.getInt("slot")}(${c.getInt("x")},${c.getInt("y")})" +
-                                                                    if (c.getBoolean("down")) "↓" else "↑"
-                                                            },
-                                                )
+                                            if (TouchRouter.fullLogEnabled) {
+                                                // 完整触摸日志（车机设置→杂项，即开即生效）：逐条坐标
+                                                if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
+                                                    appendLog(
+                                                        "EVENT: 触摸 " +
+                                                            (0 until contacts.length())
+                                                                .joinToString { i ->
+                                                                    val c = contacts.getJSONObject(i)
+                                                                    "#${c.getInt("slot")}(${c.getInt("x")},${c.getInt("y")})" +
+                                                                        if (c.getBoolean("down")) "↓" else "↑"
+                                                                },
+                                                    )
+                                                }
+                                                touchLogCount++
+                                            } else {
+                                                // 默认：5s 汇总计数（无坐标），连续触摸不刷屏
+                                                touchSummaryPending++
+                                                val now = android.os.SystemClock.uptimeMillis()
+                                                if (touchSummaryAt == 0L) touchSummaryAt = now
+                                                if (now - touchSummaryAt >= 5000L) {
+                                                    appendLog(
+                                                        "EVENT: 触摸 ×$touchSummaryPending（近5s 汇总；" +
+                                                            "完整坐标日志可在 车机设置→杂项 开启）",
+                                                    )
+                                                    touchSummaryPending = 0
+                                                    touchSummaryAt = now
+                                                }
                                             }
-                                            touchLogCount++
                                             for (i in 0 until contacts.length()) {
                                                 val c = contacts.getJSONObject(i)
                                                 TouchRouter.onContact(
@@ -2506,6 +2532,13 @@ object SessionController {
     /** 触摸/隧道事件低频计数（迁移自 MainActivity 字段，保持日志节流行为一致）。 */
     @Volatile
     private var touchLogCount = 0
+
+    /** 默认模式的触摸 5s 汇总计数器（窗口沿事件推进，无独立定时器）。 */
+    @Volatile
+    private var touchSummaryPending = 0
+
+    @Volatile
+    private var touchSummaryAt = 0L
 
     @Volatile
     private var iapEventMessageCount = 0

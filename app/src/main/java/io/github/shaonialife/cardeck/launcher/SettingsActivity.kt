@@ -11,6 +11,7 @@ import io.github.shaonialife.cardeck.launcher.settings.DefaultMapPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.DesktopPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.DockPanelFragment
+import io.github.shaonialife.cardeck.launcher.settings.MiscPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.OrientationPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.SettingsMenus
 import io.github.shaonialife.cardeck.launcher.settings.SettingsToastHost
@@ -58,6 +59,7 @@ class SettingsActivity :
                 R.id.menuDock,
                 R.id.menuDefaultMap,
                 R.id.menuDisplay,
+                R.id.menuMisc,
             )
         ids.forEach { id -> menus.add(findViewById<LinearLayout>(id)) }
         menus.forEachIndexed { index, menu ->
@@ -91,6 +93,7 @@ class SettingsActivity :
                 is DockPanelFragment -> SettingsMenus.DOCK
                 is DefaultMapPanelFragment -> SettingsMenus.DEFAULT_MAP
                 is DisplayPanelFragment -> SettingsMenus.DISPLAY
+                is MiscPanelFragment -> SettingsMenus.MISC
                 else -> 0
             }
         showMenu(index)

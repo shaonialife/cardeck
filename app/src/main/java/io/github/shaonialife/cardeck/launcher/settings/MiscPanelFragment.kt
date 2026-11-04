@@ -79,6 +79,40 @@ class MiscPanelFragment : SettingsPanelFragment() {
         hidRawOn.setOnClickListener { applyHidRaw(true) }
         hidRawOff.setOnClickListener { applyHidRaw(false) }
 
+        // 完整触摸日志（调试车机触摸）：默认关（只出 5s 汇总计数，无坐标）
+        val touchFullOn = view.findViewById<TextView>(R.id.btnTouchFullOn)
+        val touchFullOff = view.findViewById<TextView>(R.id.btnTouchFullOff)
+        var touchFullEnabled = DisplayPrefs.touchFullLog(ctx)
+
+        fun refreshTouchFull(enabled: Boolean) {
+            touchFullOn.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            touchFullOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+            touchFullOff.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            touchFullOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
+        }
+
+        refreshTouchFull(touchFullEnabled)
+
+        fun applyTouchFull(enabled: Boolean) {
+            if (enabled == touchFullEnabled) return
+            touchFullEnabled = enabled
+            DisplayPrefs.setTouchFullLog(ctx, enabled)
+            refreshTouchFull(enabled)
+            hostToast(
+                if (enabled) {
+                    "已开启完整触摸日志（逐条坐标；排查完请关掉）"
+                } else {
+                    "已关闭完整触摸日志（只出 5s 汇总）"
+                },
+            )
+        }
+        touchFullOn.setOnClickListener { applyTouchFull(true) }
+        touchFullOff.setOnClickListener { applyTouchFull(false) }
+
         // 音频路由自愈：默认开（会话中采集全零+在播 → 断开抢占的蓝牙音频设备）
         val reclaimOn = view.findViewById<TextView>(R.id.btnAudioReclaimOn)
         val reclaimOff = view.findViewById<TextView>(R.id.btnAudioReclaimOff)

@@ -45,6 +45,16 @@ object TouchRouter {
     private var pressedDisplay = -1
     private var failStreak = 0
 
+    /**
+     * 完整触摸日志（车机设置→杂项，默认关）：开=逐条「注入OK 含坐标」
+     * （1s 节流不变）；关=不逐条记录，只按 5s 汇总注入次数（无坐标）。
+     */
+    @Volatile
+    var fullLogEnabled = false
+
+    private var injectedCount = 0
+    private var injectSummaryAt = 0L
+
     /** 叠加卡片手势状态（卡片命中后独占触摸，不再注入应用）。 */
     private var overlayPressed = false
 
@@ -278,7 +288,21 @@ object TouchRouter {
                         "down=${contact.down} pressed=$pressed pressedDisplay=$pressedDisplay",
                 )
             } else if (contact.down) {
-                diag("注入OK disp=$targetDisplay ($localX,$localY)")
+                if (fullLogEnabled) {
+                    diag("注入OK disp=$targetDisplay ($localX,$localY)")
+                } else {
+                    // 默认：不逐条记录，只按 5s 汇总注入次数（无坐标）——
+                    // 连续触摸时「注入OK」与触摸日志一起刷屏，淹没其它日志
+                    injectedCount++
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (now - injectSummaryAt >= 5000L) {
+                        logSink?.invoke(
+                            "TOUCH: 注入 ×$injectedCount（近5s 汇总；完整坐标日志可在 车机设置→杂项 开启）",
+                        )
+                        injectedCount = 0
+                        injectSummaryAt = now
+                    }
+                }
             }
         } catch (e: Exception) {
             diag("注入异常：${e.message}")

@@ -36,6 +36,20 @@ object NativeBridge {
     /** so 版本串（如 "cardeck-protocol 0.1.0"）。 */
     external fun nativeVersion(): String
 
+    // ---- 日志桥（Rust →「运行日志」区域，2026-11-04）----
+
+    /** 排空 Rust 待转发日志行（`native_file_log` 的旁路队列；`UTF-8` 文本，
+     *  `\n` 分隔，队溢出附一次性摘要头；空队列返回 null）。
+     *
+     *  宿主排空线程 200ms 轮询，逐行接 `SessionController.appendLog`
+     *  （logcat + main_debug.log + UI 缓冲 + 挂屏增量四路自动获得）。
+     *  **形态定谳**：JNI 回调方向（全局引用 + 方法 ID 反射调用）在本机
+     *  ART 上三连 SEGV_ACCERR（BRIDGE-PROBE 实证 NewGlobalRef/GetMethodID
+     *  返回不透明句柄，跨线程重放必崩）——队列轮询 + ByteArray 返回 =
+     *  本代码库唯一生产验证过的 JNI 形。行已由 Rust 侧整形：RUST: 前缀 +
+     *  240 字符截断 + 队列容量上限。 */
+    external fun nativeTakeLogs(): ByteArray?
+
     // ---- 原生会话门面（Rust 拥有 run loop 与全部协议逻辑；Kotlin 只供
     // 传输字节与时钟节拍）。C 符号 cardeck_*（非 JNI 风格，System.loadLibrary
     // 后经 LibLoader 直接 dlsym 语义由 JNA/手写 extern 皆可——此处用

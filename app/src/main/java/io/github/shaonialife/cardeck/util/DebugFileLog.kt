@@ -91,6 +91,14 @@ object DebugFileLog {
     fun append(
         context: Context,
         message: String,
+    ): Unit = append(context, message, System.currentTimeMillis())
+
+    /** 写入一行（[atMs] = 行的原始发生时刻——Rust 日志桥批次排空时按
+     *  Rust 侧时刻渲染，避免整批行时间重复）。 */
+    fun append(
+        context: Context,
+        message: String,
+        atMs: Long,
     ) {
         try {
             synchronized(lock) {
@@ -105,7 +113,7 @@ object DebugFileLog {
                     ).use {
                         it
                             .append('[')
-                            .append(timestamp.format(Date()))
+                            .append(timestamp.format(Date(atMs)))
                             .append("] ")
                             .append(SESSION_MARKER)
                             .append('\n')
@@ -114,14 +122,14 @@ object DebugFileLog {
                 FileWriter(file, true).use { writer ->
                     writer
                         .append('[')
-                        .append(timestamp.format(Date()))
+                        .append(timestamp.format(Date(atMs)))
                         .append("] ")
                         .append(message)
                         .append('\n')
                 }
             }
             tap?.let { listener ->
-                val line = "[" + timestamp.format(Date()) + "] " + message
+                val line = "[" + timestamp.format(Date(atMs)) + "] " + message
                 runCatching { listener(sequence.incrementAndGet(), line) }
             }
         } catch (_: Throwable) {

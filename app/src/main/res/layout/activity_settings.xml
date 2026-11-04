@@ -209,6 +209,33 @@
                 android:textColor="#FF8E8E93"
                 android:textSize="14sp" />
         </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/menuMisc"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="?android:attr/selectableItemBackground"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="9dp">
+
+            <ImageView
+                android:layout_width="23dp"
+                android:layout_height="23dp"
+                android:background="@drawable/bg_menu_chip"
+                android:importantForAccessibility="no"
+                android:padding="5dp"
+                android:src="@drawable/ic_app_settings" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="9dp"
+                android:text="杂项设置"
+                android:textColor="#FF8E8E93"
+                android:textSize="14sp" />
+        </LinearLayout>
     </LinearLayout>
 
     <View

@@ -56,6 +56,43 @@ open class SenderApp : Application() {
                 try {
                     val bridge = io.github.shaonialife.cardeck.protocol.NativeBridge
                     if (bridge.ensureLoaded()) {
+                        // 日志桥排空线程：Rust 侧日志（fw:: 链路编排/RTSP 诊断/panic）
+                        // 经旁路队列 + 200ms 轮询接 appendLog（logcat + main_debug.log +
+                        // UI 缓冲 + 挂屏增量四路自动获得）。**形态定谳**：JNI 回调方向
+                        // （全局引用+方法 ID 反射调用）在本机 ART 三连 SEGV_ACCERR
+                        // （BRIDGE-PROBE：返回的是不透明句柄）——队列轮询 + ByteArray
+                        // 返回是唯一生产验证过的 JNI 形。
+                        Thread(
+                            {
+                                while (true) {
+                                    runCatching {
+                                        bridge.nativeTakeLogs()?.let { bytes ->
+                                            for (line in String(bytes, Charsets.UTF_8).split('\n')) {
+                                                if (line.isEmpty()) continue
+                                                // 行形 = "<原始时刻 epoch ms> <文本>"——按
+                                                // Rust 侧时刻渲染（批次排空不重打时间戳）
+                                                val sp = line.indexOf(' ')
+                                                val head = if (sp > 0) line.substring(0, sp) else ""
+                                                if (sp in 1..14 && head.all { it.isDigit() }) {
+                                                    io.github.shaonialife.cardeck.SessionController.appendLog(
+                                                        line.substring(sp + 1),
+                                                        head.toLong(),
+                                                    )
+                                                } else {
+                                                    io.github.shaonialife.cardeck.SessionController
+                                                        .appendLog(line)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Thread.sleep(200)
+                                }
+                            },
+                            "rust-log-drain",
+                        ).apply {
+                            isDaemon = true
+                            start()
+                        }
                         // 顺手验一遍固件原语：marker 判定 + 校验和 + 参数名查表
                         val marker = byteArrayOf(0xFF.toByte(), 0x55, 0x02, 0x00, 0xEE.toByte(), 0x10)
                         val detect = bridge.nativeIap2IsDetectMarker(marker, marker.size)
@@ -66,7 +103,7 @@ open class SenderApp : Application() {
                                 .nativeIap2SynParamDefaults()
                                 ?.joinToString("") { "%02x".format(it) }
                         "RUST: ✓ ${bridge.nativeVersion()}（${bridge.nativeHello()}；" +
-                            "固件原语 detect=$detect sum=$sum p6=$p6 syn=$syn）"
+                            "固件原语 detect=$detect sum=$sum p6=$p6 syn=$syn；日志桥（队列轮询）已通）"
                     } else {
                         "RUST: ⚠ cardeck_protocol 未加载"
                     }

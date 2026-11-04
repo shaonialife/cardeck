@@ -33,6 +33,9 @@ object DisplayPrefs {
     /** HID 原始报文日志默认值：默认关（校准键位时临时打开，避免刷屏）。 */
     const val HID_RAW_LOG_DEFAULT = false
 
+    /** 完整触摸日志默认值：默认关（只出 5s 汇总计数，无坐标）。 */
+    const val TOUCH_FULL_LOG_DEFAULT = false
+
     /** 音频路由自愈默认值：默认开（断开的是会话期间抢走媒体输出的蓝牙设备）。 */
     const val AUDIO_ROUTE_RECLAIM_DEFAULT = true
 
@@ -42,7 +45,30 @@ object DisplayPrefs {
     private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
     private const val KEY_HID_RAW_LOG = "hid_raw_log"
+    private const val KEY_TOUCH_FULL_LOG = "touch_full_log"
     private const val KEY_AUDIO_ROUTE_RECLAIM = "audio_route_reclaim"
+
+    /**
+     * 完整触摸日志（杂项设置开关，默认关）：开=逐条打印触点坐标与注入结果
+     * （调试车机触摸用）；关=只出每 5 秒一条的汇总计数（无坐标），避免
+     * 连续触摸刷屏淹没其它日志。
+     */
+    fun touchFullLog(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_TOUCH_FULL_LOG, TOUCH_FULL_LOG_DEFAULT)
+
+    fun setTouchFullLog(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_TOUCH_FULL_LOG, enabled)
+            .apply()
+        io.github.shaonialife.cardeck.input.TouchRouter.fullLogEnabled = enabled
+    }
 
     /**
      * 音频路由自愈（杂项设置开关，默认开）：会话中检测到「采集全零 + 有应用在播」
