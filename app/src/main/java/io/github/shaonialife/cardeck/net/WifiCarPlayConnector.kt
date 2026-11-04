@@ -357,8 +357,17 @@ class WifiCarPlayConnector(
     ): WifiNetworkSpecifier? {
         return try {
             val builder = WifiNetworkSpecifier.Builder().setSsid(ssid)
+            // **凭据自洽优先于声明**（2026-11-04 DiPlay loading 根因）：0x5703 可能
+            // 报 security=0（open）却同时带密码（xcertplay/K40 实测）——热点实际是
+            // WPA2。按 open 关联 WPA2 热点 = 关联失败转圈（系统弹框 loading、
+            // 「连接」灰置—— specifier 在此台架从未成功过的根因）。密码非空一律
+            // 按 WPA2（声明 open + 有密码自相矛盾时以实际凭据为准）。
+            if (passphrase.isNotEmpty() && securityType != 4) {
+                builder.setWpa2Passphrase(passphrase)
+                return builder.build()
+            }
             when (securityType) {
-                // 开放热点：无密码
+                // 开放热点：无密码（security=0 且无密码才走 open）
                 0 -> Unit
                 // WEP：WifiNetworkSpecifier 无对应 API（现代车机不再使用）
                 1 -> return null
