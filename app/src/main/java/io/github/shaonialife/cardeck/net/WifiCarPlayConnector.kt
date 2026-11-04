@@ -56,6 +56,17 @@ class WifiCarPlayConnector(
     private val boundNetwork = AtomicReference<Network?>(null)
 
     /**
+     * 绑定网络是否仍有效。系统把进程切回其它网络（家庭 WiFi 抢回默认网）/
+     * 热点网络被回收时，[Network] 对象可能还在引用里但已失效——capabilities
+     * 查询返回 null。「在位跳过」与重试回路据此检测网络变化（2026-11-04
+     * ENONET 案：记录还在、网络已死，整轮重试全废）。
+     */
+    fun isBoundNetworkAlive(): Boolean {
+        val network = boundNetwork.get() ?: return false
+        return connectivityManager.getNetworkCapabilities(network) != null
+    }
+
+    /**
      * 应用专属网络被系统断开（热点关闭/离开范围）时回调。会话层据此提示用户；
      * 空实现 = 不关心（例如手动绑定路径）。
      */

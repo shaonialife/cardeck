@@ -923,9 +923,14 @@ object SessionController {
         val connector = wifiConnector ?: return WifiCarPlayConnector.JoinResult.Unavailable
         if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
         val existing = connector.currentNetwork
-        if (boundCarSsid == wifi.ssid && existing != null) {
+        if (boundCarSsid == wifi.ssid && existing != null && !connector.isBoundNetworkAlive()) {
+            appendLog("WIFI: 记录的车机热点网络已失效——重新建立网络通道")
+            boundCarSsid = null
+        }
+        val existingAlive = connector.currentNetwork
+        if (boundCarSsid == wifi.ssid && existingAlive != null && connector.isBoundNetworkAlive()) {
             appendLog("WIFI: 车机热点已就绪且网络通道已绑定——跳过重复加入")
-            return WifiCarPlayConnector.JoinResult.Joined(existing)
+            return WifiCarPlayConnector.JoinResult.Joined(existingAlive)
         }
         if (!ensureWifiEnabledSilently()) return WifiCarPlayConnector.JoinResult.Unavailable
         if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
@@ -1054,9 +1059,16 @@ object SessionController {
         val result =
             synchronized(wifiBindLock) {
                 val existing = connector.currentNetwork
-                if (boundCarSsid == wifi.ssid && existing != null) {
+                if (boundCarSsid == wifi.ssid && existing != null && !connector.isBoundNetworkAlive()) {
+                    // 网络失效检测（2026-11-04 ENONET 案）：系统把进程切回家庭
+                    // WiFi / 热点网络被回收——记录还在但网络已死，跳过=整轮废
+                    appendLog("WIFI: 记录的车机热点网络已失效（系统切回其它网络/网络被回收）——重新加入")
+                    boundCarSsid = null
+                }
+                val existingAlive = connector.currentNetwork
+                if (boundCarSsid == wifi.ssid && existingAlive != null && connector.isBoundNetworkAlive()) {
                     appendLog("WIFI: 应用专属网络已在位——跳过重复加入")
-                    WifiCarPlayConnector.JoinResult.Joined(existing)
+                    WifiCarPlayConnector.JoinResult.Joined(existingAlive)
                 } else {
                     // 前置探测（2026-11-04 DiPlay 实测）：华为保存过热点 SSID →
                     // specifier 馪窗 5s 零回调（部分 ROM 对已保存 SSID 永久 pending），
@@ -2011,6 +2023,26 @@ object SessionController {
                             context = context.applicationContext,
                             endpointRefresher = { current -> enrichEndpointFromBrowser(current, source) },
                             retryTick = { attempt ->
+                                // 网络失效检测（2026-11-04 ENONET 案）：重试回路里
+                                // 绑定网络若已死（系统切回家庭 WiFi/热点被回收），
+                                // 后续重试注定全败——检测到即重走加入流程，下一轮
+                                // 重试用新网络
+                                val connectorNow = wifiConnector
+                                if (connectorNow != null &&
+                                    boundCarSsid != null &&
+                                    !connectorNow.isBoundNetworkAlive()
+                                ) {
+                                    appendLog("WIFI: 检测到车机热点网络已失效（系统切回其它网络）——重试回路内重新加入")
+                                    boundCarSsid = null
+                                    joinCarWifiSpecifier(
+                                        Iap2SenderSession.WifiConfiguration(
+                                            effective.ssid,
+                                            effective.passphrase,
+                                            effective.channel,
+                                            effective.securityType,
+                                        ),
+                                    )
+                                }
                                 // 配对重试期间车机仍可能没探测到 ctrl（Bonjour 漏掉首次公告）：
                                 // 周期性强制重播一次，并把 mDNS 现状写进日志——否则排查时
                                 // 只看得到「端口未开」的重试刷屏，无法判断是车机没邀请还是
@@ -2029,6 +2061,36 @@ object SessionController {
                                 )
                             },
                         ).also { created ->
+                            // 连接失败回执：socket 失败 = "网络不对"的直接证据
+                            // （热点无上行被系统秒级切回家庭 WiFi 时，网络对象
+                            // 存活类校验查不出，只有 connect 失败查得出）。收到
+                            // 网络类失败 → 清记录重走加入（≥15s 节流，防止与
+                            // tcp-retry 循环互相踩）。
+                            var lastRejoinAt = 0L
+                            created.onConnectFailed = { failures ->
+                                val networkish =
+                                    failures.any {
+                                        it.contains("ENONET") ||
+                                            it.contains("ENETUNREACH") ||
+                                            it.contains("EHOSTUNREACH") ||
+                                            it.contains("ETIMEDOUT") ||
+                                            it.contains("after ")
+                                    }
+                                val now = android.os.SystemClock.uptimeMillis()
+                                if (networkish && now - lastRejoinAt >= 15_000L) {
+                                    lastRejoinAt = now
+                                    appendLog("WIFI: 连接失败=网络不对（系统可能已切回其它 WiFi）——清记录重新加入热点")
+                                    boundCarSsid = null
+                                    joinCarWifiSpecifier(
+                                        Iap2SenderSession.WifiConfiguration(
+                                            effective.ssid,
+                                            effective.passphrase,
+                                            effective.channel,
+                                            effective.securityType,
+                                        ),
+                                    )
+                                }
+                            }
                             // 车机媒体键（iAP2 0x6802 通路）：方向盘/面板的上一曲、下一曲。
                             // 放在这里而不是调用点，保证重连重建 client 时也挂得上。
                             created.onMediaKey = { keyCode ->

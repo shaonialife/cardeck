@@ -1048,6 +1048,12 @@ class AirPlayLink(
      * → [ConsumerKeys] 映射成 Android KeyEvent → 本回调。由 SessionController 注入
      * `dispatchMediaKey`（与 HID 直投那条路合并处理）。
      */
+    /** 控制通道 TCP 连接失败回执（每轮 connectToEndpoint 全候选失败时一次）——
+     *  宿主据此检测网络变化（热点被系统切走→socket 失败是直接证据）并重走加入。
+     *  2026-11-04 ENONET 案：热点无上行被系统秒级切回家庭 WiFi，
+     *  网络对象存活类校验（capabilities）查不出，socket 失败才查得出。 */
+    var onConnectFailed: ((failures: List<String>) -> Unit)? = null
+
     var onMediaKey: ((Int) -> Unit)? = null
 
     /** 导航键（iDrive 旋钮/四向拨杆）：需要虚拟屏焦点，由会话层注入 DPAD。 */
@@ -1541,6 +1547,7 @@ class AirPlayLink(
                 "  ↳ 若反复失败：确认手机当前连的是接收端热点 \"${target.ssid}\"，" +
                 "而不是家里/公司 WiFi（绑定到的网络不对时到达不了车机网段）",
         )
+        onConnectFailed?.invoke(failures)
         return false
     }
 
