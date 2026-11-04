@@ -1027,6 +1027,16 @@ object SessionController {
                     appendLog("WIFI: 应用专属网络已在位——跳过重复加入")
                     WifiCarPlayConnector.JoinResult.Joined(existing)
                 } else {
+                    // 前置探测（2026-11-04 DiPlay 实测）：华为保存过热点 SSID →
+                    // specifier 馪窗 5s 零回调（部分 ROM 对已保存 SSID 永久 pending），
+                    // 每轮都靠快速兜底——系统已连着车机热点时直接绑定，省掉必输的
+                    // 5s（车机入网预算 ~9-14s 经不起白等）。探测内部有 shellWifiReady
+                    // 守卫（Shizuku 不可用/系统未连着 → null，落回 specifier 正常流程）。
+                    specifierQuickFallback(wifi)?.let { bound ->
+                        ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
+                        appendLog(">>> WiFi 已绑定现有连接（系统已连着热点），ctrl 广播已重新注册")
+                        return WifiCarPlayConnector.JoinResult.Joined(bound)
+                    }
                     connector.joinCarPlayNetwork(
                         ssid = wifi.ssid,
                         passphrase = wifi.passphrase,
