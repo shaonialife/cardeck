@@ -420,6 +420,7 @@ class AirPlayLink(
                             logInfoSummary(map)
                         }
                         log("AIRPLAY: info deviceID=${json.optString("deviceID")}")
+                        publishOemBlock(json)
                         // startPairing 返回事件（pinRequired = PIN 流已起，
                         // setup M1 未发——§10.49）：此前被丢弃，凭它进入等码期
                         val startEv = NativeBridge.nativeAirplayStartPairing(handle)
@@ -745,6 +746,57 @@ class AirPlayLink(
     }
 
     /**
+     * 请求车机 UI（车机桌面 OEM 图标点击语义）：会话保持不断，车机切回原
+     * 界面。协议形在 Rust（EventChannel::send_request_car_ui——fw:
+     * _carEndpoint_RequestCarUI @0x2277e8ab8 → requestUI 命令；接收端
+     * DiPlay onHostUiRequested / WinPlay host-ui-requested 互证）。
+     */
+    fun requestCarUi(): Boolean {
+        val result = NativeBridge.nativeAirplayRequestCarUi(controlSessionHandle)
+        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
+        if (!sent) log("EVENT: requestUI 发送失败(rust) - $result")
+        // 控制通道命令：出站即写网（主 RTSP 连接；rtspWriteLock 防与泵并发）
+        socket?.let { drainRustOutbound(controlSessionHandle, it.getOutputStream()) }
+        log("AIRPLAY: requestUI（请求车机 UI）[控制通道] ok=$sent")
+        return sent
+    }
+
+    /**
+     * /info 的 OEM 图标域 → 车机桌面「返回车机」块
+     * （DiPlay 实测 {label "BYD", PNG 192², visible:true}；fw: copyOEMIcons
+     * @0x2277f32c0 属性域）。不可见/无标签 → 清块。
+     */
+    private fun publishOemBlock(json: org.json.JSONObject) {
+        val label =
+            if (json.optBoolean("oemIconVisible", false)) {
+                json.optString("oemIconLabel", "").ifEmpty { json.optString("name", "") }
+            } else {
+                ""
+            }
+        if (label.isEmpty()) {
+            io.github.shaonialife.cardeck.launcher.VirtualLauncher
+                .setOemBlock(null)
+            return
+        }
+        val icon =
+            json
+                .optJSONArray("oemIcons")
+                ?.optJSONObject(0)
+                ?.optString("imageDataBase64", "")
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { b64 ->
+                    runCatching {
+                        val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    }.getOrNull()
+                }
+        io.github.shaonialife.cardeck.launcher.VirtualLauncher.setOemBlock(
+            io.github.shaonialife.cardeck.launcher.VirtualLauncher
+                .OemBlock(label, icon),
+        )
+    }
+
+    /**
      * SETUP #1：发送会话信息，接收 eventPort/timingPort/enabledFeatures。
      *
      * features 必须发「完整 iPhone 能力清单」：接收端计算
@@ -847,6 +899,7 @@ class AirPlayLink(
                 if (ev.isNotEmpty() && org.json.JSONObject(ev).optString("type") == "info") {
                     rustInfoEvent = org.json.JSONObject(ev)
                     log("AIRPLAY: info deviceID=${rustInfoEvent?.optString("deviceID")}")
+                    rustInfoEvent?.let { publishOemBlock(it) }
                 }
             }
             if (rustInfoEvent == null) {

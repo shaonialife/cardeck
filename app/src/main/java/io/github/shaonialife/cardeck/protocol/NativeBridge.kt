@@ -413,6 +413,11 @@ object NativeBridge {
      *  EventChannel::send_modes_assert）。返回 "" 或错误 JSON。 */
     external fun nativeAirplayAssertModes(handle: Long): String?
 
+    /** 请求车机 UI（车机桌面 OEM 图标点击语义：会话保持不断，车机切回原
+     *  界面——fw: _carEndpoint_RequestCarUI @0x2277e8ab8 → requestUI 命令）。
+     *  返回 "" 或错误 JSON。 */
+    external fun nativeAirplayRequestCarUi(handle: Long): String?
+
     /** D7 音频候选（从会话 'info' 存档选择——fw::airplay::session
      *  InfoReply::audio_candidates）。返回 JSON 数组，空 = 基线回退。 */
     external fun nativeAirplayAudioCandidates(

@@ -290,6 +290,25 @@ object SessionController {
     @Volatile
     var currentClient: AirPlayLink? = null
 
+    /**
+     * 车机桌面「OEM 图标」块点击（用户令 2026-11-04）：发 requestUI——
+     * **会话保持不断**，车机切回原界面（用户在原界面的 CarPlay 入口点回来，
+     * 屏幕流全程保持）。fw 真身 = _carEndpoint_RequestCarUI @0x2277e8ab8
+     * → requestUI 命令；modesChanged 资源释放路线已撤（真机实测与资源
+     * 重申调度器互相打架，且非固件真身）。任意线程可调（内部转 Bg——
+     * 事件通道出站是 socket 写）。
+     */
+    fun requestCarUi() {
+        val client =
+            currentClient ?: run {
+                appendLog("TOUCH: 无活动会话——OEM 块忽略")
+                return
+            }
+        Bg.run("request-car-ui") {
+            client.requestCarUi()
+        }
+    }
+
     @Volatile
     var currentHiddenSource: HiddenDisplaySource? = null
 
@@ -713,6 +732,8 @@ object SessionController {
         // 音频路由抢占自愈的节流状态随会话复位
         audioRouteReclaimLastAtMs = 0L
         audioRouteReclaimAttempts = 0
+        // OEM 块随会话复位（新一轮 info 到达后重新发布）
+        VirtualLauncher.setOemBlock(null)
         // 「强制应用横屏」覆盖的复原**不在这里做**（2026-10-23 奥迪 3315 真机日志定谳）：
         // 本方法在每轮配对起步时也会执行，此时距离上一轮会话结束只有几秒——上一轮的
         // 桌面/地图应用（与新一轮是同一批包）多半还活着；而本会话的应用在 attach 里

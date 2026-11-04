@@ -135,6 +135,34 @@ object VirtualLauncher {
         runningAppsListeners.forEach { runCatching { it() } }
     }
 
+    // ---- OEM「返回车机」块（/info oemIcons 域；会话层 publishOemBlock 写入）----
+
+    /** OEM 块数据：车机图标标签（如「BYD」「我的奥迪」）+ 预渲染 PNG 图标。 */
+    data class OemBlock(
+        val label: String,
+        val icon: android.graphics.Bitmap?,
+    )
+
+    @Volatile
+    var oemBlock: OemBlock? = null
+        private set
+
+    private val oemListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /** 桌面注册回调：OEM 块出现/变化时刷新网格（info 事件到达晚于桌面首帧）。 */
+    fun addOemListener(listener: () -> Unit) {
+        oemListeners.add(listener)
+    }
+
+    fun removeOemListener(listener: () -> Unit) {
+        oemListeners.remove(listener)
+    }
+
+    fun setOemBlock(block: OemBlock?) {
+        oemBlock = block
+        oemListeners.forEach { runCatching { it() } }
+    }
+
     /**
      * 桌面图标缓存（DockActivity 显示运行中图标用）。桌面扫描线程整表换新、dock 的
      * 主线程并发读——volatile 引用替换，读方拿到的旧表也完整自洽（此前 clear+逐条

@@ -32,11 +32,14 @@ import io.github.shaonialife.cardeck.util.Bg
  * 用户可在设置页勾选要显示的应用，返回桌面（onResume）即时刷新。
  */
 class GridActivity : AppCompatActivity() {
-    /** 桌面格子：仪表盘页（第 0 页）/ 固定设置入口 / 普通应用。 */
+    /** 桌面格子：仪表盘页（第 0 页）/ 固定设置入口 / OEM「返回车机」/ 普通应用。 */
     private sealed interface Cell {
         object Dashboard : Cell
 
         object Pinned : Cell
+
+        /** OEM「返回车机」块（/info oemIcons；点击 = 归还/收回主屏，会话保持）。 */
+        object Oem : Cell
 
         data class App(
             val entry: VirtualLauncher.AppEntry,
@@ -91,6 +94,9 @@ class GridActivity : AppCompatActivity() {
      *  具名字段（勿内联匿名 lambda）：onDestroy 才能对称移除，否则桌面重建累积泄漏。 */
     private val mapLayoutListener: (Boolean) -> Unit =
         { _ -> runOnUiThread { refreshDashWallpaper() } }
+
+    /** OEM「返回车机」块出现/变化（info 事件晚于桌面首帧到达——会话线程 fire）。 */
+    private val oemListener: () -> Unit = { runOnUiThread { reload() } }
 
     /**
      * 应用卡片视觉：暗幕 alpha 与壁纸模糊半径（RenderEffect，半径随网格屏
@@ -365,6 +371,8 @@ class GridActivity : AppCompatActivity() {
             // 注册变更通知 + 立即对账一次（兜底注册前发生的更换——事件不补发）
             WallpaperStore
                 .addListener(wallpaperListener)
+            // OEM 块（info 事件晚于桌面首帧——出现即刷新网格）
+            VirtualLauncher.addOemListener(oemListener)
             refreshWallpaperIfChanged()
 
             // 仪表盘面板已改为 ViewPager2 首页（PageAdapter 绑定时创建），
@@ -515,6 +523,8 @@ class GridActivity : AppCompatActivity() {
         val cells =
             buildList {
                 add(Cell.Pinned) // 桌面第一格：车机设置（固定，不可取消）
+                // OEM「返回车机」块（/info oemIcons；会话建立后由 publishOemBlock 发布）
+                if (VirtualLauncher.oemBlock != null) add(Cell.Oem)
                 apps.filter { it.component.flattenToString() in selected }.forEach { add(Cell.App(it)) }
             }
         // 第 0 页 = 仪表盘，其后为桌面网格页：左右滑动即互相切换
@@ -738,6 +748,27 @@ class GridActivity : AppCompatActivity() {
                         view.setOnClickListener { openSettings() }
                     }
 
+                    is Cell.Oem -> {
+                        val block = VirtualLauncher.oemBlock
+                        if (block?.icon != null) {
+                            icon.setImageBitmap(
+                                AppIcons.rounded(
+                                    android.graphics.drawable.BitmapDrawable(resources, block.icon),
+                                    iconSizePx,
+                                ),
+                            )
+                        } else {
+                            icon.setImageResource(R.drawable.ic_menu_grid)
+                        }
+                        label.text = block?.label ?: ""
+                        view.setOnClickListener {
+                            // requestUI（会话保持）：车机切回原界面即反馈；
+                            // 内部转 Bg（事件通道出站是 socket 写）
+                            io.github.shaonialife.cardeck.SessionController
+                                .requestCarUi()
+                        }
+                    }
+
                     is Cell.App -> {
                         icon.setImageBitmap(AppIcons.rounded(cell.entry.icon, iconSizePx))
                         label.text = cell.entry.label
@@ -808,6 +839,7 @@ class GridActivity : AppCompatActivity() {
             .removeListener(wallpaperListener)
         VirtualLauncher.removeDashboardListener(dashboardListener)
         VirtualLauncher.removeMapLayoutListener(mapLayoutListener)
+        VirtualLauncher.removeOemListener(oemListener)
         MediaSessionsState
             .removeListener(mediaStateListener)
         DockPrefs.removeListener(dockPrefsListener)
