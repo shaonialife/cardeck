@@ -407,7 +407,7 @@ class MainActivity : AppCompatActivity() {
                 listOf(
                     DarkMessageDialog.Action("取消") {},
                     DarkMessageDialog.Action("断开", DarkMessageDialog.Emphasis.DANGER) {
-                        SessionController.disconnect(this)
+                        SessionController.disconnect(this, userInitiated = true)
                     },
                 ),
         )
@@ -753,7 +753,7 @@ class MainActivity : AppCompatActivity() {
                     onDecline = {
                         // 放弃使用：结束本任务并退出（不用 System.exit，保留正常生命周期收尾）。
                         // 若已有会话在跑，先正常断开，避免留下无人管理的推流与虚拟屏。
-                        runCatching { SessionController.disconnect(this) }
+                        runCatching { SessionController.disconnect(this, userInitiated = true) }
                         finishAndRemoveTask()
                     },
                     onDismiss = { activeDisclaimer = null },

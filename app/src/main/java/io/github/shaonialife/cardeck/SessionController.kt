@@ -341,6 +341,13 @@ object SessionController {
     @Volatile
     var phaseHint: String? = null
 
+    /** 横屏覆盖复原闸：会话起步装填（applyAll 前），两处收尾（disconnect 用户终态 /
+     *  VideoSender.onEnded 车机拆链）谁先执行谁复原，后到静默跳过——手动断开时
+     *  两路都走，无闸会连打两条「已复原 N 个应用的显示设置」（2026-11-05 用户报告）。 */
+    private val orientationRestorePending =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
+
     /**
      * 用户取消后的自动连接冷却期（uptimeMillis）。取消只杀当轮会话，车机侧会因
      * RFCOMM 断开拆掉整轮无线栈（ACL 随之抖动），每次 ACL 重连都会再次触发
@@ -563,9 +570,20 @@ object SessionController {
         }
     }
 
-    /** 「断开连接」（可在任意 Activity 实例上调用——操作的是真管线对象）。 */
-    fun disconnect(context: Context) {
+    /** 「断开连接」（可在任意 Activity 实例上调用——操作的是真管线对象）。
+     *  [userInitiated]=用户手动断开（断开按钮/放弃使用）→ 装填自动重连冷却
+     *  （与 [cancelConnecting] 同理：RFCOMM 断开必引 ACL 抖动，不装冷却用户
+     *  点多少次断开都会被「上车自动启动」重连，2026-11-05 装机实测）；
+     *  「下车自动结束」（AUTO_STOP_SESSION）不装——下次上车本就要自动连。 */
+    fun disconnect(
+        context: Context,
+        userInitiated: Boolean = false,
+    ) {
         val hadProjection = CarPlayService.mediaProjection != null
+        if (userInitiated) {
+            autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
+            appendLog("SESSION: 手动断开——自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟（ACL 抖动不再自动拉起）")
+        }
         retireSession()
         // BT 控制会话只在这里（用户终态）退役，socket close 让保活读循环立刻退出：
         // 否则它阻塞到对端超时（实测 ~24s）才结束，用户取消后英雄卡持续转圈。
@@ -583,7 +601,9 @@ object SessionController {
         boundCarSsid = null
         // 「强制应用横屏」覆盖的用户终态复原（原先在 retireSession 里——那里每轮
         // 配对起步也执行，会杀掉新一轮刚拉起的应用，2026-10-23 移出到真实终态）。
-        appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
+        if (orientationRestorePending.compareAndSet(true, false)) {
+            appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
+        }
         // shell 兜底存下的系统网络（connect-network）自动 forget 还原：无互联网热点
         // 被系统当默认网会挤掉移动数据。失败只记日志（用户可到 WLAN 手动删）。
         cleanupShellFallbackNetwork()
@@ -2088,6 +2108,7 @@ object SessionController {
                     // 空窗，写入在此期间自然排空，attach 只需 drain（~0ms）——原先在 attach
                     // 里同步跑（1.6s，串行时 3.2s）会侵占「RECORD→屏幕口 keepAlive」的
                     // ~10s 拆链预算（keepAlive 帧自 attach 返回后才起发，2026-10-23 定谳）。
+                    orientationRestorePending.set(true)
                     appContext?.let { ctx -> AppOrientationCompat.applyAllAsync(ctx, ::appendLog) }
                     retireSession()
                     // 会话静默降噪（2026-10-10）：从交接点起暂停其它接收端的出站连接探测
@@ -2397,8 +2418,10 @@ object SessionController {
                                             restorePhoneScreen(sleepIfCarSide = true)
                                             // 同样复原横屏覆盖。这里跑在推流收尾线程，不是连接
                                             // 关键路径，但统一走异步口以保持「串行、不重入」的语义。
-                                            appContext?.let { ctx ->
-                                                AppOrientationCompat.resetAllAsync(ctx, ::appendLog)
+                                            if (orientationRestorePending.compareAndSet(true, false)) {
+                                                appContext?.let { ctx ->
+                                                    AppOrientationCompat.resetAllAsync(ctx, ::appendLog)
+                                                }
                                             }
                                             // shell 兜底存的系统网络也要在这里还原：车机拆链是
                                             // 最常见的离场方式（熄火），用户未必点「断开」——只挂

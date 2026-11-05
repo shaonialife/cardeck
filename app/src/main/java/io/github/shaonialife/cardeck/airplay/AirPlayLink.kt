@@ -622,6 +622,7 @@ class AirPlayLink(
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
 
     fun close() {
+        timingServer.stop()
         runCatching { socket?.close() }
         socket = null
         activeHost = null
@@ -1079,9 +1080,40 @@ class AirPlayLink(
                 ).also {
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
                     it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
+                    armTunnelFlow(it)
                     iapLink = it
                 }
         }
+
+    /**
+     * 隧道链固件编排布防（flow_start——真车隧道 = 新 iAP2 链，车机 SYN 握手
+     * 完成后整链重跑 1D00→1D01→AA→通知波；sysdiagnose 2026-10-15 21:14:31
+     * 实证）。此前隧道会话未布防——即使握手完成也无 1D00（2026-11-05 定谳
+     * 的结构性缺口）。平台值与 BT 链同源（[resolveBluetoothMac] 缓存优先）。
+     */
+    private fun armTunnelFlow(link: NativeTunnelIap2Link) {
+        val ctx =
+            context ?: run {
+                log("IAPLINK: 无 context——隧道链编排未布防")
+                return
+            }
+        link.startFlow(
+            io.github.shaonialife.cardeck.util.DeviceIdentity
+                .deviceName(ctx)
+                .toByteArray(),
+            io.github.shaonialife.cardeck.bt
+                .resolveBluetoothMac(ctx, log)
+                .toByteArray(),
+            io.github.shaonialife.cardeck.bt
+                .platformLanguage()
+                .toByteArray(),
+            io.github.shaonialife.cardeck.bt
+                .platformTzOffsetMinutes(),
+            io.github.shaonialife.cardeck.bt
+                .platformDstFlag(),
+        )
+        log("IAPLINK: 隧道链编排已布防（flow_start，等车机 SYN）")
+    }
 
     /** 车机 iAPSendMessage 字节入口（SessionController 事件命令处理器调用）。 */
     fun onIapEventBytes(data: ByteArray) {

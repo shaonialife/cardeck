@@ -29,6 +29,7 @@ class TimingServer(
     private val log: (String) -> Unit = {},
 ) {
     private var socket: DatagramSocket? = null
+    private var thread: Thread? = null
 
     @Volatile
     private var running = false
@@ -42,17 +43,25 @@ class TimingServer(
 
     val port: Int get() = socket?.localPort ?: 0
 
+    /** 可重入（[AirPlayLink.setupRound] 每轮调用）：活线程直接复用；线程已死
+     *  （loop 异常退、running 未清的静默死亡）先 [stop] 清残留再重启。 */
+    @Synchronized
     fun start(): Boolean {
-        if (port != 0 && running) return true
+        if (running && thread?.isAlive == true) return true
+        if (running) {
+            log("TIMING: 前次服务线程已死——清理重启")
+            stop()
+        }
         return try {
             val s = DatagramSocket()
             s.reuseAddress = true
             socket = s
             running = true
-            Thread({ loop(s) }, "airplay-timing").apply {
-                isDaemon = true
-                start()
-            }
+            thread =
+                Thread({ loop(s) }, "airplay-timing").apply {
+                    isDaemon = true
+                    start()
+                }
             true
         } catch (error: Exception) {
             log("TIMING: 启动失败 - ${error.message}")
@@ -60,10 +69,12 @@ class TimingServer(
         }
     }
 
+    @Synchronized
     fun stop() {
         running = false
-        socket?.close()
+        runCatching { socket?.close() }
         socket = null
+        thread = null
     }
 
     private fun loop(s: DatagramSocket) {

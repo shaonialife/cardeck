@@ -7,9 +7,12 @@ import io.github.shaonialife.cardeck.protocol.NativeBridge
  * WiFi 隧道 iAP2 链路（原生会话薄层）——替代日志推断的 [VirtualIap2Link]。
  *
  * 协议行为全部在 cardeck-protocol 固件真身内（nativeSessionFeed：链路帧
- * FF 5A 走 ParseBuffer/FSM，车机 SYN → 原生 SYN|ACK；识别/MFi/特性启动波
- * 由编排泵端到端自推进）。Kotlin 侧只剩：字节搬运（事件通道 onCarBytes 进、
- * 事件通道 iAPSendMessage 出）、DETECT marker 应答（传输层探测，6 字节常量）、
+ * FF 5A 走 ParseBuffer/FSM，车机 SYN → 原生 SYN|ACK；编排 [startFlow]
+ * 布防后识别/MFi/特性启动波由编排泵在链路 Connected 时端到端自推进——
+ * 真车 sysdiagnose 2026-10-15 21:14:31 实证：隧道 = 新 iAP2 链，车机 SYN
+ * 后整链重跑 1D00→1D01→AA→通知波，与 BT 链同构）。
+ * Kotlin 侧只剩：字节搬运（事件通道 onCarBytes 进、事件通道 iAPSendMessage 出）、
+ * DETECT marker 应答（传输层探测，6 字节常量）、
  * HID 报文 → 媒体键/旋钮的平台注入（ConsumerKeys/HidNavigation）。
  */
 class NativeTunnelIap2Link(
@@ -34,6 +37,20 @@ class NativeTunnelIap2Link(
     var onNavKey: ((Int) -> Unit)? = null
     var onControlSessionComplete: (() -> Unit)? = null
     val isAlive: Boolean get() = alive()
+
+    /** 启动隧道链固件编排（与 BT 链 [Iap2LinkChannel.startFlow] 同一 JNI 面：
+     *  身份/平台值注入 + flow_start）。隧道 = 新 iAP2 链，真车在车机 SYN
+     *  握手完成后整链重跑（引擎在 Connected 前只布防不出帧）。 */
+    fun startFlow(
+        deviceName: ByteArray,
+        bluetoothMac: ByteArray,
+        language: ByteArray,
+        tzOffsetMinutes: Int,
+        dst: Int,
+    ) {
+        check(handle != 0L) { "flow start on dead tunnel link" }
+        NativeBridge.nativeSessionFlowStart(handle, deviceName, bluetoothMac, language, tzOffsetMinutes, dst)
+    }
 
     init {
         check(NativeBridge.ensureLoaded()) { "cardeck_protocol 未加载" }

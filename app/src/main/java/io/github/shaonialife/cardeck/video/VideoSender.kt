@@ -221,8 +221,13 @@ class VideoSender(
                         codec.dequeueOutputBuffer(bufferInfo, 10_000)
                     } catch (error: Exception) {
                         // 编码器进错误态（如非法尺寸首帧）：必须留痕——静默 break 曾让
-                        // 「零帧推流 4 秒后断开」无从排查（接收端只见 peer EOF）
-                        log("VIDEO: 编码器取帧异常，停止推流 - ${error.message}")
+                        // 「零帧推流 4 秒后断开」无从排查（接收端只见 peer EOF）。
+                        // 但 stop()（断开收摊）的 release 会取消 pending dequeue
+                        // （"Pending dequeue output buffer request cancelled"）——
+                        // running 已 false = 正常拆卸，静默 break（2026-11-05）
+                        if (running.get()) {
+                            log("VIDEO: 编码器取帧异常，停止推流 - ${error.message}")
+                        }
                         break
                     }
                 when {

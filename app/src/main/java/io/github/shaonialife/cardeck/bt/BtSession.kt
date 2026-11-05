@@ -36,19 +36,19 @@ internal fun Iap2LinkChannel.runSenderSession(
 }
 
 /** 本端语言标签（0x4E0A 平台值——Locale.toLanguageTag，如 "zh-CN"）。 */
-private fun platformLanguage(): String =
+internal fun platformLanguage(): String =
     java.util.Locale
         .getDefault()
         .toLanguageTag()
 
 /** 本端时区偏移（分钟，含夏令时偏移——0x4E0B 参数 1 平台值）。 */
-private fun platformTzOffsetMinutes(): Int =
+internal fun platformTzOffsetMinutes(): Int =
     java.util.TimeZone
         .getDefault()
         .getOffset(System.currentTimeMillis()) / 60_000
 
 /** 本端夏令时标志（0x4E0B 参数 2 u8 平台值；1 = 当前生效）。 */
-private fun platformDstFlag(): Int =
+internal fun platformDstFlag(): Int =
     if (java.util.TimeZone
             .getDefault()
             .inDaylightTime(java.util.Date())
@@ -67,7 +67,7 @@ private fun platformDstFlag(): Int =
  * 核对，占位值导致它**静默丢弃**（链路层照常 ACK、CSM 层不再回应）。
  * 2026-10-19 奥迪 0.1.7 日志即此：整轮都是占位值，车机始终没下发 0x4301。
  */
-private fun resolveBluetoothMac(
+internal fun resolveBluetoothMac(
     context: Context,
     log: (String) -> Unit,
 ): String {
