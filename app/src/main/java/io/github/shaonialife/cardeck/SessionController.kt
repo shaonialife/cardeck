@@ -469,7 +469,10 @@ object SessionController {
                     onLinkClosed = ::onSenderLinkClosed,
                     targetProvider = targetProvider,
                 )
-            ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
+            ctrlAdvertiser =
+                CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }.also { adv ->
+                    adv.onCarInvite = { peerIp -> onCarInvite(peerIp) }
+                }
             endpointBrowser =
                 CarPlayServiceBrowser(
                     context,
@@ -1896,6 +1899,35 @@ object SessionController {
             ?.toString(Charsets.UTF_8)
             ?.trimEnd { it.code == 0 }
             ?.takeIf { it.isNotEmpty() }
+
+    /**
+     * 车机 ctrl 邀请到达（CarPlayCtrlAdvertiser.onCarInvite 转交，peerIp =
+     * 邀请源 IP）——真车形态的 AirPlay 启动触发器：MMI 6318 实车不发
+     * 0x4301（2026-11-05 实车日志定谳），邀请源 IP 即车机热点网段地址。
+     * 合成端点走 0x4301 同一交接点（onCarPlayEndpoint：冗余端点闸/
+     * sessionStarting 互斥/凭据合并/绑网直连全在里面复用）；RTSP 端口
+     * 7000 = 固件 AirPlaySender 常量（0x4301 实测同值）。热点凭据用
+     * 0x5703 缓存（真车时序：5703 先于邀请到达）。
+     */
+    private fun onCarInvite(peerIp: String) {
+        if (videoSender?.isRunning == true) {
+            appendLog(">>> [车机 ctrl 邀请] 推流中——忽略（同 0x4301 冗余端点口径）")
+            return
+        }
+        val endpoint =
+            Iap2SenderSession.CarPlayEndpoint(
+                ssid = lastCarWifiSsid ?: "",
+                passphrase = lastWifiPsk ?: "",
+                channel = 0,
+                securityType = 0,
+                airPlayPort = 7000,
+                deviceIdentifier = null,
+                publicKey = null,
+                sourceVersion = null,
+                ipAddresses = listOf(peerIp),
+            )
+        onCarPlayEndpoint(endpoint, "车机 ctrl 邀请")
+    }
 
     /** BT 会话交接点（0x4301 → AirPlay 连接）：绑 WiFi → 配对/SETUP → 推流。
      *  R1 定形（2026-11-03）：端点即 Rust EV_ENDPOINT 透传（port/IP/wifi 域

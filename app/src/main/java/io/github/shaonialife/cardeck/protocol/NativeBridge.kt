@@ -574,6 +574,16 @@ object NativeBridge {
      *  __NTPClockServerProcessPacket @0x1928677bc 直切；纯函数）。
      *  [epochSecsUnix] = 当前 Unix 秒（内部 + NTP 1900 纪元偏移）。
      *  返回 null = 请求非法。 */
+
+    /** ctrl-int 请求分类（fw: __APCarPlayControlServerHandleMessage
+     *  @0x243da8714 路径段校验；纯函数）。"connect" = 会话启动命令（车机
+     *  邀请）；"probe"/"bad"；null = 请求头残缺。 */
+    external fun nativeAirplayCtrlKind(request: ByteArray): String?
+
+    /** ctrl-int 应答构造（fw: HandleMessage 尾响应装配——200 + 回显头 +
+     *  空体 / 404；纯函数）。null = 请求头残缺。 */
+    external fun nativeAirplayCtrlRespond(request: ByteArray): ByteArray?
+
     external fun nativeAirplayTimingRespond(
         packet: ByteArray,
         arrivalNanos: Long,

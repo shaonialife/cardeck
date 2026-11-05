@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.SystemClock
+import io.github.shaonialife.cardeck.protocol.NativeBridge
 import io.github.shaonialife.cardeck.util.Bg
 import io.github.shaonialife.cardeck.util.DeviceIdentity
 import java.io.BufferedInputStream
@@ -26,6 +27,28 @@ class CarPlayCtrlAdvertiser(
     private val context: Context,
     private val log: (String) -> Unit,
 ) {
+    /**
+     * 车机 ctrl 邀请（GET /ctrl-int/1/connect）回调——参数 = 邀请源 IP
+     * （车机热点网段地址）。
+     *
+     * **固件锚（2026-11-05 直切 APTransport 域补课）**：固件手机侧真实运行
+     * ctrl-int 服务器——`_APCarPlayControlServerCreate` @0x243d75528 建
+     * "com.apple.carplaycontrolserver" tcppackage（= 本类 CTRL 监听的固件
+     * 真身）；`__APCarPlayControlServerHandleMessage` @0x243da8714 处理
+     * GET /ctrl-int/1/connect：路径段校验 → 回 AirPlay-Receiver-Device-ID
+     * 头 → connect 命令体经连接槽（+0x58）分发 → 200/400；`___carSession
+     * Browser_handleCarPlayHelperEvent_block_invoke` @0x243d61674 侧手机
+     * 发现车机后也经 `_APCarPlayControlServerInjectCommand` @0x243d75f20
+     * 注入同一 "connect" 命令——**connect = 连接会话的固件启动命令**，
+     * 车机邀请/手机自注入双方向汇入。实车形态差：MMI 3315 邀请后下发
+     * 0x4301（2026-10-19 锚），MMI 6318 只邀请不发 0x4301（2026-11-05
+     * 实车日志：邀请 ×3、0x4301 零命中）——两形态同一命令源，无车型分支。
+     * 宿主落法 = 回调交 SessionController 合成端点走 0x4301 同一交接点
+     * （onCarPlayEndpoint）；RTSP 连接序本体 = fw::airplay::flow（固件
+     * Stage2StartTransaction 锚）。
+     */
+    var onCarInvite: ((peerIp: String) -> Unit)? = null
+
     companion object {
         const val SERVICE_TYPE = "_carplay-ctrl._tcp"
 
@@ -276,35 +299,23 @@ class CarPlayCtrlAdvertiser(
                     .joinToString("; ") { it.trim() }
             log("$TAG: $peer -> [$requestLine] $headers")
 
-            // 车机 ctrl 邀请：这是「车机已发现手机、AirPlay 窗口已开」的权威信号
-            // （catplay CarPlayCtrlSession：收到即把邀请交给连接流程）。
-            if (requestLine.startsWith("GET /ctrl-int/1/connect")) {
-                val receiverId =
-                    head
-                        .lineSequence()
-                        .firstOrNull {
-                            it.substringBefore(':').trim().equals("AirPlay-Receiver-Device-ID", ignoreCase = true)
-                        }?.substringAfter(':')
-                        ?.trim()
+            // 分类 + 应答字节面 100% Rust（fw: __APCarPlayControlServerHandleMessage
+            // @0x243da8714 直切——fw::airplay::ctrl + nativeAirplayCtrl{Kind,Respond}，
+            // TimingServer 同构：Kotlin 只剩 socket 泵）。
+            val kind = NativeBridge.nativeAirplayCtrlKind(head.toByteArray(Charsets.US_ASCII))
+            val response = kind?.let { NativeBridge.nativeAirplayCtrlRespond(head.toByteArray(Charsets.US_ASCII)) }
+            if (kind == "connect") {
+                // 车机 ctrl 邀请 = 会话启动命令（fw: connect 命令域；MMI 6318
+                // 实车形态——邀请 ×3 零 0x4301，2026-11-05 定谳）。
                 inviteCount++
-                log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
+                log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次）——AirPlay 窗口已开启")
+                onCarInvite?.invoke(peer)
             }
-
             val output = client.getOutputStream()
-            val response =
-                when {
-                    requestLine.startsWith("GET /ctrl-int/") -> {
-                        log("$TAG: ✓ 应答 ctrl-int 探测 200 OK")
-                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    }
-
-                    else -> {
-                        log("$TAG: 未识别的请求，按 200 空应答处理（后续实现按需细化）")
-                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    }
-                }
-            output.write(response.toByteArray(Charsets.US_ASCII))
-            output.flush()
+            if (response != null) {
+                output.write(response)
+                output.flush()
+            }
 
             // 对端 Connection: close 会自行断开；等待期间若还有字节（隧道/事件），转储出来
             client.soTimeout = 3_000

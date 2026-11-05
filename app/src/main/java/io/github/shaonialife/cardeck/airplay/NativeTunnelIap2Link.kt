@@ -116,16 +116,16 @@ class NativeTunnelIap2Link(
 
     /**
      * 车机字节入口：事件通道（onIapEventBytes）与隧道读取共用。
-     * marker（FF 55 6B）是传输层探测——薄层直答；其余进原生链。
+     * **全部进原生链**（含 6B FF 55 marker——fw: ParseBuffer FF55 扫描器
+     * 完成码分派 @0x10000d8f0-914：DETECT→0x13→FSM 0x17 SendDetect 全六态
+     * 回显 + 协商域重置；RequestIdentify(…FE)→0x15→FSM 0x19 仅 ATTACHED
+     * SendRST——引擎 endpoint.rs 同径实现）。Kotlin 直答分支已删（A2 直切
+     * 定谳 2026-11-05）：它是引擎固件径的重复第二实现，且缺 SendDetect 的
+     * 协商域重置副作用；出站回显经 bt_write 槽 → routeOutbound → 事件通
+     * 道，feed 同步出站时序不变。
      */
     fun onCarBytes(bytes: ByteArray) {
         if (handle == 0L) return
-        // 半移交/Honda marker：6 字节 FF 55 探测，同毫秒回 DETECT（真 iPhone 行为）
-        if (bytes.size == 6 && bytes[0] == 0xFF.toByte() && bytes[1] == 0x55.toByte()) {
-            sendEventIap(MARKER)
-            log("IAPLINK: 车机 marker——已回 DETECT（事件通道）")
-            return
-        }
         NativeBridge.nativeSessionFeed(handle, bytes)
     }
 
@@ -183,9 +183,5 @@ class NativeTunnelIap2Link(
             NativeBridge.nativeSessionDestroy(handle)
             handle = 0L
         }
-    }
-
-    private companion object {
-        val MARKER = byteArrayOf(0xFF.toByte(), 0x55, 0x02, 0x00, 0xEE.toByte(), 0x10)
     }
 }
