@@ -150,7 +150,8 @@ object TouchRouter {
         //  横屏：dock 左侧竖条（x < dockW），app 在右（x 平移 dockW）
         //  竖屏：dock 底部横条（y > appHeight），app 在上
         //  地图屏（仪表盘/全屏，优先于应用区）：全屏=应用区全部；分屏=dock 右侧 tile 区域。
-        //  地图屏与流 1:1 创建，坐标直接平移；其余走活动应用屏（含超采样倍率换算）。
+        //  地图屏密度=手机侧（px=画布 tile × mapDisplayScale）——命中后按倍率换算屏内
+        //  坐标；其余走应用屏（同倍率语义，见 gridScale/activeAppScale）。
         var inDock: Boolean
         var targetDisplay = -1
         var localX = 0
@@ -193,8 +194,9 @@ object TouchRouter {
             ) {
                 inDock = false
                 targetDisplay = launcher.mapDisplayId
-                localX = px
-                localY = if (launcher.mapFullscreen) py else py - CARD_MARGIN_PX
+                val mapScale = launcher.mapDisplayScale()
+                localX = (px * mapScale).toInt()
+                localY = ((if (launcher.mapFullscreen) py else py - CARD_MARGIN_PX) * mapScale).toInt()
                 routedToMap = true
             }
             if (!routedToMap) {
@@ -214,10 +216,11 @@ object TouchRouter {
                 if (tileX in 0 until tileVisibleW) {
                     inDock = false
                     targetDisplay = launcher.mapDisplayId
-                    // 地图屏按布局动态 resize（分屏=tile 尺寸、全屏=应用区尺寸），
-                    // 屏内容即坐标域：相对应用区左缘的偏移就是屏内坐标，直接平移
-                    localX = tileX
-                    localY = py
+                    // 地图屏按布局动态 resize（分屏=tile×倍率、全屏=应用区×倍率，密度=
+                    // 手机侧）：屏内坐标 = 相对 tile 原点的画布偏移 × mapDisplayScale
+                    val mapScale = launcher.mapDisplayScale()
+                    localX = ((if (launcher.mapFullscreen) tileX else tileX - CARD_MARGIN_PX) * mapScale).toInt()
+                    localY = ((if (launcher.mapFullscreen) py else py - CARD_MARGIN_PX) * mapScale).toInt()
                     routedToMap = true
                 }
             }

@@ -23,7 +23,6 @@ object SettingsMenus {
     val ALL =
         listOf(
             Item(DESKTOP, "管理桌面应用", "勾选的应用显示在车机桌面", R.drawable.ic_menu_grid),
-            Item(SUPERSAMPLE, "应用超采样", "竖屏应用渲染更精细，可三态调节", R.drawable.ic_menu_zoom),
             Item(ORIENTATION, "应用横屏", "竖屏应用在车机横屏全屏显示", R.drawable.ic_screen_rotation),
             Item(DOCK, "dock 栏设置", "壁纸暗幕透明度与模糊程度", R.drawable.ic_menu_dock),
             Item(DEFAULT_MAP, "默认地图", "仪表盘地图屏使用的地图应用", R.drawable.ic_menu_map),
@@ -37,7 +36,6 @@ object SettingsMenus {
     fun createFragment(id: Int): Fragment =
         when (id) {
             DESKTOP -> DesktopPanelFragment()
-            SUPERSAMPLE -> SupersamplePanelFragment()
             ORIENTATION -> OrientationPanelFragment()
             DOCK -> DockPanelFragment()
             DISPLAY -> DisplayPanelFragment()

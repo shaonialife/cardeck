@@ -57,14 +57,78 @@ object VirtualLauncher {
     private const val LETTERBOX_TARGET_DP = 410f
 
     /**
-     * 横屏应用屏超采样倍率（固定像素占位缩小的唯一杠杆，见 attach 注释）。
-     * 2.0 时像素开销 4x（用户实测明显变卡）；1.5 时 2.25x，顶部固定区占比
-     * 12%（原始 18%）——画质/流畅的折中点（2026-10-11 用户反馈调参）。
+     * 应用屏/地图屏 px 上限（GL 纹理安全）：密度一致性优先，仅极端机型（超高手机
+     * 密度 × 大画布）才会触顶让密度略降。
      */
-    private const val APP_SUPERSAMPLE = 1.5f
+    const val MAX_DISPLAY_PX = 4096
 
-    /** 超采样后的应用屏高度上限（px；控制 GPU/内存开销）。 */
-    private const val SUPERSAMPLE_MAX_HEIGHT = 1620
+    /** 虚拟屏几何（px + 密度 + 实际 dp 窗口）。 */
+    data class DisplayGeometry(
+        val widthPx: Int,
+        val heightPx: Int,
+        val densityDpi: Int,
+        val dpWidth: Float,
+        val dpHeight: Float,
+    )
+
+    /**
+     * 应用屏几何（2026-11-06 字号漂移修复）：**密度 = 手机侧密度**——应用在手机与
+     * 车机两侧看到相同密度配置，跨屏打开不再触发按密度重排（字号变大/变小）。
+     * px = dp 窗口 × 手机密度/160，合成器 GL 缩小回画布应用区（天然高倍率超采样，
+     * 取代原 appHi 超采样屏）。dp 窗口：横屏高 = letterbox 目标 410×1.05（现状），
+     * 竖屏宽 = 410；其余维度按画布应用区纵横比。px 最长边超 [MAX_DISPLAY_PX] 时
+     * 等比回缩（极端机型让密度略降保可用）。
+     */
+    fun appDisplayGeometry(
+        appAreaW: Int,
+        appAreaH: Int,
+        dockAtBottom: Boolean,
+        phoneDensityDpi: Int,
+    ): DisplayGeometry {
+        val landscape = appAreaW > appAreaH && !dockAtBottom
+        val wF: Float
+        val hF: Float
+        if (landscape) {
+            hF = LETTERBOX_TARGET_DP * LETTERBOX_ASPECT_RATIO * phoneDensityDpi / 160f
+            wF = hF * appAreaW / appAreaH.toFloat()
+        } else {
+            wF = LETTERBOX_TARGET_DP * phoneDensityDpi / 160f
+            hF = wF * appAreaH / appAreaW.toFloat()
+        }
+        val scale = minOf(1f, MAX_DISPLAY_PX.toFloat() / maxOf(wF, hF))
+        val w = Math.round(wF * scale)
+        val h = Math.round(hF * scale)
+        return DisplayGeometry(
+            w,
+            h,
+            phoneDensityDpi,
+            w * 160f / phoneDensityDpi,
+            h * 160f / phoneDensityDpi,
+        )
+    }
+
+    /**
+     * 地图屏几何：dp = 旧地图屏（应用区 @ [MAP_DISPLAY_DPI]）不变（高德车机布局
+     * 不变），px 按手机密度同比例放大——地图标注/字号与手机侧一致。
+     */
+    fun mapDisplayGeometry(
+        appAreaW: Int,
+        appAreaH: Int,
+        phoneDensityDpi: Int,
+    ): DisplayGeometry {
+        val wF = appAreaW * (phoneDensityDpi / MAP_DISPLAY_DPI.toFloat())
+        val hF = appAreaH * (phoneDensityDpi / MAP_DISPLAY_DPI.toFloat())
+        val scale = minOf(1f, MAX_DISPLAY_PX.toFloat() / maxOf(wF, hF))
+        val w = Math.round(wF * scale)
+        val h = Math.round(hF * scale)
+        return DisplayGeometry(
+            w,
+            h,
+            phoneDensityDpi,
+            w * 160f / phoneDensityDpi,
+            h * 160f / phoneDensityDpi,
+        )
+    }
 
     // ---- 仪表盘分屏（拖拽把手）----
     // 比例 = tile 主轴长占「可用长度」（应用区主轴 − 两端边距 − 把手宽）的比例。
@@ -209,19 +273,20 @@ object VirtualLauncher {
         private set
 
     /**
-     * 应用屏超采样倍率（超采样应用屏的渲染倍率；1=未创建超采样屏）。
-     * 触摸坐标按当前**活动应用屏**的倍率换算（见 [activeAppScale]）。
+     * 应用屏相对画布应用区的渲染倍率（= 应用屏 px / 画布应用区 px；密度统一为手机
+     * 侧后 = 手机密度/160 × …，典型 ~2.3）。触摸坐标按此倍率换算（[activeAppScale]），
+     * GridActivity 把手布局同源（[gridScale]）。
      */
     @Volatile
-    var hiScale: Float = 1f
+    var appDisplayScale: Float = 1f
         private set
 
-    /** 超采样应用屏（横屏车机时存在；竖屏车机为 -1，全部走原生）。 */
+    /** 旧超采样屏 displayId：2026-11-06 密度统一后单应用屏替代，恒 -1（保留既有分支）。 */
     @Volatile
     var appHiDisplayId: Int = -1
         private set
 
-    /** 主区桌面（GridActivity）所在屏：横屏=超采样屏（保持既有观感），竖屏=原生屏。 */
+    /** 主区桌面（GridActivity）所在屏：单应用屏架构下恒 = 应用屏。 */
     @Volatile
     var gridDisplayId: Int = -1
         private set
@@ -307,15 +372,12 @@ object VirtualLauncher {
     @Volatile
     private var appDisplayH = 0
 
-    /** 超采样应用屏逻辑尺寸（同上）。 */
-    @Volatile
-    private var appHiDisplayW = 0
-
-    @Volatile
-    private var appHiDisplayH = 0
-
-    /** 地图屏密度（创建时固定 200dpi，resize 不变——逻辑尺寸随像素缩放）。 */
+    /** 旧地图屏密度（200）：地图 dp 窗口的基准值；实际密度 = 手机侧（2026-11-06）。 */
     private const val MAP_DISPLAY_DPI = 200
+
+    /** 地图屏密度（= 手机侧，attach 时赋值；resize 恒定——dp 窗口随像素缩放）。 */
+    @Volatile
+    private var mapDisplayDensity = MAP_DISPLAY_DPI
 
     /** 仪表盘（分屏）模式是否激活。 */
     @Volatile
@@ -376,10 +438,16 @@ object VirtualLauncher {
     fun defaultMapComponent(context: Context): ComponentName? = DefaultMapPrefs.resolve(context)
 
     /**
-     * 桌面所在屏相对视频流的渲染倍率（原生屏=1，超采样屏=hiScale）。
+     * 桌面所在屏（=应用屏）相对画布应用区的渲染倍率（[appDisplayScale]）。
      * 桌面内绘制「全流画布壁纸切片」时的尺寸/偏移换算用。
      */
-    fun gridScale(): Float = if (gridDisplayId >= 0 && gridDisplayId == appHiDisplayId) hiScale else 1f
+    fun gridScale(): Float = appDisplayScale
+
+    /**
+     * 地图屏相对画布 tile 的缩放（显示 px/画布 px；密度=手机侧，典型 ~2.8）。
+     * 触摸坐标换算用：地图触摸命中画布 tile 后乘此倍率得到屏内坐标。
+     */
+    fun mapDisplayScale(): Float = mapDisplayDensity / MAP_DISPLAY_DPI.toFloat()
 
     private var dockDisplay: VirtualDisplay? = null
     private var appDisplay: VirtualDisplay? = null
@@ -392,8 +460,8 @@ object VirtualLauncher {
     /** 当前活动应用屏 ID（TouchRouter 注入目标）。 */
     fun activeAppDisplayId(): Int = if (composer?.isActiveAppHi() == true && appHiDisplayId >= 0) appHiDisplayId else appDisplayId
 
-    /** 当前活动应用屏的坐标倍率（超采样屏=hiScale，原生屏=1）。 */
-    fun activeAppScale(): Float = if (composer?.isActiveAppHi() == true && appHiDisplayId >= 0) hiScale else 1f
+    /** 当前活动应用屏的坐标倍率（单应用屏架构下恒 = [appDisplayScale]）。 */
+    fun activeAppScale(): Float = appDisplayScale
 
     /** 应用区在输出画面中的矩形（顶部原点）——叠加卡片定位用。 */
     fun appAreaRect(): RectF? {
@@ -412,7 +480,6 @@ object VirtualLauncher {
     fun hintDisplaySize(displayId: Int): Pair<Int, Int>? =
         when (displayId) {
             appDisplayId -> if (appDisplayW > 0) appDisplayW to appDisplayH else null
-            appHiDisplayId -> if (appHiDisplayW > 0) appHiDisplayW to appHiDisplayH else null
             mapDisplayId -> if (mapDisplayW > 0) mapDisplayW to mapDisplayH else null
             else -> null
         }
@@ -482,15 +549,19 @@ object VirtualLauncher {
         }
         appAreaWidth = appWidth
         appAreaHeight = appHeightPx
-        // 竖屏应用屏密度：窗口逻辑宽度目标 ≈ 手机竖屏宽度（LETTERBOX_TARGET_DP）。
-        // 错用 dock 的 densityDpi（随画布分辨率等比、非手机密度）会把窗口压到 ~206dp——文字观感大一倍
-        // （2026-10-14 竖屏实测：应用与桌面字号明显偏大的根因）。
-        val appPortraitDensity =
-            (appWidth / LETTERBOX_TARGET_DP * 160f).toInt().coerceIn(160, 640)
-        // 地图屏：按应用区全尺寸创建，分屏/全屏间动态 resize（见 resizeMapDisplay）。
-        // tile 尺寸 = SPLIT 绘制矩形，边距统一用契约值 CARD_MARGIN_PX（勿再裸写数字）。
-        // 分屏比例由用户拖动把手调整（持久化偏好）；几何推导集中在 [dashSplitGeom]
-        // 纯函数（单测钉死四方一致性）。tile 主轴长（横=宽、竖=高）=比例×可用长度。
+        // 应用屏/地图屏密度 = **手机侧密度**（2026-11-06 字号漂移修复）：应用在手机
+        // 与车机两侧看到相同密度配置，跨屏打开不再触发按密度重排（字号变大/变小）。
+        // px = dp 窗口 × 手机密度/160，合成器 GL 缩小回画布应用区（天然高倍率超采样，
+        // 取代原 appHi 超采样屏——手机密度本就高于旧超采样倍率）。
+        val phoneDensityDpi = context.resources.displayMetrics.densityDpi
+        val appGeom = appDisplayGeometry(appWidth, appHeightPx, dockAtBottom, phoneDensityDpi)
+        val mapGeom = mapDisplayGeometry(appWidth, appHeightPx, phoneDensityDpi)
+        mapDisplayDensity = mapGeom.densityDpi
+        appDisplayScale = appGeom.widthPx / appWidth.toFloat()
+        // 地图屏：按应用区全尺寸创建（此处为画布域的 resize 基线），分屏/全屏间动态
+        // resize（见 resizeMapDisplay）。tile 尺寸 = SPLIT 绘制矩形，边距统一用契约值
+        // CARD_MARGIN_PX（勿再裸写数字）。分屏比例由用户拖动把手调整（持久化偏好）；
+        // 几何推导集中在 [dashSplitGeom] 纯函数（单测钉死四方一致性）。
         dashSplitFraction =
             context
                 .getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -508,42 +579,6 @@ object VirtualLauncher {
             // 横屏应用区从 dock 右缘起（竖屏 x 原点即流原点，无偏移）
             dashSplitPos = geom.splitCenter + dockWidthPx
         }
-        // 横屏应用屏的密度选择（2026-10-11 实测标定）：
-        // 竖屏锁定应用（如头条）在横屏屏上被系统 letterbox 成窄条窗口，窗口逻辑宽度
-        // = 屏高px/letterbox宽高比，再由屏幕密度换算 dp。密度偏高 → 窗口只有 ~343dp，
-        // 应用呈现「大字大搜索框」的窄屏布局；密度 ~200 → 窗口 ~411dp ≈ 手机宽度，
-        // 应用呈现紧凑手机布局（截图验证）。目标：letterbox 窗口 ≈ LETTERBOX_TARGET_DP。
-        val landscapeApp = appWidth > appHeightPx && !dockAtBottom
-        // 超采样：部分应用（头条实测）按「手机状态栏物理像素」预留顶部区域
-        // （28dp@560dpi=98px 原始像素，与显示密度无关），在 540px 高的流里占 18%、
-        // 手机上仅 3.5%——无法去除（应用内部绘制），只能靠「渲染更多像素再缩回」
-        // 把固定像素的占比压小。×2：98px→49px（9%）；超采样高度上限 1620px。
-        val appScaleFactor =
-            if (landscapeApp) {
-                minOf(APP_SUPERSAMPLE, SUPERSAMPLE_MAX_HEIGHT.toFloat() / appHeightPx)
-            } else {
-                1f
-            }
-        val appHiWidth = (appWidth * appScaleFactor).toInt()
-        val appHiHeight = (appHeightPx * appScaleFactor).toInt()
-        this.hiScale = appScaleFactor
-        val appHiDensity =
-            if (landscapeApp) {
-                val letterboxWindowPx = appHiHeight / LETTERBOX_ASPECT_RATIO
-                (letterboxWindowPx / LETTERBOX_TARGET_DP * 160f).toInt().coerceIn(180, 640)
-            } else {
-                appPortraitDensity
-            }
-        // 原生应用屏密度：与超采样屏保持**相同逻辑尺寸**（应用布局不受所在屏影响，
-        // 超采样只是渲染分辨率差异）。横屏：原生 1034×540 @~200dpi = 827×432dp，
-        // 与超采样屏（1551×810 @301dpi）的 824×431dp 等值；竖屏车机：直接用流密度。
-        val appNativeDensity =
-            if (landscapeApp) {
-                val hiLogicalHeightDp = appHiHeight * 160f / appHiDensity
-                (appHeightPx * 160f / hiLogicalHeightDp).toInt().coerceIn(160, 640)
-            } else {
-                appPortraitDensity
-            }
 
         // 等待 Shizuku UserService 绑定（受信虚拟屏需要 shell 权限创建）
         var svc = CarInputClient.service
@@ -605,34 +640,20 @@ object VirtualLauncher {
                     val appId =
                         svc!!.createDisplay(
                             "CarPlayApp",
-                            appWidth,
-                            appHeightPx,
-                            appNativeDensity,
+                            appGeom.widthPx,
+                            appGeom.heightPx,
+                            appGeom.densityDpi,
                             appSurface,
                             true,
                         )
-                    // 超采样屏（竖屏车机无、应用侧回退时也无）
-                    val appHiId =
-                        if (appHiSurface != null) {
-                            svc!!.createDisplay(
-                                "CarPlayAppHi",
-                                appHiWidth,
-                                appHiHeight,
-                                appHiDensity,
-                                appHiSurface,
-                                true,
-                            )
-                        } else {
-                            -1
-                        }
-                    // 地图屏（横竖屏都创建；按应用区全尺寸创建，分屏/全屏间动态 resize）
+                    // 地图屏（横竖屏都创建；高分辨率 = 旧 dp 窗口 × 手机密度，分屏/全屏间动态 resize）
                     val mapId =
                         if (mapSurface != null) {
                             svc!!.createDisplay(
                                 "CarPlayMap",
-                                appWidth,
-                                appHeightPx,
-                                200,
+                                mapGeom.widthPx,
+                                mapGeom.heightPx,
+                                mapGeom.densityDpi,
                                 mapSurface,
                                 true,
                             )
@@ -642,20 +663,13 @@ object VirtualLauncher {
                     if (dockId >= 0 && appId >= 0) {
                         dockDisplayId = dockId
                         appDisplayId = appId
-                        appDisplayW = appWidth
-                        appDisplayH = appHeightPx
-                        if (appHiId >= 0) {
-                            appHiDisplayId = appHiId
-                            appHiDisplayW = appHiWidth
-                            appHiDisplayH = appHiHeight
-                        } else if (appHiSurface != null) {
-                            log("LAUNCHER: 超采样屏创建失败——本次会话全部走原生屏")
-                        }
+                        appDisplayW = appGeom.widthPx
+                        appDisplayH = appGeom.heightPx
                         if (mapId >= 0) {
                             mapDisplayId = mapId
-                            // 创建尺寸=应用区全尺寸（resizeMapDisplay 的幂等基线）
-                            mapDisplayW = appWidth
-                            mapDisplayH = appHeightPx
+                            // 创建尺寸=resizeMapDisplay 的幂等基线（显示 px 域）
+                            mapDisplayW = mapGeom.widthPx
+                            mapDisplayH = mapGeom.heightPx
                         } else if (mapSurface != null) {
                             log("LAUNCHER: 地图屏创建失败——仪表盘无地图 tile")
                         }
@@ -674,7 +688,6 @@ object VirtualLauncher {
                         // 半成功：释放已建的
                         if (dockId >= 0) runCatching { svc!!.releaseDisplay(dockId) }
                         if (appId >= 0) runCatching { svc!!.releaseDisplay(appId) }
-                        if (appHiId >= 0) runCatching { svc!!.releaseDisplay(appHiId) }
                         if (mapId >= 0) runCatching { svc!!.releaseDisplay(mapId) }
                         // 本次整体回退应用侧屏：VDM 会话不留到下轮（下轮 attach 会重设）
                         runCatching { svc!!.closeVirtualDevice() }
@@ -685,8 +698,9 @@ object VirtualLauncher {
                 displaysViaService = true
                 log(
                     "LAUNCHER: 三屏创建(受信) dock=$dockDisplayId(${dockWidthPx}px) " +
-                        "app=$appDisplayId(${appWidth}x$appHeightPx @${appNativeDensity}dpi) " +
-                        "appHi=$appHiDisplayId(${appHiWidth}x$appHiHeight @${appHiDensity}dpi scale=x$appScaleFactor)",
+                        "app=$appDisplayId(${appGeom.widthPx}x${appGeom.heightPx} @${appGeom.densityDpi}dpi " +
+                        "dp=${appGeom.dpWidth.toInt()}x${appGeom.dpHeight.toInt()} scale=x$appDisplayScale) " +
+                        "map=$mapDisplayId(${mapGeom.widthPx}x${mapGeom.heightPx} @${mapGeom.densityDpi}dpi)",
                 )
                 // 会话建立：为「强制应用横屏」名单写入兼容覆盖——**已提前到 attach 开头**
                 // （先写覆盖再拉应用，见 attach 开头注释；此处不再重复入队）。
@@ -717,32 +731,15 @@ object VirtualLauncher {
                 appDisplay =
                     dm.createVirtualDisplay(
                         "CarPlayApp",
-                        appWidth,
-                        appHeightPx,
-                        appNativeDensity,
+                        appGeom.widthPx,
+                        appGeom.heightPx,
+                        appGeom.densityDpi,
                         appSurface,
                         DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                             DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
                         null,
                         null,
                     )
-                if (appHiSurface != null) {
-                    appHiDisplay =
-                        dm.createVirtualDisplay(
-                            "CarPlayAppHi",
-                            appHiWidth,
-                            appHiHeight,
-                            appHiDensity,
-                            appHiSurface,
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
-                            null,
-                            null,
-                        )
-                    appHiDisplayId = appHiDisplay?.display?.displayId ?: -1
-                    appHiDisplayW = appHiWidth
-                    appHiDisplayH = appHiHeight
-                }
                 // 地图屏同样建（应用侧 PUBLIC）：地图启动走 shell `am start --display`，
                 // 不需要受信；resize 用应用侧公开 API（见 resizeMapDisplay）。
                 // 回退形态曾完全不建地图屏——受信创建在 EMUI12 上静默失败后，仪表盘
@@ -751,9 +748,9 @@ object VirtualLauncher {
                     mapDisplay =
                         dm.createVirtualDisplay(
                             "CarPlayMap",
-                            appWidth,
-                            appHeightPx,
-                            MAP_DISPLAY_DPI,
+                            mapGeom.widthPx,
+                            mapGeom.heightPx,
+                            mapGeom.densityDpi,
                             mapSurface,
                             DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
@@ -763,35 +760,38 @@ object VirtualLauncher {
                     val fallbackMapId = mapDisplay?.display?.displayId ?: -1
                     if (fallbackMapId >= 0) {
                         mapDisplayId = fallbackMapId
-                        mapDisplayW = appWidth
-                        mapDisplayH = appHeightPx
+                        mapDisplayW = mapGeom.widthPx
+                        mapDisplayH = mapGeom.heightPx
                     } else {
                         log("LAUNCHER: 地图屏（回退）创建失败——仪表盘无地图 tile")
                     }
                 }
                 dockDisplayId = dockDisplay?.display?.displayId ?: -1
                 appDisplayId = appDisplay?.display?.displayId ?: -1
-                appDisplayW = appWidth
-                appDisplayH = appHeightPx
+                appDisplayW = appGeom.widthPx
+                appDisplayH = appGeom.heightPx
                 log(
                     "LAUNCHER: 三屏创建(回退) dock=$dockDisplayId(${dockWidthPx}px) " +
-                        "app=$appDisplayId(${appWidth}x$appHeightPx @${appNativeDensity}dpi) " +
-                        "appHi=$appHiDisplayId(${appHiWidth}x$appHiHeight @${appHiDensity}dpi scale=x$appScaleFactor) " +
-                        "map=$mapDisplayId(${mapDisplayW}x$mapDisplayH)——受信屏不可用，已回退应用侧 PUBLIC 屏",
+                        "app=$appDisplayId(${appGeom.widthPx}x${appGeom.heightPx} @${appGeom.densityDpi}dpi " +
+                        "dp=${appGeom.dpWidth.toInt()}x${appGeom.dpHeight.toInt()} scale=x$appDisplayScale) " +
+                        "map=$mapDisplayId(${mapDisplayW}x$mapDisplayH @${mapGeom.densityDpi}dpi)——受信屏不可用，已回退应用侧 PUBLIC 屏",
                 )
             }
             displaysCreated[0] = dockDisplayId >= 0 && appDisplayId >= 0
         }
         return try {
+            // 输入 buffer 尺寸 = **虚拟屏实际分辨率**（display 域）：SF 把屏内容 1:1
+            // 画进 buffer，buffer 小于屏会裁剪成左上角（「图标巨大」症状）；GL 把整幅
+            // 纹理缩放进画布 pane 矩形（输出坐标域），缩小在此发生。
             composer.start(
                 dockWidthPx,
                 dockHeightPx,
-                appWidth,
-                appHeightPx,
-                if (landscapeApp) appHiWidth else 0,
-                if (landscapeApp) appHiHeight else 0,
-                appWidth,
-                appHeightPx,
+                appGeom.widthPx,
+                appGeom.heightPx,
+                0,
+                0,
+                mapGeom.widthPx,
+                mapGeom.heightPx,
             )
             // 分屏把手位置推给合成器（覆盖默认中线公式；拖动时 previewDashSplit 持续更新）
             composer.setTileEdgeOverride(dashSplitPos - DASH_GAP_PX / 2f)
@@ -811,7 +811,7 @@ object VirtualLauncher {
             Shell.exec("cmd window set-letterbox-style --aspectRatio $LETTERBOX_ASPECT_RATIO")
             log(
                 "LAUNCHER: letterbox 宽高比=$LETTERBOX_ASPECT_RATIO " +
-                    "appDensity=${appNativeDensity}dpi appHiDensity=${appHiDensity}dpi",
+                    "appDensity=${appGeom.densityDpi}dpi（=手机侧） mapDensity=${mapGeom.densityDpi}dpi",
             )
             // 自启组件必须写成「applicationId/绝对类名」：`am -n` 只认带斜杠的规范，
             // 且相对类名按 applicationId 展开——.rd 调试包（applicationId 后缀）下
@@ -908,8 +908,6 @@ object VirtualLauncher {
         mapDisplayH = 0
         appDisplayW = 0
         appDisplayH = 0
-        appHiDisplayW = 0
-        appHiDisplayH = 0
         appAreaWidth = 0
         appAreaHeight = 0
         mapFullscreen = false
@@ -923,7 +921,7 @@ object VirtualLauncher {
         dockHeightPx = 0
         appHeightPx = 0
         dockAtBottom = false
-        hiScale = 1f
+        appDisplayScale = 1f
         streamWidthPx = 0
         streamHeightPx = 0
     }
@@ -1170,20 +1168,22 @@ object VirtualLauncher {
     private fun resizeMapDisplay(fullscreen: Boolean) {
         val id = mapDisplayId
         if (id < 0) return
-        val w = if (fullscreen) appAreaWidth else mapTileWidth
-        val h = if (fullscreen) appAreaHeight else mapTileHeight
+        // resize 目标 = 画布域 tile/应用区尺寸 × 地图屏缩放（显示 px 域；密度=手机侧）
+        val mapScale = mapDisplayDensity / MAP_DISPLAY_DPI.toFloat()
+        val w = ((if (fullscreen) appAreaWidth else mapTileWidth) * mapScale).toInt()
+        val h = ((if (fullscreen) appAreaHeight else mapTileHeight) * mapScale).toInt()
         if (w <= 0 || h <= 0 || (w == mapDisplayW && h == mapDisplayH)) return
         runCatching {
             val applied =
                 if (displaysViaService) {
                     // 受信形态：shell 侧 resize
                     val svc = CarInputClient.service ?: return@runCatching
-                    svc.resizeDisplay(id, w, h, MAP_DISPLAY_DPI)
+                    svc.resizeDisplay(id, w, h, mapDisplayDensity)
                 } else {
                     // 回退形态：屏由本应用创建，直接用应用侧公开 API——shell 对
                     // 他人创建的 display 没有 resize 权限（token 属主校验）
                     val display = mapDisplay ?: return@runCatching
-                    display.resize(w, h, MAP_DISPLAY_DPI)
+                    display.resize(w, h, mapDisplayDensity)
                     true
                 }
             if (applied) {
@@ -1193,7 +1193,7 @@ object VirtualLauncher {
                 // （tile 内容偏左、宽度只剩比例值、右侧全黑）
                 composer?.resizeMapInput(w, h)
                 logSink?.invoke(
-                    "LAUNCHER: 地图屏 resize → ${w}x$h@${MAP_DISPLAY_DPI}dpi（${if (fullscreen) "全屏" else "分屏"}）",
+                    "LAUNCHER: 地图屏 resize → ${w}x$h@${mapDisplayDensity}dpi（${if (fullscreen) "全屏" else "分屏"}）",
                 )
             }
         }
@@ -1322,17 +1322,13 @@ object VirtualLauncher {
     }
 
     /**
-     * 启动/切换应用。
-     * 目标屏按每应用超采样偏好路由（SupersamplePrefs）：
-     *  - 超采样开启（或自动判定为竖屏应用）→ 超采样屏（1551×810 缩回，固定像素顶带占比小）
-     *  - 超采样关闭（横屏/地图类）→ 原生屏（1:1 渲染，更清晰、GPU 开销 1/2.25）
+     * 启动/切换应用（单应用屏架构：全部落应用屏，密度=手机侧，无超采样路由）。
      *
      * 本 ROM（MagicOS）实测行为：`am start --display X` 对已有任务只做"带到前台"，
      * 不落到 X 屏；`am task move` 静默无效；`am task remove` 不存在，清任务用
      * `am stack remove <taskId>`（本版本 RootTask id == taskId）。可靠做法：
-     *  1) 目标屏已有该包任务 → 普通启动带回前台（复用，保留任务栈）
-     *  2) 目标屏没有 → 先清掉该包在**另一个应用屏**上的任务（偏好切换后避免双实例），
-     *     再 `-f 0x18000000`（NEW_TASK|MULTIPLE_TASK）在目标屏新建实例
+     *  目标屏已有该包任务 → 普通启动带回前台（复用，保留任务栈）；否则
+     *  `-f 0x18000000`（NEW_TASK|MULTIPLE_TASK）在目标屏新建实例
      *
      * 已知局限（2026-10-10 实测）：应用在手机侧也有实例时，进程基准密度停留在
      * 手机屏（560dpi），车机屏渲染文字偏大（≈2.2 倍）。唯一根治是强制重启该进程，
@@ -1349,25 +1345,11 @@ object VirtualLauncher {
         if (isMapPackage(component.packageName) && mapDisplayId >= 0) {
             return launchMapOnMapDisplay(component)
         }
-        val ctx = appContextRef
-        val wantHi =
-            ctx != null &&
-                appHiDisplayId >= 0 &&
-                SupersamplePrefs.shouldSupersample(ctx, component)
-        val targetDisplay = if (wantHi) appHiDisplayId else appDisplayId
-        // 任务查询共用一次 dumpsys 快照（此前 onTarget + 清理两块屏最多连跑 3 遍 4s 超时命令）
+        val targetDisplay = appDisplayId
+        // 目标屏已有该包任务 → 普通启动带回前台（复用，保留任务栈）；任务查询共用
+        // 一次 dumpsys 快照（单应用屏：无「另一块应用屏」需要清理）
         val tasks = taskIdsByDisplayPkg()
         val onTarget = tasksOf(tasks, component.packageName, targetDisplay).isNotEmpty()
-        if (!onTarget) {
-            // 偏好切换后清理另一块应用屏上的旧任务（不同屏双实例会各自维护状态，易混淆）
-            val otherDisplay = if (targetDisplay == appHiDisplayId) appDisplayId else appHiDisplayId
-            if (otherDisplay >= 0) {
-                tasksOf(tasks, component.packageName, otherDisplay).forEach { taskId ->
-                    Shell.exec("am stack remove $taskId", timeoutMs = 4000)
-                    Log.i(TAG, "清理旧屏任务 pkg=${component.packageName} task=$taskId display=$otherDisplay")
-                }
-            }
-        }
         var ok: Boolean
         val result: Shell.Result
         if (isMapPackage(component.packageName)) {
@@ -1397,8 +1379,7 @@ object VirtualLauncher {
             }
         }
         logSink?.invoke(
-            "LAUNCH(${component.packageName}): hi=$wantHi disp=$targetDisplay onTarget=$onTarget ok=$ok " +
-                "out=${result.output.take(80)}",
+            "LAUNCH(${component.packageName}): disp=$targetDisplay ok=$ok out=${result.output.take(80)}",
         )
         if (ok) {
             synchronized(runningApps) { runningApps.add(component) }
@@ -1412,8 +1393,7 @@ object VirtualLauncher {
                 composer?.setTileLayout(DualDisplayComposer.TileLayout.HIDDEN)
                 logSink?.invoke("LAUNCHER: 退出仪表盘（普通应用已打开）")
             }
-            // 合成器切到目标屏（超采样屏等其出帧再切；原生屏即时切换）
-            composer?.requestActiveApp(targetDisplay == appHiDisplayId)
+            // 单应用屏：合成器恒显示应用输入，无需切换
             // 应用已在运行、被系统按旧配置带回前台的情况：启动后探测一次是否仍
             // letterbox（提示卡只对「应用横屏」名单内的应用生效，其它应用不计）
             val ctx = appContextRef

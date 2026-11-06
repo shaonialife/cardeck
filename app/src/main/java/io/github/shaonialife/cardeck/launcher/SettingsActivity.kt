@@ -15,7 +15,6 @@ import io.github.shaonialife.cardeck.launcher.settings.MiscPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.OrientationPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.SettingsMenus
 import io.github.shaonialife.cardeck.launcher.settings.SettingsToastHost
-import io.github.shaonialife.cardeck.launcher.settings.SupersamplePanelFragment
 
 /**
  * 车机设置（双栏宿主：左菜单 / 右内容 Fragment 容器）。
@@ -54,7 +53,6 @@ class SettingsActivity :
         val ids =
             intArrayOf(
                 R.id.menuDesktopApps,
-                R.id.menuSupersample,
                 R.id.menuOrientation,
                 R.id.menuDock,
                 R.id.menuDefaultMap,
@@ -88,7 +86,6 @@ class SettingsActivity :
         val index =
             when (restored) {
                 is DesktopPanelFragment -> SettingsMenus.DESKTOP
-                is SupersamplePanelFragment -> SettingsMenus.SUPERSAMPLE
                 is OrientationPanelFragment -> SettingsMenus.ORIENTATION
                 is DockPanelFragment -> SettingsMenus.DOCK
                 is DefaultMapPanelFragment -> SettingsMenus.DEFAULT_MAP

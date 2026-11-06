@@ -15,7 +15,6 @@ import io.github.shaonialife.cardeck.launcher.AppIcons
 import io.github.shaonialife.cardeck.launcher.DefaultMapPrefs
 import io.github.shaonialife.cardeck.launcher.DesktopApps
 import io.github.shaonialife.cardeck.launcher.DockPrefs
-import io.github.shaonialife.cardeck.launcher.SupersamplePrefs
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppRowsAdapter.AppHolder
 import io.github.shaonialife.cardeck.ui.DarkMessageDialog
@@ -87,65 +86,6 @@ class DesktopPanelFragment : SettingsPanelFragment() {
                 check.setImageResource(
                     if (nowChecked) R.drawable.bg_checkbox_on else R.drawable.bg_checkbox_off,
                 )
-            }
-        }
-    }
-}
-
-class SupersamplePanelFragment : SettingsPanelFragment() {
-    override fun onCreateView(
-        inflater: LayoutInflater,
-        container: ViewGroup?,
-        savedInstanceState: Bundle?,
-    ): View = inflater.inflate(R.layout.fragment_panel_supersample, container, false)
-
-    override fun onViewCreated(view: View) {
-        setupAppList(view, R.id.ssList, R.id.ssListIndex, SupersampleAdapter())
-    }
-
-    private inner class SupersampleAdapter : AppRowsAdapter(this@SupersamplePanelFragment, R.layout.item_app_ss, { apps }) {
-        override fun onCreateAppHolder(row: View): AppHolder = SsHolder(row)
-    }
-
-    private inner class SsHolder(
-        private val row: View,
-    ) : AppHolder(row) {
-        private val icon: ImageView = row.findViewById(R.id.ssIcon)
-        private val name: TextView = row.findViewById(R.id.ssName)
-        private val segAuto: TextView = row.findViewById(R.id.ssAuto)
-        private val segOn: TextView = row.findViewById(R.id.ssOn)
-        private val segOff: TextView = row.findViewById(R.id.ssOff)
-
-        override fun bind(entry: VirtualLauncher.AppEntry) {
-            val iconPx = (28 * resources.displayMetrics.density).toInt()
-            icon.setImageBitmap(AppIcons.rounded(entry.icon, iconPx))
-            name.text = entry.label
-            refresh(SupersamplePrefs.mode(requireContext(), entry.component))
-
-            fun pick(
-                mode: Int,
-                label: String,
-            ) {
-                SupersamplePrefs.setMode(requireContext(), entry.component, mode)
-                refresh(mode)
-                hostToast("「${entry.label}」超采样：$label（下次启动生效）")
-            }
-            segAuto.setOnClickListener { pick(SupersamplePrefs.MODE_AUTO, "自动") }
-            segOn.setOnClickListener { pick(SupersamplePrefs.MODE_ON, "开启") }
-            segOff.setOnClickListener { pick(SupersamplePrefs.MODE_OFF, "关闭") }
-        }
-
-        private fun refresh(mode: Int) {
-            val segs =
-                listOf(
-                    segAuto to SupersamplePrefs.MODE_AUTO,
-                    segOn to SupersamplePrefs.MODE_ON,
-                    segOff to SupersamplePrefs.MODE_OFF,
-                )
-            segs.forEach { (view, segMode) ->
-                val active = segMode == mode
-                view.background = if (active) requireActivity().getDrawable(R.drawable.bg_segment_sel) else null
-                view.setTextColor(if (active) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
             }
         }
     }

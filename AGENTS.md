@@ -117,8 +117,8 @@ iap2/        iAP2 链路层 + CSM + 发送端会话（0x5703 热点凭据 / 0x43
 net/         WiFi 入网绑定（WifiCarPlayConnector）+ mDNS ctrl 广播 + ctrl-int HTTP
 airplay/     AirPlay：SRP 配对、加密 RTSP 控制通道、事件通道、流协商、ChaCha20 加密
 video/       MediaCodec Surface 输入 H.264 → 128B 头 + ChaCha20 帧封装 TCP 推流
-audio/       AudioPlaybackCapture → RTP/ChaCha20 over UDP
-launcher/    隐形屏启动器（核心）：四块受信虚拟屏
+audio/       REMOTE_SUBMIX 直采（shell）→ RTP/ChaCha20 over UDP（回退=播放捕获）
+launcher/    隐形屏启动器（核心）：三块受信虚拟屏（dock/app/map）
 render/      DualDisplayComposer：GL 合成多虚拟屏画面 → 编码器 Surface（出帧节奏在此）
 input/       TouchRouter：车机触摸按坐标分流注入 dock/app/map 屏
 shizuku/     Shell（cmd 执行）+ CarInputClient（触摸注入/虚拟屏创建/resize，AIDL UserService）
@@ -130,9 +130,10 @@ MainActivity 手机侧操作台 UI（英雄卡状态机 1s 轮询）
 ```
 
 **虚拟屏**（横屏车机，全部经 Shizuku shell 创建）：CarPlayDock（左侧竖条，自有
-DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超采样应用屏，
-竖屏锁定应用 letterbox 缓解）+ CarPlayMap（地图屏，仪表盘 tile/全屏间动态 resize）。
-竖屏车机时 dock 落底部、无 Hi 屏。
+DockActivity，不受信）+ CarPlayApp（应用屏，**密度=手机侧**、px=dp×手机密度/160，
+合成器缩小回画布——自带超采样，2026-11-06 起取代原 app+appHi 双屏）+
+CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 resize）。
+竖屏车机时 dock 落底部、应用屏窗口宽 = 410dp（手机宽度）。
 
 ## 关键约定与已踩过的坑（改代码前必读）
 
@@ -207,6 +208,21 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   （designScale = densityDpi/420；不用 sp——dock 是像素级设计画布，不跟手机字体缩放）；
   ③ 模糊半径等物理像素量同样乘 designScale；④ `fitClockText` 的行程/步进也按
   designScale 缩放。改 dock 视觉时先确认这三处都随密度走。
+- **应用屏/地图屏密度 = 手机侧密度（2026-11-06，字号跨屏漂移修复 + 移除超采样屏）**：
+  旧行为：应用屏 360/240dpi、地图屏 200dpi 与手机 560dpi 不一致，应用跨屏打开时系统
+  按新密度重排（手机开→车机开字号变大、反向变小）。现 `appDisplayGeometry/
+  mapDisplayGeometry`（纯函数，`DisplayGeometryTest` 钉死）：**密度=手机侧
+  （`context.resources.displayMetrics.densityDpi`，不 coerce——一致性是本特性核心）**，
+  px = dp 窗口 × 手机密度/160，合成器 GL 缩小回画布应用区（缩放比 ≈0.43，天然高倍率
+  超采样）。dp 窗口：横屏高 = LETTERBOX_TARGET_DP×LETTERBOX_ASPECT_RATIO（410×1.05），
+  竖屏宽 = 410dp，其余维度按画布应用区纵横比；地图 dp = 旧应用区@200dpi 不变（高德
+  车机布局不变、标注变清晰）。px 最长边 ≤4096（GL 纹理安全，仅极端机型让密度略降）。
+  **appHi 超采样屏已移除**（手机密度天然高于旧 1.5× 超采样倍率），gridDisplayId=应用屏，
+  `composer.start` hi 两参传 0（`hasHiInput=false` 是既有降级路径）；`gridScale()/
+  activeAppScale()` = 应用屏 px/画布应用区 px（**触摸坐标换算与 GridActivity 把手布局
+  都依赖它，改密度公式必须同步检查**）；`resizeMapDisplay` 的 resize 目标 = 画布 tile
+  尺寸 × `mapDisplayDensity/200`（显示 px 域），密度参数同步传手机值。回退路径（无
+  Shizuku 应用侧屏）同样密度。旧 APP_SUPERSAMPLE/SUPERSAMPLE_MAX_HEIGHT 常量退役。
 - **竖屏桌面网格行数自适应**（2026-10-17 修复「竖屏单元格占用范围过大」：用户开
   「显示布局边界」截图暴露——固定 3 行把格子拉成 ~1:2.5 瘦高条，图标只占三成、
   大片空框）：`GridActivity.computeCellMetrics()` 按**格子目标高宽比 1.25** 自适应
