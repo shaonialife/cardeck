@@ -10,6 +10,7 @@ import android.hardware.display.VirtualDisplay
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import io.github.shaonialife.cardeck.bt.BtSessionGate
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.media.NotificationAccess
@@ -574,6 +575,9 @@ object VirtualLauncher {
             var viaService = false
             if (useTrusted) {
                 runCatching {
+                    // VirtualDeviceManager 路线的目标车机：本次链路对端 BT MAC（自动模式下
+                    // 无既选目标，实际对端是唯一可信来源）。空 = VDM 关闭，全部走 legacy。
+                    svc!!.setCompanionDevice(BtSessionGate.lastPeerAddress ?: "")
                     // 残留清理：进程重启/上轮会话遗留的同名虚拟屏不释放会一直占位
                     // （新宽度/新 surface 不生效——2026-10-11 dock 改宽后视觉无变化的根因）
                     val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -672,6 +676,8 @@ object VirtualLauncher {
                         if (appId >= 0) runCatching { svc!!.releaseDisplay(appId) }
                         if (appHiId >= 0) runCatching { svc!!.releaseDisplay(appHiId) }
                         if (mapId >= 0) runCatching { svc!!.releaseDisplay(mapId) }
+                        // 本次整体回退应用侧屏：VDM 会话不留到下轮（下轮 attach 会重设）
+                        runCatching { svc!!.closeVirtualDevice() }
                     }
                 }.onFailure { log("LAUNCHER: 受信屏创建异常 ${it.message}") }
             }
@@ -865,6 +871,9 @@ object VirtualLauncher {
                 if (appHiDisplayId >= 0) runCatching { svc.releaseDisplay(appHiDisplayId) }
                 // 地图屏同样由 shell 持有：不释放会在断开后残留（重装后由启动检测兜底发现）
                 if (mapDisplayId >= 0) runCatching { svc.releaseDisplay(mapDisplayId) }
+                // VDM 会话收口：余屏兜底释放 → device.close → 解除本次创建的伴侣关联
+                // （既有关联复用后原样保留）。幂等：无会话时返回 true。
+                runCatching { svc.closeVirtualDevice() }
             }
             displaysViaService = false
         }

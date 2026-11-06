@@ -252,6 +252,7 @@ class Iap2BluetoothClient(
                 val socket = tryConnect(device)
                 if (socket != null) {
                     log("BT-C: ✓ 已连入 $name 的无线 iAP2 服务（RFCOMM 建立）")
+                    BtSessionGate.lastPeerAddress = device.address
                     connected = socket
                     break
                 } else {
@@ -406,4 +407,12 @@ object BtSessionGate {
      */
     @Volatile
     var sessionActive: Boolean = false
+
+    /**
+     * 最近一次 iAP2 链路对端（车机）的蓝牙地址：出站连接成功或入站连入时写入。
+     * VirtualDeviceManager 伴侣关联按它绑定「哪台车机」（自动模式下无既选目标，
+     * 实际对端是唯一可信来源；取不到时建屏走 legacy，不影响推流）。
+     */
+    @Volatile
+    var lastPeerAddress: String? = null
 }

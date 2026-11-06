@@ -30,6 +30,16 @@ interface ICarInput {
     // 应用自行 relayout——地图屏「分屏 ⇄ 全屏」切换即用此能力（任务不动，状态不丢）。
     boolean resizeDisplay(int displayId, int width, int height, int dpi);
 
+    // VirtualDeviceManager 路线（Android 14+ 官方 API）：以 shell 包名与车机 BT MAC 建
+    // COMPANION_DEVICE_APP_STREAMING 伴侣关联 +
+    // LOCK_STATE_UNLOCKED 虚拟设备，建在其上的屏整台无视主机锁屏/休眠。
+    // mac 在每次会话建屏前传入（空串=不启用，全部走 DisplayManager legacy）。
+    void setCompanionDevice(String btMac);
+
+    // 会话结束收口：释放虚拟设备上残余的屏 → device.close → disassociate（仅当
+    // 关联是本轮创建的；已有的用户级关联复用后原样保留）→ role 兜底回填。
+    boolean closeVirtualDevice();
+
     // 物理主屏硬件电源（SurfaceControl.setDisplayPowerMode）：false=断电（真息屏），
     // true=恢复点亮。系统逻辑上仍保持唤醒（不锁屏、不进 Doze），虚拟屏照常渲染。
     // 原理同 scrcpy -S/--turn-screen-off；失败返回 false（ROM 未授权/取不到 display token）。

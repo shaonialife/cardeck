@@ -132,8 +132,6 @@ class CarInputServiceImpl(
 
     init {
         if (DisplayPowerApi.available) {
-            // 真休眠（电源键）时系统广播 SCREEN_OFF：锁若不足以阻止全局 sleep，在此
-            // 对每块虚拟 display 补一次 wakeUp（只作用目标 display，不点亮主屏）。
             runCatching {
                 val receiver =
                     object : android.content.BroadcastReceiver() {
@@ -142,18 +140,77 @@ class CarInputServiceImpl(
                             intent: android.content.Intent?,
                         ) {
                             kickAllDisplaysAwake("SCREEN_OFF")
+                            // Display-off token 在面板超时（实测锁屏后 ~6s）才落下，即时 kick
+                            // 发早了会被后续 token「追平」——延迟补踢把 token 掀掉（2026-11-06）
+                            scheduleDelayedKicks()
                         }
                     }
-                val filter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
                 try {
+                    val filter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
                     context.registerReceiver(receiver, filter, android.content.Context.RECEIVER_EXPORTED)
                 } catch (_: Throwable) {
+                    val filter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
                     context.registerReceiver(receiver, filter)
                 }
                 fileLog("per-display 保活就绪：SCREEN_OFF 补唤醒已注册")
-            }.onFailure { fileLog("SCREEN_OFF 注册失败（仅缺补唤醒，锁仍生效）: $it") }
+            }.onFailure { fileLog("SCREEN_OFF 注册失败（锁仍生效）: $it") }
+            // 看门狗与广播注册解耦：广播在本 ROM 收不到（实测只有注册行没有触发行），
+            // 看门狗才是主力——注册失败不能连带跳过它。
+            runCatching { startDisplayStateWatchdog() }
+                .onFailure { fileLog("看门狗启动失败（仅缺补踢，锁仍生效）: $it") }
         } else {
             fileLog("per-display 保活不可用：无三参 newWakeLock（Android 15/16 前），维持现状")
+        }
+    }
+
+    /**
+     * 显示电源看门狗：持锁期间每 3s 检查各 display 的电源态，非 ON 立即补踢。
+     * 不依赖 SCREEN_OFF 广播（部分 ROM 不送达 shell 进程的运行时接收器，2026-11-06
+     * 实测「只有注册行、没有触发行」）；Display-off token 在面板超时后才落下，轮询
+     * 天然覆盖该时序。
+     *
+     * 生命周期：本进程常驻（与虚拟屏/亮屏锁同寿），线程 daemon 随进程消亡——
+     * 不是泄漏。[watchdogStarted] 做**进程级单飞**：Shizuku 若在同一进程重建服务
+     * 实例，init 重跑也不会起第二个看门狗（双份补踢 + 日志重复）。
+     */
+    private fun startDisplayStateWatchdog() {
+        if (!watchdogStarted.compareAndSet(false, true)) {
+            fileLog("看门狗已在本进程运行——跳过重复启动")
+            return
+        }
+        Thread({
+            val dm =
+                runCatching {
+                    shellContext.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+                }.getOrNull()
+            if (dm == null) {
+                // 早退必须归还单飞标记：否则本进程内永远无法再启动看门狗
+                watchdogStarted.set(false)
+                fileLog("看门狗未启动：DisplayManager 不可用")
+                return@Thread
+            }
+            fileLog("display 电源看门狗已启动（3s 轮询）")
+            while (true) {
+                try {
+                    Thread.sleep(WATCHDOG_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                val ids = synchronized(displayWakeLocks) { displayWakeLocks.keys.toList() }
+                if (ids.isEmpty()) continue
+                for (id in ids) {
+                    val state =
+                        runCatching { dm.getDisplay(id)?.state }.getOrNull()
+                    // UNKNOWN 是创建/切换瞬态，不踢；OFF/DOZE 必踢
+                    if (state == android.view.Display.STATE_OFF || state == android.view.Display.STATE_DOZE) {
+                        fileLog("看门狗 #$id state=$state——补踢")
+                        runCatching { kickDisplayAwake(id, "watchdog state=$state") }
+                    }
+                }
+            }
+        }, "carinput-display-watchdog").apply {
+            isDaemon = true
+            start()
         }
     }
 
@@ -230,20 +287,89 @@ class CarInputServiceImpl(
     }
 
     private fun kickAllDisplaysAwake(reason: String) {
-        val pm = powerManager
         val ids = synchronized(displayWakeLocks) { displayWakeLocks.keys.toList() }
         if (ids.isEmpty()) return
-        // 无条件逐屏 wakeUp（2026-10-26 17:2x 实测：真休眠 Dozing 下所有虚拟屏
-        // state=OFF + WMS 持 Display-off token，而 isInteractive(displayId) 仍返回
-        // true——按交互态短路会让 wakeUp 永远发不出去）。逐屏打 interactive 观测值，
-        // 便于判读 wakeUp 是否真把 display 拉回。
-        ids.forEach { id ->
-            val interactive =
-                DisplayPowerApi.isInteractiveInt?.let { probe ->
-                    runCatching { probe.invoke(pm, id) }.getOrNull()
-                }
-            wakeDisplayUnconditionally(id, reason)
-            fileLog("SCREEN_OFF 补唤醒 #$id：唤醒前 isInteractive=$interactive")
+        ids.forEach { id -> kickDisplayAwake(id, reason) }
+    }
+
+    /**
+     * 单屏补唤醒：优先 `IDisplayManager.requestDisplayPower(displayId, ON)`（经
+     * DisplayPowerController 状态机，能驱动 WMS 释放 Display-off sleep token——
+     * 2026-11-06 定谳：仅靠 wakeUp 只把 display 电源拉回 state=ON，token 仍挂着、
+     * mSleeping=true、活动暂停、触摸无效），无该 API 再退 wakeUp。
+     */
+    private fun kickDisplayAwake(
+        displayId: Int,
+        reason: String,
+    ) {
+        val pm = powerManager
+        val interactive =
+            DisplayPowerApi.isInteractiveInt?.let { probe ->
+                runCatching { probe.invoke(pm, displayId) }.getOrNull()
+            }
+        val viaDisplayManager =
+            requestDisplayPower(displayId, REQUEST_POWER_STATE_ON)?.also {
+                fileLog("补唤醒 #$displayId requestDisplayPower(ON) ok（$reason，interactive=$interactive）")
+            }
+        if (viaDisplayManager != true) {
+            wakeDisplayUnconditionally(displayId, reason)
+            fileLog("SCREEN_OFF 补唤醒 #$displayId（wakeUp 路径，$reason，interactive=$interactive）")
+        }
+    }
+
+    /** 锁屏后延迟补踢：Display-off token 在面板超时（~6s）才落下，即时 kick 发早了。 */
+    private fun scheduleDelayedKicks() {
+        listOf(1_000L, 3_000L, 8_000L).forEach { delayMs ->
+            android.os
+                .Handler(android.os.Looper.getMainLooper())
+                .postDelayed({
+                    val ids = synchronized(displayWakeLocks) { displayWakeLocks.keys.toList() }
+                    if (ids.isNotEmpty()) {
+                        ids.forEach { id ->
+                            runCatching { kickDisplayAwake(id, "SCREEN_OFF+$delayMs") }
+                                .onFailure { fileLog("补唤醒 #$id 失败：${it.message}") }
+                        }
+                    }
+                }, delayMs)
+        }
+    }
+
+    /** IDisplayManager 代理（requestDisplayPower 反射探测；ROM 无此 API 时整体回退 wakeUp）。 */
+    private val displayManagerProxy: Any? by lazy {
+        runCatching {
+            val binder =
+                Class
+                    .forName("android.os.ServiceManager")
+                    .getMethod("getService", String::class.java)
+                    .invoke(null, "display") as IBinder
+            Class
+                .forName("android.hardware.display.IDisplayManager\$Stub")
+                .getMethod("asInterface", IBinder::class.java)
+                .invoke(null, binder)
+        }.onFailure { fileLog("IDisplayManager 代理创建失败：${it.message}") }.getOrNull()
+    }
+
+    private val requestDisplayPowerMethod: Method? by lazy {
+        displayManagerProxy?.let { proxy ->
+            proxy.javaClass.methods
+                .firstOrNull { it.name == "requestDisplayPower" }
+                ?.also { fileLog("requestDisplayPower 可用：${it.parameterTypes.joinToString()}") }
+        }
+    }
+
+    /** requestDisplayPower(displayId, state)；ROM 无该 API 返回 null（调用方走 wakeUp 兜底）。 */
+    private fun requestDisplayPower(
+        displayId: Int,
+        state: Int,
+    ): Boolean? {
+        val proxy = displayManagerProxy ?: return null
+        val method = requestDisplayPowerMethod ?: return null
+        return try {
+            method.invoke(proxy, displayId, state)
+            true
+        } catch (t: Throwable) {
+            fileLog("requestDisplayPower($displayId,$state) 失败：${t.message}")
+            false
         }
     }
 
@@ -254,6 +380,557 @@ class CarInputServiceImpl(
                 fileLog("vd #$displayId per-display 亮屏锁已释放")
             }
         }
+    }
+
+    // ---- VirtualDeviceManager 路线（锁屏推流的官方解，2026-11 落地）----
+    //
+    // legacy flags（TRUSTED/ALWAYS_UNLOCKED/OWN_DISPLAY_GROUP + per-display 亮屏锁）只挡住了
+    // keyguard token 与 display-off token 的一部分；按电源键真休眠时窗口表面仍会被系统剥离
+    // （AGENTS.md 2026-10-23）。参考实现走 VirtualDeviceManager：以 shell 包名与车机 BT MAC 建
+    // COMPANION_DEVICE_APP_STREAMING 伴侣关联（`cmd companiondevice associate`，shell 权限免弹窗）
+    // → 创建 LOCK_STATE_UNLOCKED 虚拟设备 → 建在其上的屏整台无视主机锁屏/休眠。
+    // 任何一步失败逐屏回退 legacy DisplayManager 路径（下行代码一行不改）。
+
+    @Volatile
+    private var companionMac: String? = null
+
+    /** 看门狗进程级单飞标记（防服务实例重建时起第二个轮询线程）。 */
+    private val watchdogStarted =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
+
+    /** 本会话 VDM 已失败（关联/设备/建屏任一环节）——余屏直接走 legacy，下轮 setCompanionDevice 重置重试。 */
+    @Volatile
+    private var vdmFailedThisSession = false
+
+    private val vdmLock = Any()
+
+    private var vdmSession: VdmSession? = null
+
+    /** shell 包 Context（系统按 uid 2000 校验 packageName；VDM 与 legacy 建屏共用）。 */
+    private val shellContext: Context by lazy {
+        try {
+            context.createPackageContext("com.android.shell", 0)
+        } catch (t: Throwable) {
+            fileLog("createPackageContext(com.android.shell) 失败：$t，回退本 app context")
+            context
+        }
+    }
+
+    override fun setCompanionDevice(btMac: String?) {
+        val mac = btMac?.trim()?.takeIf { it.isNotEmpty() }
+        synchronized(vdmLock) {
+            if (!mac.equals(companionMac, ignoreCase = true)) {
+                // 目标车机变了：收掉旧会话（含 disassociate 本次创建的关联），下次建屏重建
+                vdmSession?.let { old ->
+                    runCatching { old.close() }
+                        .onFailure { fileLog("VDM: 旧会话收口失败：${it.message}") }
+                }
+                vdmSession = null
+            }
+            companionMac = mac
+            // 每次 attach 前都会重设 → 会话级重试（进程级禁用会掩盖偶发故障）
+            vdmFailedThisSession = false
+        }
+        fileLog("setCompanionDevice(${mac ?: "<空——VDM 关闭，走 legacy>"})")
+    }
+
+    override fun closeVirtualDevice(): Boolean {
+        synchronized(vdmLock) {
+            val session = vdmSession ?: return true // 幂等：无会话即成功
+            vdmSession = null
+            vdmFailedThisSession = true // 会话已收口，本轮不再重建（下轮 attach 重置）
+            return try {
+                session.close()
+                true
+            } catch (t: Throwable) {
+                fileLog("closeVirtualDevice 失败：${t.message}")
+                false
+            }
+        }
+    }
+
+    /** gate 通过时取（或建）VDM 会话；失败置会话级禁用并返回 null（调用方落 legacy）。 */
+    private fun obtainVdmSession(): VdmSession? {
+        if (!VirtualDeviceRoute.shouldAttempt(Build.VERSION.SDK_INT, companionMac, vdmFailedThisSession)) {
+            return null
+        }
+        synchronized(vdmLock) {
+            if (vdmFailedThisSession) return null
+            val mac = companionMac ?: return null
+            vdmSession?.let { existing ->
+                if (existing.mac.equals(mac, ignoreCase = true)) return existing
+                runCatching { existing.close() }
+                vdmSession = null
+            }
+            return try {
+                VdmSession(mac).also { session ->
+                    session.ensure()
+                    vdmSession = session
+                    fileLog("VDM: 会话就绪 ${session.describe()}")
+                }
+            } catch (t: Throwable) {
+                vdmFailedThisSession = true
+                fileLog("VDM: 会话建立失败——本会话走 legacy（${describeCause(t)}）")
+                null
+            }
+        }
+    }
+
+    /** 反射失败的根因解包（InvocationTargetException.message 恒 null，直接打会吞根因）。 */
+    private fun describeCause(t: Throwable): String {
+        var cause = t
+        var depth = 0
+        while (cause.cause != null && cause.cause !== cause && depth < 5) {
+            cause = cause.cause!!
+            depth++
+        }
+        return "${cause.javaClass.name}: ${cause.message ?: "(无消息)"}"
+    }
+
+    /**
+     * VDM 专用 Context 包装：
+     * `VirtualDeviceManager` 构造/建设备时会取 `context.getAttributionSource()`，而
+     * createPackageContext 得到的 shell 包 Context 在本 ROM 上该值为 null
+     * （实测 NullPointerException）——这里显式给出 shell uid + shell 包名的
+     * AttributionSource（真机实证必需）。
+     */
+    private class AttributionContext(
+        base: Context,
+    ) : android.content.ContextWrapper(base) {
+        private val attributionSource: android.content.AttributionSource =
+            android.content.AttributionSource
+                .Builder(android.os.Process.myUid())
+                .setPackageName(CDM_PACKAGE)
+                .build()
+
+        override fun getAttributionSource(): android.content.AttributionSource = attributionSource
+
+        override fun getOpPackageName(): String = CDM_PACKAGE
+
+        override fun getPackageName(): String = CDM_PACKAGE
+
+        override fun getApplicationContext(): Context = this
+    }
+
+    /**
+     * VDM 会话：关联（复用/创建）→ 虚拟设备（LOCK_STATE_UNLOCKED）→ 建屏。
+     * 生命周期 = 一次 CarPlay 会话：VirtualLauncher.detach 末尾 closeVirtualDevice 收口
+     * （参考实现 destroy() 同款）；进程死亡时系统侧虚拟设备与屏随进程回收，关联
+     * （system 持久化）留待下次 ensure 复用。
+     */
+    private inner class VdmSession(
+        val mac: String,
+    ) {
+        var associationId = -1
+        var associationCreatedByUs = false
+        var device: Any? = null
+        private val displays = LinkedHashMap<Int, android.hardware.display.VirtualDisplay>()
+
+        private val userId: Int = android.os.Process.myUid() / 100000
+
+        /** ICompanionDeviceManager 代理（服务名/Stub 全反射，取不到时关联路径整体失败→legacy）。 */
+        private val cdm: Any? by lazy {
+            runCatching {
+                val binder =
+                    Class
+                        .forName("android.os.ServiceManager")
+                        .getMethod("getService", String::class.java)
+                        .invoke(null, "companiondevice") as IBinder
+                Class
+                    .forName("android.companion.ICompanionDeviceManager\$Stub")
+                    .getMethod("asInterface", IBinder::class.java)
+                    .invoke(null, binder)
+            }.onFailure { fileLog("VDM: ICompanionDeviceManager 反射失败：${it.message}") }.getOrNull()
+        }
+
+        fun describe(): String =
+            "mac=$mac assocId=$associationId createdByUs=$associationCreatedByUs device=${device != null} displays=${displays.size}"
+
+        /** 关联（复用既有或 shell 命令创建）→ role 兜底 → 虚拟设备。任一步失败抛出。 */
+        @Synchronized
+        fun ensure() {
+            janitor()
+            val existing = findExistingAssociation()
+            if (existing >= 0) {
+                associationId = existing
+                fileLog("VDM: 复用既有关联 id=$existing mac=$mac")
+            } else {
+                // 位置形命令（参考实现同款，荣耀 Magic7 Pro SDK 37 实测可用）：
+                // associate USER_ID PACKAGE MAC PROFILE SELF_MANAGED
+                // ⚠ 本 ROM 的**旗标形**（--mac-address/--profile）解析有 bug：抛
+                // 「not a valid MAC address」却仍用**本机 MAC** 创建垃圾关联——旗标形
+                // 只作位置形彻底无效时的兜底，且事后清道（janitor 同款规则）。
+                runCatching {
+                    runCmd(
+                        "companiondevice",
+                        "associate",
+                        userId.toString(),
+                        CDM_PACKAGE,
+                        mac,
+                        ROLE_APP_STREAMING,
+                        "false",
+                    )
+                    fileLog("VDM: associate(位置形) 已执行")
+                }.onFailure { fileLog("VDM: 位置形失败：${it.message}") }
+                if (findExistingAssociation() < 0) {
+                    runCatching {
+                        runCmd(
+                            "companiondevice",
+                            "associate",
+                            userId.toString(),
+                            CDM_PACKAGE,
+                            "--mac-address",
+                            mac,
+                            "--profile",
+                            ROLE_APP_STREAMING,
+                            "--self-managed",
+                            "false",
+                        )
+                        fileLog("VDM: associate(旗标形兜底) 已执行")
+                    }.onFailure { fileLog("VDM: 旗标形也失败：${it.message}") }
+                }
+                associationCreatedByUs = true
+                // 命令成功 ≠ 关联立即可见（参考实现轮询 20×100ms 确认）
+                for (i in 0 until 20) {
+                    val id = findExistingAssociation()
+                    if (id >= 0) {
+                        associationId = id
+                        break
+                    }
+                    Thread.sleep(100)
+                }
+                if (associationId < 0) {
+                    throw java.io.IOException("associate 已执行但关联未生效（2s 内不可见）")
+                }
+                fileLog("VDM: 关联已创建 id=$associationId")
+                janitor() // 兜底命令若产出垃圾关联（MAC 不符），立即清掉
+            }
+            ensureRoleHolder()
+            ensureDevice()
+        }
+
+        /**
+         * 清道夫：`com.android.shell` 名下 profile 匹配但 MAC 不是当前目标的关联只可能是
+         * 本应用早期残留（换车遗留 / ROM 命令面 bug 产物）——该包名的关联只能由 shell uid
+         * 创建（= 我们），按 id 清除是安全的。其它 profile 的条目只记日志不动。
+         * 本 ROM 的 `cmd companiondevice disassociate` 命令面解析全废（实测任何格式都报
+         * 「not a valid MAC address」），清理必须走 binder 反射（[disassociate]）。
+         */
+        private fun janitor() {
+            val manager = cdm ?: return
+            val associations =
+                runCatching {
+                    Class
+                        .forName("android.companion.ICompanionDeviceManager")
+                        .getMethod("getAssociations", String::class.java, Int::class.javaPrimitiveType)
+                        .invoke(manager, CDM_PACKAGE, userId) as List<*>
+                }.getOrNull() ?: return
+            for (association in associations) {
+                val assoc = association ?: continue
+                val id =
+                    runCatching { assoc.javaClass.getMethod("getId").invoke(assoc) as Int }.getOrNull()
+                        ?: continue
+                val assocMac =
+                    runCatching {
+                        assoc.javaClass
+                            .getMethod("getDeviceMacAddress")
+                            .invoke(assoc)
+                            ?.toString()
+                    }.getOrNull() ?: continue
+                val profile =
+                    runCatching {
+                        assoc.javaClass.getMethod("getDeviceProfile").invoke(assoc) as? String
+                    }.getOrNull()
+                if (profile != ROLE_APP_STREAMING) {
+                    fileLog("VDM: 跳过非本 profile 的关联 id=$id mac=$assocMac profile=$profile")
+                    continue
+                }
+                if (assocMac.equals(mac, ignoreCase = true)) continue
+                if (disassociate(id)) {
+                    fileLog("VDM: 已清理残留关联 id=$id mac=$assocMac（非当前目标 $mac）")
+                }
+            }
+        }
+
+        /** binder 反射 disassociate：新版按 associationId，旧版按 (package, mac) 双参兜底。 */
+        private fun disassociate(id: Int): Boolean {
+            val manager = cdm ?: return false
+            val cls = Class.forName("android.companion.ICompanionDeviceManager")
+            return runCatching {
+                cls.getMethod("disassociate", Int::class.javaPrimitiveType).invoke(manager, id)
+                true
+            }.getOrElse {
+                runCatching {
+                    // 旧签名：disassociate(String packageName, String macAddress)——id 关联
+                    // 的 mac 需再查一次，查不到就放弃（残留无害，只是 CDM 列表里多一行）
+                    cls.getMethod("disassociate", String::class.java, String::class.java)
+                    val macOf =
+                        (
+                            Class
+                                .forName("android.companion.ICompanionDeviceManager")
+                                .getMethod("getAssociations", String::class.java, Int::class.javaPrimitiveType)
+                                .invoke(manager, CDM_PACKAGE, userId) as List<*>
+                        ).firstOrNull { assoc ->
+                            assoc != null &&
+                                runCatching {
+                                    (assoc.javaClass.getMethod("getId").invoke(assoc) as Int) == id
+                                }.getOrDefault(false)
+                        }?.let { assoc ->
+                            runCatching {
+                                assoc.javaClass
+                                    .getMethod("getDeviceMacAddress")
+                                    .invoke(assoc)
+                                    ?.toString()
+                            }.getOrNull()
+                        }
+                    if (macOf == null) return false
+                    cls
+                        .getMethod("disassociate", String::class.java, String::class.java)
+                        .invoke(manager, CDM_PACKAGE, macOf)
+                    true
+                }.getOrDefault(false)
+            }
+        }
+
+        /** 按 MAC+profile 查既有关联，返回 associationId（无/不匹配 -1；profile 不同抛异常防误伤）。 */
+        private fun findExistingAssociation(): Int {
+            val manager = cdm ?: throw java.io.IOException("CompanionDeviceManager 不可用")
+            val associations =
+                Class
+                    .forName("android.companion.ICompanionDeviceManager")
+                    .getMethod(
+                        "getAssociations",
+                        String::class.java,
+                        Int::class.javaPrimitiveType,
+                    ).invoke(manager, CDM_PACKAGE, userId) as List<*>
+            for (association in associations) {
+                val assoc = association ?: continue
+                val assocMac =
+                    runCatching {
+                        assoc.javaClass
+                            .getMethod("getDeviceMacAddress")
+                            .invoke(assoc)
+                            ?.toString()
+                    }.getOrNull() ?: continue
+                if (!assocMac.equals(mac, ignoreCase = true)) continue
+                val profile =
+                    runCatching {
+                        assoc.javaClass.getMethod("getDeviceProfile").invoke(assoc) as? String
+                    }.getOrNull()
+                if (profile == ROLE_APP_STREAMING) {
+                    return assoc.javaClass.getMethod("getId").invoke(assoc) as Int
+                }
+                // 与参考实现一致：profile 不同直接失败，绝不复用/改写用户的非流式关联
+                throw java.io.IOException("已存在同 MAC 关联但 profile=$profile（期望 app-streaming）")
+            }
+            return -1
+        }
+
+        /** role 持有者兜底（disassociate 可能连带摘掉 role；参考实现 close 同款回填）。 */
+        private fun ensureRoleHolder() {
+            runCatching {
+                val holders =
+                    runCmd("role", "get-role-holders", "--user", userId.toString(), ROLE_APP_STREAMING)
+                if (!VirtualDeviceRoute.roleHoldersContain(holders, CDM_PACKAGE)) {
+                    runCmd(
+                        "role",
+                        "add-role-holder",
+                        "--user",
+                        userId.toString(),
+                        ROLE_APP_STREAMING,
+                        CDM_PACKAGE,
+                    )
+                    fileLog("VDM: 已补授 role $ROLE_APP_STREAMING")
+                }
+            }.onFailure { fileLog("VDM: role 检查/补授失败（继续，关联本身可能足够）：${it.message}") }
+        }
+
+        private fun ensureDevice() {
+            val paramsClass = Class.forName("android.companion.virtual.VirtualDeviceParams")
+            val builderClass = Class.forName("android.companion.virtual.VirtualDeviceParams\$Builder")
+            val builder = builderClass.getConstructor().newInstance()
+            // LOCK_STATE_UNLOCKED：AOSP 值 = 1。ROM 字段名可能不同（荣耀 SDK 37 实测
+            // 无该名字）——枚举 int 常量按候选名匹配，匹配不到回退 1 并全量留痕供判读。
+            val lockState = resolveLockStateUnlocked(paramsClass)
+            builderClass.getMethod("setLockState", Int::class.javaPrimitiveType).invoke(builder, lockState)
+            builderClass.getMethod("setName", String::class.java).invoke(builder, "CarDeck")
+            val params = builderClass.getMethod("build").invoke(builder)
+
+            val vdmClass = Class.forName("android.companion.virtual.VirtualDeviceManager")
+            val ivdmClass = Class.forName("android.companion.virtual.IVirtualDeviceManager")
+            val binder =
+                Class
+                    .forName("android.os.ServiceManager")
+                    .getMethod("getService", String::class.java)
+                    .invoke(null, "virtualdevice") as IBinder
+            val proxy =
+                Class
+                    .forName("android.companion.virtual.IVirtualDeviceManager\$Stub")
+                    .getMethod("asInterface", IBinder::class.java)
+                    .invoke(null, binder)
+            val manager =
+                vdmClass
+                    .getConstructor(ivdmClass, Context::class.java)
+                    .newInstance(proxy, AttributionContext(shellContext))
+            device =
+                vdmClass
+                    .getMethod("createVirtualDevice", Int::class.javaPrimitiveType, paramsClass)
+                    .invoke(manager, associationId, params)
+            fileLog("VDM: 虚拟设备已创建 lockState=$lockState（UNLOCKED=锁屏/休眠不影响其窗口）")
+        }
+
+        /** 枚举 VirtualDeviceParams 的 int 常量找 LOCK_STATE_UNLOCKED（找不到回退 AOSP 值 1）。 */
+        private fun resolveLockStateUnlocked(paramsClass: Class<*>): Int {
+            val fields =
+                paramsClass.fields
+                    .filter { it.type == Int::class.javaPrimitiveType }
+                    .mapNotNull { field ->
+                        runCatching { field.name to field.getInt(null) }.getOrNull()
+                    }
+            fileLog("VDM: VirtualDeviceParams 常量 ${fields.joinToString { "${it.first}=${it.second}" }}")
+            val names = listOf("LOCK_STATE_UNLOCKED", "LOCK_STATE_ALWAYS_UNLOCKED", "UNLOCKED")
+            for (candidate in names) {
+                fields.firstOrNull { it.first == candidate }?.let { return it.second }
+            }
+            fileLog("VDM: 未找到 UNLOCKED 常量名，回退 AOSP 值 1")
+            return 1
+        }
+
+        /** 在虚拟设备上建屏；flags 候选由调用方给定（trusted/dock 两套），失败抛给调用方降级。 */
+        @Synchronized
+        fun createDisplay(
+            name: String,
+            width: Int,
+            height: Int,
+            dpi: Int,
+            surface: Surface,
+            flags: Int,
+        ): android.hardware.display.VirtualDisplay {
+            val dev = device ?: throw java.io.IOException("虚拟设备未就绪")
+            val configClass = Class.forName("android.hardware.display.VirtualDisplayConfig")
+            val builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+            val builder =
+                builderClass
+                    .getConstructor(
+                        String::class.java,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                    ).newInstance(name, width, height, dpi)
+            builderClass.getMethod("setSurface", Surface::class.java).invoke(builder, surface)
+            builderClass.getMethod("setFlags", Int::class.javaPrimitiveType).invoke(builder, flags)
+            val config = builderClass.getMethod("build").invoke(builder)
+            val vd =
+                dev.javaClass
+                    .getMethod(
+                        "createVirtualDisplay",
+                        configClass,
+                        java.util.concurrent.Executor::class.java,
+                        android.hardware.display.VirtualDisplay.Callback::class.java,
+                    ).invoke(dev, config, null, null) as? android.hardware.display.VirtualDisplay
+                    ?: throw java.io.IOException("createVirtualDisplay 返回 null")
+            val id = vd.display.displayId
+            if (id <= 0) {
+                runCatching { vd.release() }
+                throw java.io.IOException("displayId 无效（$id）")
+            }
+            displays[id] = vd
+            logDisplayGroup(id)
+            return vd
+        }
+
+        /** 应用侧 releaseDisplay 时同步摘除跟踪（close 兜底释放时不重复 release）。 */
+        @Synchronized
+        fun discard(displayId: Int) {
+            displays.remove(displayId)
+        }
+
+        /** 会话收口：余屏兜底释放 → device.close → disassociate（仅本次创建的）→ role 回填。 */
+        @Synchronized
+        fun close() {
+            for ((id, vd) in displays) {
+                runCatching { vd.release() }
+                fileLog("VDM: 残余屏 #$id 已随会话收口释放")
+            }
+            displays.clear()
+            device?.let { dev ->
+                runCatching { dev.javaClass.getMethod("close").invoke(dev) }
+                    .onFailure { fileLog("VDM: device.close 失败（屏已释放，影响有限）：${it.message}") }
+            }
+            device = null
+            fileLog("VDM: 会话已收口（屏已释放、device 已关闭；复用关联保留 id=$associationId）")
+            if (associationCreatedByUs && associationId >= 0) {
+                val removed =
+                    runCatching { disassociate(associationId) }.getOrDefault(false)
+                fileLog(
+                    if (removed) {
+                        "VDM: 本次创建的关联已解除 id=$associationId"
+                    } else {
+                        "VDM: disassociate 失败（关联留存，下次 ensure 复用/清道）：id=$associationId"
+                    },
+                )
+                associationCreatedByUs = false
+                associationId = -1
+                // 参考实现 close 语义：解除后 role 可能被连带摘掉，校验并回填
+                runCatching {
+                    val holders = runCmd("role", "get-role-holders", "--user", userId.toString(), ROLE_APP_STREAMING)
+                    if (!VirtualDeviceRoute.roleHoldersContain(holders, CDM_PACKAGE)) {
+                        runCmd(
+                            "role",
+                            "add-role-holder",
+                            "--user",
+                            userId.toString(),
+                            ROLE_APP_STREAMING,
+                            CDM_PACKAGE,
+                        )
+                        fileLog("VDM: role 已回填")
+                    }
+                }.onFailure { fileLog("VDM: role 回填校验失败：${it.message}") }
+            }
+        }
+
+        /** 读回 displayGroupId 验证独立组（AGENTS.md：shell 写操作必须读回确认）。 */
+        private fun logDisplayGroup(displayId: Int) {
+            runCatching {
+                val dm = shellContext.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+                val display = dm.getDisplay(displayId) ?: return@runCatching
+                val infoClass = Class.forName("android.view.DisplayInfo")
+                val info = infoClass.getConstructor().newInstance()
+                val valid =
+                    android.view.Display::class.java
+                        .getMethod("getDisplayInfo", infoClass)
+                        .invoke(display, info) as Boolean
+                if (!valid) return@runCatching
+                val group = infoClass.getField("displayGroupId").getInt(info)
+                // DEFAULT_DISPLAY_GROUP=0（@hide 于本 compileSdk，写 AOSP 常量值）
+                val independent = group != DEFAULT_DISPLAY_GROUP
+                fileLog(
+                    "VDM: #$displayId displayGroupId=$group " +
+                        if (independent) "（独立组 ✓）" else "（⚠ 与主屏同组——锁屏可能拖累该屏）",
+                )
+            }.onFailure { fileLog("VDM: #$displayId displayGroupId 读回失败：${it.message}") }
+        }
+    }
+
+    /**
+     * UserService 内直接跑 /system/bin/cmd（本进程就是 shell uid，无需 Shizuku 转发）。
+     * redirectErrorStream 合并 stderr——`cmd` 系参数校验失败只写 stderr，不读就是
+     * 静默无效（AGENTS.md 踩坑记录）。
+     */
+    private fun runCmd(vararg args: String): String {
+        val process = ProcessBuilder("/system/bin/cmd", *args).redirectErrorStream(true).start()
+        val output = process.inputStream.use { it.readBytes().decodeToString().trim() }
+        if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            throw java.io.IOException("cmd 超时: ${args.joinToString(" ")}")
+        }
+        if (process.exitValue() != 0) {
+            throw java.io.IOException(
+                "cmd 失败(exit=${process.exitValue()}): ${args.joinToString(" ")} -> ${output.take(200)}",
+            )
+        }
+        return output
     }
 
     private class Injector(
@@ -564,14 +1241,41 @@ class CarInputServiceImpl(
             fileLog("createDisplay $name ${width}x$height@$dpi start")
             // 关键：必须用「shell 包的 Context」——系统检查 packageName 与调用 uid(2000) 匹配，
             // 用本 app 的 Context 会报 SecurityException('packageName must match the owner uid')
-            val shellContext =
-                try {
-                    context.createPackageContext("com.android.shell", 0)
-                } catch (t: Throwable) {
-                    fileLog("createPackageContext(com.android.shell) 失败：$t，回退本 app context")
-                    context
-                }
             fileLog("ctx package=${shellContext.packageName}")
+            // VDM 路线优先（锁屏推流官方解）：gate（SDK/MAC/会话失败标记）通过 → 关联+虚拟设备
+            // 就绪 → 按 flags 候选表建屏。任何失败逐级落回下方 legacy DisplayManager 路径。
+            val vdm = obtainVdmSession()
+            if (vdm != null) {
+                val candidates =
+                    if (trusted) VirtualDeviceRoute.trustedFlagCandidates else VirtualDeviceRoute.dockFlagCandidates
+                var created: android.hardware.display.VirtualDisplay? = null
+                for (flags in candidates) {
+                    created =
+                        runCatching {
+                            vdm.createDisplay(name, width, height, dpi, surface, flags)
+                        }.onFailure {
+                            fileLog(
+                                "VDM: $name flags=0x${flags.toString(16)} 建屏失败：" +
+                                    describeCause(it),
+                            )
+                        }.getOrNull()
+                    if (created != null) break
+                }
+                val vd = created
+                if (vd != null) {
+                    val id = vd.display.displayId
+                    synchronized(virtualDisplays) { virtualDisplays[id] = vd }
+                    if (!keepDisplayAwake(id, "vdm create $name")) {
+                        fileLog("$name(id=$id) VDM 屏未获得 per-display 保活（依赖虚拟设备自身语义）")
+                    }
+                    if (trusted) applyImePolicyLocal(id)
+                    Log.i(TAG, "createDisplay $name id=$id (VDM) size=${width}x$height@$dpi")
+                    return id
+                }
+                // flags 全灭：本会话不再尝试 VDM（余屏避免重复失败），直接 legacy
+                vdmFailedThisSession = true
+                fileLog("VDM: $name 全部 flags 候选失败——本会话改走 legacy")
+            }
             val dm = shellContext.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
             // VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH = 1 << 6（@hide）：
             // 不声明时应用看到 "-touch" 配置（无触摸设备）→ 部分应用（如头条）
@@ -732,6 +1436,7 @@ class CarInputServiceImpl(
             return false
         }
         releaseDisplayKeepAwake(displayId)
+        synchronized(vdmLock) { vdmSession?.discard(displayId) }
         return try {
             vd.release()
             Log.i(TAG, "releaseDisplay id=$displayId")
@@ -911,7 +1616,9 @@ class CarInputServiceImpl(
 
     override fun diag(): String =
         "injector=" + (injector?.let { "${it.receiver.javaClass.name} ${it.method}" } ?: "null") +
-            " setDisplayId=${setDisplayIdMethod != null}"
+            " setDisplayId=${setDisplayIdMethod != null}" +
+            " vdm=" + (vdmSession?.describe() ?: if (vdmFailedThisSession) "failed-this-session" else "off") +
+            " companionMac=${companionMac ?: "-"}"
 
     override fun pid(): Int = android.os.Process.myPid()
 
@@ -946,5 +1653,18 @@ class CarInputServiceImpl(
         private const val POWER_MODE_NORMAL = 2
 
         /** SurfaceControl 显示电源模式（@hide；AOSP 定义 OFF=0 / NORMAL=2，反射失败时兜底用）。 */
+
+        /** 伴侣关联的 shell 包名 + App Streaming 角色/画像（同一字符串，AOSP 定义）。 */
+        private const val CDM_PACKAGE = "com.android.shell"
+        private const val ROLE_APP_STREAMING = "android.app.role.COMPANION_DEVICE_APP_STREAMING"
+
+        /** Display.DEFAULT_DISPLAY_GROUP（@hide；AOSP 定义 = 0，主屏所在显示组）。 */
+        private const val DEFAULT_DISPLAY_GROUP = 0
+
+        /** IDisplayManager.requestDisplayPower 的 state 参数：2 = STATE_ON。 */
+        private const val REQUEST_POWER_STATE_ON = 2
+
+        /** 显示电源看门狗轮询周期。 */
+        private const val WATCHDOG_INTERVAL_MS = 3_000L
     }
 }

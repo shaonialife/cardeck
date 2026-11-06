@@ -367,6 +367,82 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   只保留暗幕。会话中切换经 `SessionController.applyScreenOffPreference` **立即收放**
   （车机屏可操作，不必等下次连接）。「显示」面板已套 ScrollView——车机内容区只有
   ~200dp 高，4 段内容不滚动会把最后一段裁掉。
+- **锁屏推流的正路：VirtualDeviceManager 路线已落地（0.1.28.56，2026-11；DiPlay 台链路
+  通路已真机打通，真休眠核心场景待验证）**：
+  legacy flags 挡不住「按电源键真休眠」的窗口表面剥离（2026-10-23 记录），per-display
+  亮屏锁（0.1.28.10）只覆盖一部分。走 **VirtualDeviceManager 官方路线**（Android 14+，
+  伴侣关联 + 虚拟设备），在 **UserService（shell uid）内闭环**实现：
+  ① `ICarInput.setCompanionDevice(btMac)` 每次建屏前传入链路对端 MAC
+  （`BtSessionGate.lastPeerAddress`，client/server 链路建立时写入；空 = 走 legacy）；
+  ② `VdmSession.ensure()`：反射 `ICompanionDeviceManager.getAssociations("com.android.shell",
+  userId)` 按 MAC+profile 复用关联，无则 ProcessBuilder 跑 `cmd companiondevice
+  associate`（**位置形** `associate <user> com.android.shell <mac> <profile> false`——
+  荣耀 SDK 37 实测可用；见下方命令面坑）+ 轮询 20×100ms 确认 + `role
+  get-role-holders/add-role-holder` 兜底；同 MAC 但 profile 不同的既有用户关联
+  **绝不复用，直接失败降级**；③ `VirtualDeviceParams.Builder setLockState(...)` +
+  `VirtualDeviceManager(IVirtualDeviceManager$Stub.asInterface(ServiceManager.getService(
+  "virtualdevice")), context).createVirtualDevice(assocId, params)`；④ `createDisplay`
+  入口 VDM 优先：受信屏 flags 候选 `1355→1354`（1354=实测可用组合
+  PRESENTATION|OWN_CONTENT_ONLY|SUPPORTS_TOUCH|DESTROY_CONTENT_ON_REMOVAL|TRUSTED；
+  **首选多带 PUBLIC**——VDM 屏默认私有，私有屏拒绝第三方 IME 窗口是 2026-10-17 定谳的
+  键盘坑；专属虚拟设备 IME 是后续可选项，未做），dock 屏首选 **1354（带 TRUSTED）**：
+  **本 ROM 上不在虚拟设备 display group 的 VDM 屏，锁屏后合成渲染会冻结**——窗口表面
+  活着（mHasSurface=true）、活动 RESUMED、显示电源 ON、注入派发成功（`input -d` 点
+  dock 图标能 LAUNCH），但画面停更成纯色条 → 用户视角即「锁屏后 dock 点不动」
+  （2026-11-06 真机定谳；曾试过非受信 + OWN_DISPLAY_GROUP + ALWAYS_UNLOCKED = 6474：
+  keyguard token 消失了但渲染照样冻结；DockActivity `am start -S` 重建也不能救）。
+  dock 带 TRUSTED 进设备组后与 grid/appHi/map 同待遇，锁屏中时钟照走、`topResumed`。
+  代价是第三方任务理论上可逃上 dock——dock 只承载自有 DockActivity，逃逸源基本不存在，
+  实测未见。降级候选保留非受信 6474 组合（ROM 拒绝受信 dock 时）。受信屏 flags 候选
+  `1355→1354` 的 PUBLIC 首选仅限 app/appHi/map（dock 无输入场景不加 PUBLIC），读回
+  displayGroupId 只作日志；建屏后照旧进 `virtualDisplays`
+  map + `keepDisplayAwake` + 受信屏 `applyImePolicyLocal`。⑤ `ICarInput.closeVirtualDevice()`
+  在 `VirtualLauncher.detach` 与建屏失败回退分支收口：余屏释放 → device.close →
+  **仅本次创建的关联才 disassociate**（复用的关联原样保留）→ role 丢失时回填。
+  降级链：SDK<34 / 无 MAC / 关联失败 / createVirtualDevice 失败 / flags 全灭 → 逐屏回
+  legacy（一行未改）。DiPlay 台实测（2026-11-06 真机验证）：四屏全部建在虚拟设备上、
+  触摸注入/keepAlive/地图启动全链路正常；**推流中按电源键真休眠 1 分钟，帧/音频/触摸/
+  keepAlive 全程持续，唤醒无缝恢复**（此前真休眠必冻结的根场景已消）；
+  **锁屏可点性（2026-11-06 真机定谳，三层机制层层剥离）**：① keyguard token（无
+  ALWAYS_UNLOCKED 豁免的屏会被掐停活动）——受信 VDM 屏系统自动豁免，已随 dock 升级
+  受信解决；② Display-off token（面板超时 ~6s 后落下）不随 `wakeUp`（只拉回电源
+  state）释放，须走 `IDisplayManager.requestDisplayPower(displayId, 2)`（经
+  DisplayPowerController 状态机 token 才被摘）；③ **合成渲染冻结**（终极根因）：
+  不在设备 display group 的 VDM 屏，锁屏后即使活动 RESUMED/电源 ON/token 全清，
+  画面也不更新（dock 条变纯色）——解法 = dock 带 TRUSTED 进设备组（见上文 dock flags）。
+  **SCREEN_OFF 广播在本 ROM 的 UserService 进程收不到**（只有注册行、历次无触发行）
+  ——补唤醒的兜底是 `startDisplayStateWatchdog`（持锁期间 3s 轮询 `Display.state`，
+  OFF/DOZE 即补踢 requestDisplayPower+wakeUp），不要依赖广播路径。
+  验证手段（锁屏中）：`dumpsys window displays` 各 Display 的 mSleeping/mAllSleepTokens、
+  `dumpsys activity activities` 的 DockActivity isSleeping/topResumedActivity、
+  **K40 测试台 screencap 看 dock 条是否仍在渲染**（时钟走秒 = 合成活着；桌面/网格
+  壁纸可用于视觉比对）。
+  断开收口的 closeVirtualDevice 释放路径已接（点「断开」看 `carinput_svc.log` 的
+  释放/收口行）。
+  **荣耀 Magic7 Pro（SDK 37）ROM 特有事实（2026-11-06 实测定谳）**：
+  ① `cmd companiondevice` **命令面大面积残废**：位置形 `associate` 可用；**旗标形
+  `--mac-address`（含 `=value` 形）解析全废**——抛「not a valid MAC address」**却仍会
+  用本机 BT MAC 创建一条垃圾关联**（危险：静默污染 CDM）；`disassociate` 无论
+  `--id`/`--mac-address`/无冒号格式**全部解析失败**，清理只能走 binder 反射
+  （`ICompanionDeviceManager.disassociate(int)`，旧签名 `(String,String)` 兜底）。
+  ② 常量名不是 AOSP 文档的 `LOCK_STATE_UNLOCKED` 而是 **`LOCK_STATE_ALWAYS_UNLOCKED=1`**
+  ——枚举 int 常量按候选名匹配（`VirtualDeviceRoute` 之外在 ensureDevice 里做），枚举
+  结果全量落日志（`VDM: VirtualDeviceParams 常量 …`）供判读。
+  ③ **`VirtualDeviceManager` 构造必须传自定义 AttributionSource 的 Context 包装**
+  （对照参考实现 k5——原以为是 belt-and-braces，实测是必需品）：createPackageContext
+  得到的 shell 包 Context `getAttributionSource()` 返回 null，直接 NPE
+  （`CarInputServiceImpl.AttributionContext`：`AttributionSource.Builder(uid)
+  .setPackageName("com.android.shell")`）。**排障铁律：VDM 失败日志必须根因解包再打**
+  （InvocationTargetException.message 恒 null，只打 message 会把真因吞成空串）。
+  ④ CDM 关联自带 role 授予：`associate` 带 app-streaming profile 后
+  `role get-role-holders` 立即可见 com.android.shell，无需手动 add。
+  **com.android.shell 名下的 CDM 关联是本应用的「命名空间」**（只能由 shell uid 创建）：
+  ensure 开头的清道夫按「profile 匹配但 MAC≠当前目标 → 清除」处理换车残留与命令面
+  bug 垃圾，其它 profile 只记日志不动。
+  **判读日志**：`/data/local/tmp/carinput_svc.log` 搜 `VDM:`（关联 id、lockState、
+  displayGroupId、flags 降级原因）；应用侧 `setCompanionDevice(...)` 行。
+  验证场景：推流中按电源键 → 车机持续出帧；断开 → 本次创建的关联已清、复用的留存。
+  UserService 进程死亡时虚拟设备/屏随进程回收，关联持久化留待复用——非泄漏。
 - **上车自动连接（ACL 广播唤醒，2026-10-23，详见 `docs/AUTO-CONNECT.md`）**：
   `bt/CarBluetoothReceiver` 以**清单静态接收器**监听 `ACTION_ACL_CONNECTED/DISCONNECTED`
   ——这两个在[隐式广播例外清单](https://developer.android.com/develop/background-work/background-tasks/broadcasts/broadcast-exceptions)

@@ -125,6 +125,8 @@ class Iap2BluetoothServer(
                 continue
             }
             log("BT: 接收端已连入 name=$peerName，开始 iAP2 发送端会话")
+            // 记录对端地址：VirtualDeviceManager 伴侣关联按它绑定车机（自动模式下唯一可信来源）
+            BtSessionGate.lastPeerAddress = peerAddress
             Thread({ runSession(socket) }, "iap2-bt-session").apply {
                 isDaemon = true
                 start()

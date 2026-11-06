@@ -181,8 +181,8 @@ L3 对每条**纯 SYN 都回 SYN|ACK**、SYN|ACK 用新序号、同参数重复 
 
 我们的路线是 Shizuku 反射 `DisplayManager.createVirtualDisplay` + 手打
 PUBLIC/TRUSTED/ALWAYS_UNLOCKED/OWN_DISPLAY_GROUP 四个 flag + `setDisplayImePolicy`
-反射；真休眠时窗口表面仍会被剥离（AGENTS.md 2026-10-23 已记）。参考实现走的是
-**VirtualDeviceManager**（`reference/third-party-app/…/C0004a3.java`，Android 34+）：
+反射；真休眠时窗口表面仍会被剥离（AGENTS.md 2026-10-23 已记）。正路是
+**VirtualDeviceManager**（Android 34+ 官方 API）：
 
 1. **建关联**：`cmd companiondevice associate <user> com.android.shell <车机BT MAC>
    android.app.role.COMPANION_DEVICE_APP_STREAMING false`——以 shell 包名与车机
@@ -191,9 +191,9 @@ PUBLIC/TRUSTED/ALWAYS_UNLOCKED/OWN_DISPLAY_GROUP 四个 flag + `setDisplayImePol
    还给 com.android.shell）。
 2. **建虚拟设备**：反射 `VirtualDeviceManager.createVirtualDevice(assocId, params)`，
    `VirtualDeviceParams.Builder().setLockState(1)`（**LOCK_STATE_ALWAYS_UNLOCKED——
-   官方字段，整台虚拟设备所有窗口无视主机锁屏**）+ `setName("CarDroid")` +
-   `setInputMethodComponent(CarInputMethodService)`（**虚拟设备专属 IME**——虚拟屏
-   键盘的官方解法，替代我们 setDisplayImePolicy(LOCAL) 反射；设置失败则无 IME 重建）。
+   官方字段，整台虚拟设备所有窗口无视主机锁屏**）+ 自有设备命名 +
+   （可选）`setInputMethodComponent`（**虚拟设备专属 IME**——虚拟屏键盘的官方解法，
+   替代我们 setDisplayImePolicy(LOCAL) 反射；设置失败则无 IME 重建）。
 3. **建屏**：`virtualDevice.createVirtualDisplay(...)`，flags 1354（无 PUBLIC/
    TRUSTED/ALWAYS_UNLOCKED——VDM 屏天然对外+受信+锁屏豁免），读回 displayGroupId
    确认独立 display group。
@@ -242,6 +242,64 @@ per-display wakeUp 的权限语义）内闭环，零 AIDL/应用侧改动：
 验证判据（UserService 日志 /data/local/tmp/carinput_svc.log）：
 「per-display 保活就绪」「per-display 亮屏锁已持有（create …）」
 「wakeUp 已发（SCREEN_OFF…）」；现象判据：推流中按电源键，车机画面不再冻结。
+
+### §H 落地（二）：VirtualDeviceManager 路线全量实现（0.1.28.56，2026-11-06，待真机验证）
+
+按本节 1~5 步全量落地（此前只做了第 4 步 per-display 保活）。实现要点与参考实现的
+差异清单（其余照抄）：
+
+- **全部收口在 CarInputServiceImpl（UserService）**，应用侧只加两个 AIDL 方法：
+  `setCompanionDevice(btMac)`（每次建屏前传链路对端 MAC，来源
+  `BtSessionGate.lastPeerAddress`——出站连接成功/入站连入时写入）与
+  `closeVirtualDevice()`（VirtualLauncher.detach 与建屏失败回退分支调用）。
+- **关联**：先按 MAC+profile 复用 `getAssociations` 既有关联，无则
+  `cmd companiondevice associate`（UserService 内 ProcessBuilder 直跑——本进程就是
+  shell uid，无需 Shizuku 转发）+ 轮询确认；**stderr 合并读取**（cmd 参数面随 ROM
+  变化，荣耀 SDK 37 未实测，失败即降级 legacy 并留痕）。
+- **同 MAC 不同 profile 的既有用户关联：绝不复用/改写，直接失败降级**（参考实现
+  同款「existing association profile differs」）。
+- **flags 分两套**：受信屏 `1355→1354` 候选（参考只用 1354；我们首选加 PUBLIC 是
+  为了键盘——VDM 屏默认私有，私有屏拒绝第三方 IME 窗口，2026-10-17 定谳；参考实现
+  靠 `setInputMethodComponent` 虚拟设备专属 IME 解决同一问题，我们暂不引入 IME，
+  保留现有 `setDisplayImePolicy(LOCAL)` 反射，失败只退化键盘不退化推流）；dock 屏
+  `330`（无 TRUSTED/PUBLIC——保「第三方任务逃不上来」语义）。
+- **建屏后**照旧：`virtualDisplays` map（resize/release 复用）+ per-display 亮屏锁
+  （第 4 步已有）+ 受信屏 IME LOCAL。
+- **收口**：`closeVirtualDevice` = 余屏释放 → `device.close()` → **仅本次创建的
+  关联 disassociate**（复用的用户级关联原样保留）→ role 丢失回填（参考 close 同款）。
+  进程死亡：虚拟设备/屏随进程回收（VDM 系统侧代管），关联持久化留待下次复用——非泄漏。
+- **降级链**（逐屏，legacy 一行未改）：SDK<34 / MAC 空 / 关联或设备失败（本会话禁用
+  VDM）/ flags 全灭（本会话禁用）→ DisplayManager 1354 组合原路径。
+- 单测 `VirtualDeviceRouteTest`（flags 候选表 / gate / role 输出分词比对）。
+- 验证判据：`carinput_svc.log` 搜 `VDM:`（关联 id → 虚拟设备已创建 lockState=1 →
+  `#N displayGroupId=X（独立组 ✓）`）；现象判据 = 推流中按电源键车机持续出帧、
+  断开后 `dumpsys companion` 关联已清（本次创建的）。
+- 已知取舍：首个 createDisplay 会一次性承担关联+设备创建 ~1-3s（复用时 ~0.1s）；
+  若真机显示首帧明显推迟，优化入口 = `setCompanionDevice` 阶段提前 ensure。
+
+### §H 落地（二）续：荣耀真机联调定谳（2026-11-06，DiPlay 台）
+
+通路已真机打通（关联复用/清道夫/虚拟设备创建 lockState=1/四屏建设备上/触摸·keepAlive·
+地图启动全链路正常），过程中修正三处对参考实现的假设：
+
+1. **k5 ContextWrapper 是必需品**（原判「belt-and-braces」错误）：`VirtualDeviceManager`
+   构造要取 `context.getAttributionSource()`，createPackageContext 的 shell 包 Context
+   该值为 null → NPE。已实现同款 `AttributionContext`。
+2. **ROM 常量名 `LOCK_STATE_ALWAYS_UNLOCKED=1`**（非 AOSP 文档名
+   `LOCK_STATE_UNLOCKED`）→ 枚举常量按候选名匹配 + 全量落日志。
+3. **`cmd companiondevice` 命令面在荣耀上残废**：旗标形 associate 抛异常却仍建
+   「本机 MAC」垃圾关联（实测发生，靠清道夫回收）；disassociate 全格式解析失败 →
+   清理走 binder。**位置形 associate 可用**（= 参考实现所用形式，我们改为主选）。
+   另实测：CDM 关联创建时自动授予对应 role（无需手动 add-role-holder）。
+4. **displayGroupId 组归属是确定行为，非竞态**：带 TRUSTED 的屏被系统挪进虚拟设备
+   自己的 display group；不带 TRUSTED 的 dock 留在默认组——**真休眠实测 dock 照样
+   state ON、帧照出**（per-display 亮屏锁 + VDM 电源语义兜住），读回只作日志。
+5. 排障方法教训：VDM 反射链失败的日志**必须根因解包**——首轮真机失败日志只打了
+   InvocationTargetException.message（恒 null），差点归因成「ROM 不支持」。
+
+**真休眠核心场景已真机验证（2026-11-06）**：推流中按电源键休眠 1 分钟——帧/音频/
+触摸/keepAlive 全程持续，dumpsys 证实物理屏已灭而四块虚拟屏 state=ON，唤醒无缝恢复。
+待验证：断开收口后 CDM 列表状态（复用的关联按设计保留）。
 
 ### §G 增补：DiPlay 首测（2026-10-26 17:15，修正前）
 
