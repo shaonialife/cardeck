@@ -5,6 +5,7 @@ import android.content.Context
 import android.hardware.input.InputManager
 import android.os.Build
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -931,6 +932,158 @@ class CarInputServiceImpl(
             )
         }
         return output
+    }
+
+    // ---- 车机音频采集（REMOTE_SUBMIX，免投屏链路）----
+
+    /** 单活动采集实例（submix 输入激活期间系统把媒体策略整体路由走）。 */
+    @Volatile
+    private var submixCapture: SubmixCapture? = null
+
+    private val submixLock = Any()
+
+    override fun startSubmixAudio(sampleRate: Int): ParcelFileDescriptor? =
+        try {
+            synchronized(submixLock) {
+                submixCapture?.close()
+                SubmixCapture(sampleRate)
+                    .also { capture ->
+                        submixCapture = capture
+                        fileLog("SUBMIX: 采集就绪 ${capture.describe()}")
+                    }.openPipe()
+            }
+        } catch (t: Throwable) {
+            synchronized(submixLock) {
+                runCatching { submixCapture?.close() }
+                submixCapture = null
+            }
+            fileLog("SUBMIX: 启动失败（应用侧将回退播放捕获）：${describeCause(t)}")
+            null
+        }
+
+    override fun stopSubmixAudio() {
+        synchronized(submixLock) {
+            submixCapture?.close()
+            submixCapture = null
+        }
+    }
+
+    /**
+     * REMOTE_SUBMIX 采集（audioSource=8，shell uid 持 CAPTURE_AUDIO_OUTPUT，免
+     * MediaProjection/投屏授权链）：submix 输入激活时 AudioPolicy 把媒体策略整体
+     * 路由走——手机本地自然静音（**不动音量条**），采样随 SETUP 协商值。
+     * PCM16LE 立体声经管道回传应用侧；应用读端断开（断开/崩溃）时泵线程写管道
+     * 失败自愈关闭，媒体路由随之恢复，不留孤儿采集。
+     *
+     * MissingPermission/WrongConstant 豁免：本类只运行在 Shizuku UserService
+     * （shell uid 2000，持 CAPTURE_AUDIO_OUTPUT/RECORD_AUDIO 系统授权），不受应用
+     * 运行时权限模型约束；REMOTE_SUBMIX=8 是 @hide 常量（公开 IntDef 不含），
+     * 与文件内虚拟屏 flags 的 WrongConstant 同例——lint 按应用进程判定，此处豁免。
+     */
+    @android.annotation.SuppressLint("MissingPermission", "WrongConstant")
+    private inner class SubmixCapture(
+        sampleRate: Int,
+    ) {
+        private val record: android.media.AudioRecord
+        private var pipeWrite: ParcelFileDescriptor? = null
+        private var pump: Thread? = null
+        private val closed =
+            java.util.concurrent.atomic
+                .AtomicBoolean(false)
+
+        init {
+            val format =
+                android.media.AudioFormat
+                    .Builder()
+                    .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(android.media.AudioFormat.CHANNEL_IN_STEREO)
+                    .build()
+            val minBuffer = android.media.AudioRecord.getMinBufferSize(sampleRate, 12, 2)
+            if (minBuffer <= 0) throw java.io.IOException("submix buffer unavailable ($minBuffer)")
+            val builder =
+                android.media.AudioRecord
+                    .Builder()
+                    .setAudioSource(8) // MediaRecorder.AudioSource.REMOTE_SUBMIX
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(maxOf(minBuffer * 4, 16_384))
+            // AudioRecord.Builder.setContext 是 hidden API（部分 ROM 可用）：带 shell
+            // AttributionSource 提升初始化成功率；失败无妨（uid 已是 2000）
+            runCatching {
+                android.media.AudioRecord
+                    .Builder::class.java
+                    .getMethod("setContext", Context::class.java)
+                    .invoke(builder, AttributionContext(shellContext))
+            }
+            val created =
+                try {
+                    builder.build()
+                } catch (t: Throwable) {
+                    throw java.io.IOException("submix AudioRecord build: ${t.message}")
+                }
+            if (created.state != android.media.AudioRecord.STATE_INITIALIZED) {
+                runCatching { created.release() }
+                throw java.io.IOException("submix not initialized (state=${created.state})")
+            }
+            record = created
+        }
+
+        fun describe(): String = "rate=${record.sampleRate} buffer=${record.bufferSizeInFrames}f state=${record.state}"
+
+        /** 新建管道并确保采集在跑；返回读端给应用。 */
+        @Synchronized
+        fun openPipe(): ParcelFileDescriptor {
+            if (closed.get()) throw java.io.IOException("submix capture closed")
+            val pipe = ParcelFileDescriptor.createPipe()
+            if (record.recordingState != android.media.AudioRecord.RECORDSTATE_RECORDING) {
+                record.startRecording()
+                if (record.recordingState != android.media.AudioRecord.RECORDSTATE_RECORDING) {
+                    runCatching { pipe[0].close() }
+                    runCatching { pipe[1].close() }
+                    throw java.io.IOException("submix not recording (state=${record.recordingState})")
+                }
+            }
+            pipeWrite = pipe[1]
+            pump =
+                Thread(
+                    {
+                        runCatching {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                        }
+                        try {
+                            ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
+                                val frameBytes = record.sampleRate / 50 * 4 // 20ms 一写（立体声 16bit）
+                                val buffer = ByteArray(frameBytes)
+                                while (!closed.get()) {
+                                    val read = record.read(buffer, 0, frameBytes, android.media.AudioRecord.READ_BLOCKING)
+                                    if (read <= 0) continue // 瞬态（无新数据），继续阻塞读
+                                    // 整段写出：应用读端断开时抛 IOException → 自愈关闭
+                                    out.write(buffer, 0, read)
+                                }
+                            }
+                        } catch (_: Throwable) {
+                            // 应用读端关闭（断开/崩溃）——自愈收口，媒体路由随之恢复
+                            runCatching { close() }
+                        }
+                    },
+                    "cardeck-submix",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
+            return pipe[0]
+        }
+
+        fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            runCatching { record.stop() }
+            runCatching { record.release() }
+            // 管道写端随 close 关闭 → 泵线程 write 抛异常退出；AutoCloseOutputStream
+            // 已托管写端 fd，此处只做幂等兜底
+            runCatching { pipeWrite?.close() }
+            pipeWrite = null
+            pump = null
+        }
     }
 
     private class Injector(

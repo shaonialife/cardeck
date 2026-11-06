@@ -1777,14 +1777,6 @@ object SessionController {
             appendLog("AUDIO: 无接收端可用地址，跳过音频通道")
             return false
         }
-        val projection = CarPlayService.mediaProjection
-        if (projection == null) {
-            appendLog(
-                "AUDIO: 缺少投屏权限（播放捕获依赖 MediaProjection）——音频通道未启动。" +
-                    "现在点「申请投屏权限」也可即时补启（无需重连）；注意「断开连接」会停服务并连带失效投屏授权",
-            )
-            return false
-        }
         return try {
             // 音频封装参数已定案（见 AudioTuning），不再提供切换
             val tuning = AudioTuning.RAW_SPF
@@ -1816,6 +1808,20 @@ object SessionController {
                 appendLog("AUDIO: 全部候选档位协商失败（共 ${ordered.size} 档）——本次仅推视频")
                 return false
             }
+            // 首选 REMOTE_SUBMIX 采集（shell UserService，免投屏授权链）：submix 输入
+            // 激活时系统把媒体策略整体路由走——手机本地自然静音，**音量条不动**；
+            // 不可用（服务未绑/ROM 拒绝）回退投影播放捕获（旧行为：需 MediaProjection
+            // + 会话中静音手机媒体音量）
+            val submixService = CarInputClient.service
+            val submixFd =
+                submixService?.let { service ->
+                    runCatching { service.startSubmixAudio(audio.sampleRate) }
+                        .onFailure { appendLog("AUDIO: REMOTE_SUBMIX 启动异常：${it.message}") }
+                        .getOrNull()
+                }
+            if (submixFd != null) {
+                appendLog("AUDIO: 采集走 REMOTE_SUBMIX（免投屏链路，手机音量条不动）")
+            }
             val sender =
                 AudioSender(
                     host = host,
@@ -1836,8 +1842,30 @@ object SessionController {
             // 音频路由抢占自愈（2026-10-26 荣耀实测：耳机 X7e 抢占 A2DP 后，
             // 采集全零、推给车机的是静音流——用户视角「车机没声音了」）
             sender.onRouteHijackSuspect = { maybeReclaimAudioRoute() }
-            if (!sender.start(projection)) {
+            // submix 模式收口：释放 UserService 侧 AudioRecord（幂等；即使本回调
+            // 丢失，泵线程检测到读端关闭也会自愈）
+            sender.onStopped = { runCatching { CarInputClient.service?.stopSubmixAudio() } }
+            val started =
+                if (submixFd != null) {
+                    sender.start(android.os.ParcelFileDescriptor.AutoCloseInputStream(submixFd))
+                } else {
+                    val projection = CarPlayService.mediaProjection
+                    if (projection == null) {
+                        appendLog(
+                            "AUDIO: REMOTE_SUBMIX 不可用且缺少投屏权限（播放捕获依赖 MediaProjection）" +
+                                "——音频通道未启动。现在点「申请投屏权限」也可即时补启（无需重连）；" +
+                                "注意「断开连接」会停服务并连带失效投屏授权",
+                        )
+                        false
+                    } else {
+                        appendLog("AUDIO: REMOTE_SUBMIX 不可用——回退投影播放捕获（会话中静音手机媒体音量）")
+                        sender.start(projection)
+                    }
+                }
+            if (!started) {
                 audioSender = null
+                // 未成功进入采集循环也显式收口（stop 已触发 onStopped，此处幂等兜底）
+                runCatching { submixService?.stopSubmixAudio() }
                 false
             } else {
                 true
@@ -1845,6 +1873,7 @@ object SessionController {
         } catch (error: Exception) {
             appendLog("AUDIO: 通道启动异常 - ${error.message}")
             audioSender = null
+            runCatching { CarInputClient.service?.stopSubmixAudio() }
             false
         }
     }

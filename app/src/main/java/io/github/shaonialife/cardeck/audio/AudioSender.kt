@@ -7,6 +7,7 @@ import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.io.IOException
+import java.io.InputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -84,6 +85,20 @@ class AudioSender(
 
         /** 静音前媒体音量的持久化键（进程被杀也不丢恢复目标）。 */
         private const val KEY_SAVED_VOLUME = "audio_saved_media_volume"
+
+        /** 从流里读满一个整帧；EOF 返回 false（残包/断流都视为结束）。internal：单测直测。 */
+        internal fun readFully(
+            stream: InputStream,
+            buffer: ByteArray,
+        ): Boolean {
+            var offset = 0
+            while (offset < buffer.size) {
+                val n = stream.read(buffer, offset, buffer.size - offset)
+                if (n < 0) return false
+                offset += n
+            }
+            return true
+        }
     }
 
     private val running = AtomicBoolean(false)
@@ -144,6 +159,21 @@ class AudioSender(
 
     /** 静音前的手机媒体音量 index（-1 = 未静音）。 */
     private var mutedOriginalVolume = -1
+
+    /**
+     * REMOTE_SUBMIX 采集流（shell UserService 经管道回传的 PCM16LE 立体声）。
+     * 非 null 时走 submix 路径：**不劫持手机音量条**（submix 输入激活时系统把媒体
+     * 策略整体路由走，手机本地自然静音），也不需要 MediaProjection。null = 投影
+     * 播放捕获路径（回退）。
+     */
+    @Volatile
+    private var submixStream: InputStream? = null
+
+    /**
+     * 停止回调（宿主收口用）：submix 模式下宿主借此调用 stopSubmixAudio 释放
+     * UserService 侧采集；即使回调丢失，应用读端关闭也会让泵线程自愈。
+     */
+    var onStopped: (() -> Unit)? = null
 
     /**
      * 静音手机媒体输出：音频通道激活后声音只从车机出（真 CarPlay 行为）。
@@ -217,10 +247,52 @@ class AudioSender(
     }
 
     /**
-     * 启动音频发送。需要 MediaProjection（AudioPlaybackCapture 的授权来源）。
-     * 返回是否成功进入采集循环。
+     * 启动音频发送（投影播放捕获路径——**回退**）：需要 MediaProjection。
+     * 首选路径见 [start]（REMOTE_SUBMIX）。返回是否成功进入采集循环。
      */
     fun start(projection: MediaProjection): Boolean {
+        if (running.get()) return true
+        stopped.set(false)
+        val captureConfig = buildCaptureConfig(projection)
+        val audioFormat =
+            AudioFormat
+                .Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build()
+        val recorder =
+            try {
+                AudioRecord
+                    .Builder()
+                    .setAudioPlaybackCaptureConfig(captureConfig)
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(framePcmBytes * 8)
+                    .build()
+            } catch (error: Exception) {
+                log("AUDIO: 播放捕获初始化失败 - ${error.message}")
+                return false
+            }
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            log("AUDIO: AudioRecord 初始化失败（state=${recorder.state}）")
+            runCatching { recorder.release() }
+            return false
+        }
+        return startCommon(recorder)
+    }
+
+    /**
+     * 启动音频发送（**首选**：REMOTE_SUBMIX 流——shell UserService 经管道回传的
+     * PCM16LE 立体声）。不依赖 MediaProjection，也**不劫持手机音量条**：submix
+     * 输入激活时系统把媒体策略整体路由走，手机本地自然静音。
+     */
+    fun start(stream: InputStream): Boolean = startCommon(submixStream = stream)
+
+    /** 共用启动：socket/AAC 编码器/同步包/采集线程。record 与 submixStream 二选一。 */
+    private fun startCommon(
+        record: AudioRecord? = null,
+        submixStream: InputStream? = null,
+    ): Boolean {
         if (running.get()) return true
         stopped.set(false)
         return try {
@@ -239,35 +311,21 @@ class AudioSender(
                 aacEncoder = encoder
             }
 
-            val captureConfig = buildCaptureConfig(projection)
-            val audioFormat =
-                AudioFormat
-                    .Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                    .build()
-            val recorder =
-                AudioRecord
-                    .Builder()
-                    .setAudioPlaybackCaptureConfig(captureConfig)
-                    .setAudioFormat(audioFormat)
-                    .setBufferSizeInBytes(framePcmBytes * 8)
-                    .build()
-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                log("AUDIO: AudioRecord 初始化失败（state=${recorder.state}）")
-                runCatching { recorder.release() }
-                aacEncoder?.stop()
-                aacEncoder = null
-                client.close()
-                socket = null
-                return false
+            if (record != null) {
+                this.record = record
+                this.submixStream = null
+                running.set(true)
+                // 音频通道激活后声音只从车机出（真 CarPlay 行为）：播放捕获取自
+                // REMOTE_SUBMIX（音量应用点之前），静音手机不影响捕获数据
+                mutePhoneMedia()
+            } else {
+                this.submixStream = submixStream
+                running.set(true)
             }
-            record = recorder
-            running.set(true)
-            mutePhoneMedia()
+            val sourceDesc =
+                if (record != null) "播放捕获 ${sampleRate}Hz 立体声" else "REMOTE_SUBMIX ${sampleRate}Hz（音量条不动）"
             log(
-                "AUDIO: 已启动（播放捕获 ${sampleRate}Hz 立体声 → $host:$dataPort，" +
+                "AUDIO: 已启动（$sourceDesc → $host:$dataPort，" +
                     "通路=t$streamType/${codec.name}，" +
                     if (codec == AudioCodec.AAC_LC) {
                         "每包 1 个 AAC 帧（${AacLcEncoder.FRAME_SAMPLES} 采样" +
@@ -282,12 +340,14 @@ class AudioSender(
 
             Thread(
                 {
-                    try {
-                        recorder.startRecording()
-                    } catch (error: Exception) {
-                        log("AUDIO: 启动采集失败 - ${error.message}")
-                        stop()
-                        return@Thread
+                    if (record != null) {
+                        try {
+                            record.startRecording()
+                        } catch (error: Exception) {
+                            log("AUDIO: 启动采集失败 - ${error.message}")
+                            stop()
+                            return@Thread
+                        }
                     }
                     runCaptureLoop()
                 },
@@ -315,6 +375,9 @@ class AudioSender(
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return
         running.set(false)
+        val wasSubmix = submixStream != null
+        runCatching { submixStream?.close() }
+        submixStream = null
         runCatching { record?.stop() }
         runCatching { record?.release() }
         record = null
@@ -326,7 +389,11 @@ class AudioSender(
         syncSocket = null
         syncThread = null
         thread = null
-        restorePhoneMedia()
+        if (!wasSubmix) restorePhoneMedia()
+        // 宿主收口（submix 模式释放 UserService 侧 AudioRecord，媒体路由随之恢复）；
+        // 即使回调丢失，泵线程检测到读端关闭也会自愈
+        runCatching { onStopped?.invoke() }
+        onStopped = null
         log("AUDIO: 已停止（共发 $packetsSent 包 / ${bytesSent / 1024}KB）")
     }
 
@@ -404,7 +471,9 @@ class AudioSender(
     // ---- 采集循环 → 封包发送 ----
 
     private fun runCaptureLoop() {
-        val recorder = record ?: return
+        val recorder = record
+        val stream = submixStream
+        if (recorder == null && stream == null) return
         val frameBytes = framePcmBytes
         val pcm = ByteArray(frameBytes)
         // 诊断抽样节拍：PCM 约 125 包/s（每 20s 一次）；AAC 约 47 帧/s
@@ -412,12 +481,23 @@ class AudioSender(
         try {
             while (running.get()) {
                 val read =
-                    try {
-                        recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
-                    } catch (error: Exception) {
-                        log("AUDIO: 采集读取异常 - ${error.message}")
-                        break
+                    when {
+                        stream != null ->
+                            // 管道流：读满一帧才发（EOF = 采集端关闭，正常结束）
+                            if (readFully(stream, pcm)) pcm.size else Int.MIN_VALUE
+                        recorder != null ->
+                            try {
+                                recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
+                            } catch (error: Exception) {
+                                log("AUDIO: 采集读取异常 - ${error.message}")
+                                break
+                            }
+                        else -> break
                     }
+                if (read == Int.MIN_VALUE) {
+                    log("AUDIO: submix 流已结束（读端关闭/采集停止）")
+                    break
+                }
                 if (read < 0) {
                     readFailures++
                     if (readFailures == 1 || readFailures % 100 == 0) {

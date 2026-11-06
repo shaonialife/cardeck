@@ -1056,6 +1056,22 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   序号）。两条踩坑：**裸 ACK 会与 SYN|ACK 撞号**（故主机路径只回 SYN|ACK，Audi
   帧序随之从「裸 ACK+SYN|ACK」变为单帧，需复测）；**不能对所有带 SYN 位的帧都回**
   （会与对端的 SYN|ACK 形成无限乒乓，单测曾因此空转 55 秒，只有 `jstack` 能看出）。
+- **车机音频采集：REMOTE_SUBMIX 直采（0.1.28.59，首选）→ 投影播放捕获（回退）**：
+  旧路径 `AudioPlaybackCapture` 依赖投屏授权链且会话中强制手机媒体音量=0（断开恢复，
+  音量条被劫持）。现首选走 **shell UserService 内 `AudioRecord(audioSource=8
+  /*REMOTE_SUBMIX*/)` + `ParcelFileDescriptor.createPipe()`**：PCM16LE 立体声经管道
+  AIDL 回传（`startSubmixAudio(sampleRate)`/`stopSubmixAudio()`），应用侧从管道读满
+  帧喂既有 RTP 管线。**静音原理 = submix 输入激活时 AudioPolicy 把媒体策略整体路由
+  走——手机本地自然静音、音量条不动**（与「音量置零」有本质区别：置零只压播放端，
+  路由换整条策略）。要点：① shell uid 持 CAPTURE_AUDIO_OUTPUT，无需 MediaProjection
+  （视频镜像的投影授权照旧）；② `AudioRecord.Builder.setContext` 是 hidden API，
+  反射带 AttributionContext 包装（`AttributionContext`，与 VDM 共用），失败仅降级；
+  ③ 泵线程写管道失败（应用断开/崩溃）即自愈关闭采集——媒体路由随之恢复，不留孤儿
+  （否则 submix 挂着手机媒体全程静音）；④ 采样率随 SETUP 协商值（48k/44.1k）；
+  ⑤ 通话（STRATEGY_PHONE）不受路由影响，导航播报随媒体一并路由；⑥ 收口两端：
+  `AudioSender.onStopped` → `stopSubmixAudio`（幂等）+ 泵线程自愈。验证手段：日志
+  「AUDIO: 已启动（REMOTE_SUBMIX…）」且**无**「已静音手机媒体输出」行；推流中手机
+  媒体音量键调音量条可动；断开后手机本地音频立即恢复。
 - **会话中音频路由被蓝牙设备抢占 → 推静音流（2026-10-26 荣耀+6318 定谳）**：耳机
   （X7e）或车机 A2DP 回连后，手机媒体输出切去蓝牙，AudioPlaybackCapture 采不到
   （诊断行「采集样本 非零0%」持续）、推给车机的就是静音流——用户报「车机没声音了」，

@@ -2,6 +2,7 @@
 // 相比每次 spawn `input` 命令（约 200-400ms），injectInputEvent 直连系统服务。
 package io.github.shaonialife.cardeck.shizuku;
 
+import android.os.ParcelFileDescriptor;
 import android.view.Surface;
 
 interface ICarInput {
@@ -39,6 +40,15 @@ interface ICarInput {
     // 会话结束收口：释放虚拟设备上残余的屏 → device.close → disassociate（仅当
     // 关联是本轮创建的；已有的用户级关联复用后原样保留）→ role 兜底回填。
     boolean closeVirtualDevice();
+
+    // 车机音频采集（REMOTE_SUBMIX，shell 权限，免投屏授权链）：submix 输入激活时
+    // 系统把媒体策略整体路由走——手机本地自然静音（音量条不动），采样率随 SETUP
+    // 协商值（48k/44.1k）。返回管道读端（PCM16LE 立体声连续流），应用侧读满帧即用。
+    // 已有实例在跑则停旧建新（单活动实例）。
+    ParcelFileDescriptor startSubmixAudio(int sampleRate);
+
+    // 音频采集收口（幂等）：AudioRecord stop/release + 管道关闭，媒体路由随之恢复。
+    void stopSubmixAudio();
 
     // 物理主屏硬件电源（SurfaceControl.setDisplayPowerMode）：false=断电（真息屏），
     // true=恢复点亮。系统逻辑上仍保持唤醒（不锁屏、不进 Doze），虚拟屏照常渲染。
