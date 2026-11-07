@@ -1008,7 +1008,16 @@ class AirPlayLink(
                             "timingPort=${pendingSetupInfo!!.timingPort} " +
                             "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
                     )
-                    // G6：offset 已记录；屏幕锚消费待真车证伪后再接
+                    // G6：屏幕锚消费——NTP 客户端 offset（raw，fw 未除 2 语义）；
+                    // 只在样本存在且 |offset|<2s 时应用，异常样本不污染时间戳。
+                    val off = timingServer.offsetSecs
+                    if (off.isFinite() && kotlin.math.abs(off) < 2.0) {
+                        ntpEpochAnchorSecs += Math.round(off)
+                        log("TIMING: 会话锚应用 offset=${String.format("%.6f", off)}s")
+                    } else {
+                        val shown = if (off.isFinite()) String.format("%.6f", off) else "NaN"
+                        log("TIMING: offset 未应用（offset=$shown）")
+                    }
                     // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者）
                     sock.soTimeout = 1_000
                     startSessionPump(handle, input, output)
