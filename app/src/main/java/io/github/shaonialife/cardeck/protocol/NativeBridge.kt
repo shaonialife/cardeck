@@ -605,6 +605,14 @@ object NativeBridge {
         announceJson: ByteArray,
     ): String?
 
+    /** 先发 `stup`，controlSetup 应答后自动切 SDP 序（fw 真实顺序）。 */
+    external fun nativeAirplayBeginSdpAfterControl(
+        handle: Long,
+        timingPort: Int,
+        controlPort: Int,
+        announceJson: ByteArray,
+    ): String?
+
     /** 发 ANNOUNCE（'annc'，SDP 文本体——fw: _sdpsession_sendAnnounce
      *  @0x22779ddd4 直切）。[paramsJson] = {"uuidU64":N,"localIp":"..",
      *  "ip6":B,"deviceName":"..","audioFormatBit":N,"authType":N,
