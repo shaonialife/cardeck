@@ -373,6 +373,14 @@ object NativeBridge {
     /** 会话收尾 TEARDOWN（fw: sendTeardownWithStreamDescArray；连接级空体）。 */
     external fun nativeAirplayTeardown(handle: Long): String?
 
+    /** 发 SETPEERS/SETPEERSX（fw: apsession_handlePeerListChangedNotification
+     *  @0x22784cf24；[bodyJson] = peer 列表 JSON → bplist）。 */
+    external fun nativeAirplaySendSetPeers(
+        handle: Long,
+        bodyJson: ByteArray,
+        extended: Int,
+    ): String?
+
     /** 发 FLUSH（fw: _carAudioStream_sendFlush @0x22775b8a4；
      *  体 {streamID, RTP-Info:"seq=%u;rtptime=%u"}）。 */
     external fun nativeAirplaySendFlush(
