@@ -65,6 +65,7 @@ class Iap2LinkChannel(
     @Volatile
     private var terminated = false
     private var readySignalled = false
+    private var lastEventPollMs = 0L
 
     /** 原生会话句柄（0 = 未创建）。 */
     @Volatile
@@ -198,6 +199,16 @@ class Iap2LinkChannel(
         while (!terminated) {
             if (handle == 0L) break
             val sleep = NativeBridge.nativeSessionTick(handle).coerceIn(1, 20).toLong()
+            val now = System.currentTimeMillis()
+            if (now - lastEventPollMs >= 1000) {
+                lastEventPollMs = now
+                for (kind in 0..4) {
+                    val ev = NativeBridge.nativeSessionTakeEvents(handle, kind)
+                    if (!ev.isNullOrEmpty() && !ev.contains("\"events\":[]")) {
+                        log("IAP2-EVT k=$kind " + ev.take(300))
+                    }
+                }
+            }
             if (!readySignalled && NativeBridge.nativeSessionLinkReady(handle) == 1) {
                 readySignalled = true
                 readyLatch.countDown()
