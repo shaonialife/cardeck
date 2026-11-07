@@ -48,6 +48,7 @@ class TimingServer(
         private set
 
     private var clientSamples = 0L
+    private var clientAttempts = 0L
 
     /** 收到的 timesync 请求计数（诊断：车机是否真的来同步媒体时钟）。 */
     private var syncRequests = 0L
@@ -108,6 +109,8 @@ class TimingServer(
             s.soTimeout = 1500
             clientSocket = s
             clientRunning = true
+            log("TIMING: 客户端启动 host=$host port=$port")
+            clientAttempts = 0
             clientThread =
                 Thread({ clientLoop(s, host, port) }, "airplay-timing-client").apply {
                     isDaemon = true
@@ -162,7 +165,10 @@ class TimingServer(
                     }
                 }
             } catch (_: SocketTimeoutException) {
-                // 车机未回；下一轮再试
+                clientAttempts++
+                if (clientAttempts <= 3) {
+                    log("TIMING: 客户端无应答 #$clientAttempts（car timingPort 未回——待 SETPEERS/网络时钟）")
+                }
             } catch (_: Exception) {
                 break
             }
