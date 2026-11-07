@@ -145,6 +145,9 @@ class AirPlayLink(
     @Volatile
     var cancelled: Boolean = false
 
+    /** G2 实验：SDP 序的本端 control 端口（仅 cardeck.sdp=1 时分配）。 */
+    private var sdpLocalPorts: SdpLocalPorts? = null
+
     /** 配对重试循环是否仍在跑（主控据此判断「晚到端点」应热更新还是忽略）。 */
     @Volatile
     var pairingInProgress: Boolean = false
@@ -966,7 +969,24 @@ class AirPlayLink(
             }
         }
         // 自动链启动（ANNOUNCE 参数 = 宿主平台数据：本机地址/UUID/设备名/键 IV）
-        NativeBridge.nativeAirplaySetupAuto(handle, buildAnnounceParams(sock).toByteArray())
+        val announce = buildAnnounceParams(sock).toByteArray()
+        if (System.getProperty("cardeck.sdp") == "1") {
+            // 实验开关：走固件 SDP 序（ANNOUNCE→ssdp→volume→RECORD）
+            val local = SdpLocalPorts.allocate()
+            sdpLocalPorts = local
+            log(
+                "AIRPLAY: SDP 序启动 timing=${timingServer.port} " +
+                    "control=${local?.controlPort ?: 0}",
+            )
+            NativeBridge.nativeAirplayBeginSdpAfterControl(
+                handle,
+                timingServer.port,
+                local?.controlPort ?: 0,
+                announce,
+            )
+        } else {
+            NativeBridge.nativeAirplaySetupAuto(handle, announce)
+        }
         drain()
         val buf = ByteArray(16 * 1024)
         val deadline = System.currentTimeMillis() + 30_000
