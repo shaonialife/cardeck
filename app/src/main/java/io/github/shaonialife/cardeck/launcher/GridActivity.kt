@@ -59,6 +59,9 @@ class GridActivity : AppCompatActivity() {
     /** 应用清单缓存（每次 resume 重扫 packageManager 会拖慢回桌面——仅在首次载入时扫描）。 */
     private var appsCache: List<VirtualLauncher.AppEntry>? = null
 
+    /** 首次冷缓存扫描是否在后台进行中（主线程只置位/清位）。 */
+    private var appsScanInFlight = false
+
     /** 壁纸背景层（对齐全流画布的切片；版本变化时后台换图）。 */
     private var wallpaperView: ImageView? = null
     private var wallpaperShownVersion = -1L
@@ -527,21 +530,35 @@ class GridActivity : AppCompatActivity() {
                 .coerceAtMost((cellWidthPx * 0.72f).toInt())
     }
 
-    /** 重新读取应用清单与桌面选择（首帧与每次回到桌面时调用）。 */
+    /** 重新读取应用清单与桌面选择（首帧与每次回到桌面时调用）。
+     *
+     *  **主线程禁止扫 PackageManager**：132 个应用的 queryIntentActivities +
+     *  loadLabel/loadIcon + 拼音排序在荣耀实测 2.7s（连接成功瞬间与虚拟屏首帧
+     *  重叠，手机页面卡死 3s 的根因）。冷缓存时先用「固定格 + 仪表盘」出首帧，
+     *  扫描切后台，完成后回主线程换表。 */
     private fun reload() {
-        val apps =
-            appsCache ?: run {
-                val scanned = VirtualLauncher.launchableApps(this)
-                // iconCache 供 dock 运行中图标使用：整表换新——dock 在另一块屏的主线程
-                // 并发读，clear+逐条写入共享 HashMap 无同步会损坏（坏味道审查 P1）
-                VirtualLauncher.replaceIconCache(
-                    scanned.associate { it.component to it.icon },
-                )
-                appsCache = scanned
+        val cached =
+            appsCache
+                ?: VirtualLauncher.peekCachedApps()?.also { appsCache = it }
+        if (cached == null && !appsScanInFlight) {
+            appsScanInFlight = true
+            Bg.run("apps-scan") {
+                val scanned = VirtualLauncher.cachedApps(this@GridActivity)
                 // 纳入进程级共享缓存：桌面扫过之后，车机设置首次打开即秒开
                 VirtualLauncher.adoptAppsCache(scanned)
-                scanned
+                runOnUiThread {
+                    // iconCache 供 dock 运行中图标使用：整表换新——dock 在另一块屏的
+                    // 主线程并发读，必须回主线程做（坏味道审查 P1）。
+                    VirtualLauncher.replaceIconCache(
+                        scanned.associate { it.component to it.icon },
+                    )
+                    appsCache = scanned
+                    appsScanInFlight = false
+                    reload()
+                }
             }
+        }
+        val apps = cached ?: emptyList()
 
         val selected = DesktopApps.selected(this, apps)
         val cells =

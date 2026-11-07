@@ -2066,8 +2066,15 @@ object VirtualLauncher {
     @Volatile
     private var appsCache: List<AppEntry>? = null
 
+    /** 扫描互斥：attach 后台与 GridActivity 首次载入可能同时命中冷缓存，
+     *  不加锁会重复扫两遍（各 130+ 应用 loadIcon，主线程合计可卡数秒）。 */
+    private val appsScanLock = Any()
+
     /** 应用清单缓存（桌面与车机设置共享；安装/卸载广播时失效）。 */
-    fun cachedApps(context: Context): List<AppEntry> = appsCache ?: scanLaunchableApps(context).also { appsCache = it }
+    fun cachedApps(context: Context): List<AppEntry> =
+        appsCache ?: synchronized(appsScanLock) {
+            appsCache ?: scanLaunchableApps(context).also { appsCache = it }
+        }
 
     /**
      * 仅读取共享缓存，**绝不扫描**：设置页等必须在主线程取列表的界面用这个，
