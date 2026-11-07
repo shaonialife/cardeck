@@ -994,6 +994,11 @@ class AirPlayLink(
                             "timingPort=${pendingSetupInfo!!.timingPort} " +
                             "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
                     )
+                    // G6：客户端态轮询车机 timingPort（offset 记录；消费待接）
+                    timingServer.startClient(
+                        sock.inetAddress.hostAddress ?: "",
+                        pendingSetupInfo!!.timingPort,
+                    )
                     // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者）
                     sock.soTimeout = 1_000
                     startSessionPump(handle, input, output)
