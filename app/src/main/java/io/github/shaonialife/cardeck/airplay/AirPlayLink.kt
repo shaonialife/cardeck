@@ -867,6 +867,25 @@ class AirPlayLink(
         params.put("localIp", ip)
         params.put("ip6", ip6)
         params.put("deviceName", android.os.Build.MODEL ?: "CarDeck")
+        // G4 平台 hook：认证类型与 KeyHolder 键/IV 由宿主提供（引擎不再伪造
+        // MFi 身份）。当前为旧 MFiSAP 兼容值；真 MFi 芯片接入时应替换为
+        // APSKeyHolderGetAuthenticationType / makeBase64EncodedKeyAndIV 的产物。
+        val rnd = java.security.SecureRandom()
+        val key = ByteArray(16).also { rnd.nextBytes(it) }
+        val iv = ByteArray(16).also { rnd.nextBytes(it) }
+        params.put("authType", 8)
+        params.put(
+            "aesKeyB64",
+            java.util.Base64
+                .getEncoder()
+                .encodeToString(key),
+        )
+        params.put(
+            "aesIvB64",
+            java.util.Base64
+                .getEncoder()
+                .encodeToString(iv),
+        )
         return params.toString()
     }
 
