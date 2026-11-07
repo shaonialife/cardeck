@@ -982,6 +982,12 @@ class AirPlayLink(
             if (event.isEmpty()) continue
             val json = org.json.JSONObject(event)
             when (json.optString("type")) {
+                "volume" -> {
+                    // G8：初始音量事件（SDP 序 GET /volume 回包；fw:
+                    // __NTPClock... 同层）——先记录，宿主音量执行面后续接。
+                    initialVolumeDb = json.optDouble("db", Double.NaN)
+                    log("AIRPLAY: 初始音量 db=$initialVolumeDb")
+                }
                 "controlSetup" -> {
                     controlJson = json
                     // G6：controlSetup 已给车机 timingPort——提前启动客户端轮询，
@@ -1719,6 +1725,11 @@ class AirPlayLink(
     /** 会话墙钟锚（NTP-1900 秒 @ 进程时钟零点；runFlow 每连接轮刷新）。 */
     @Volatile
     var ntpEpochAnchorSecs: Long = 0L
+        private set
+
+    /** G8：初始音量（dB；NaN = 未收到/未请求）。 */
+    @Volatile
+    var initialVolumeDb: Double = Double.NaN
         private set
 
     // ---- 身份持久化 ----
