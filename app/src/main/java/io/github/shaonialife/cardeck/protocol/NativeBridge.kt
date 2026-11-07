@@ -595,6 +595,16 @@ object NativeBridge {
         announceJson: ByteArray,
     ): String?
 
+    /** 固件 SDP 序（ANNOUNCE→ssdp→初始音量→RECORD；fw:
+     *  _sdpsession_setupStreamCreatingResponseInternal @0x22779d718）。
+     *  [timingPort]/[controlPort] = 本端 RTP/timing 端口（宿主分配）。 */
+    external fun nativeAirplayBeginSdpSequence(
+        handle: Long,
+        timingPort: Int,
+        controlPort: Int,
+        announceJson: ByteArray,
+    ): String?
+
     /** 发 ANNOUNCE（'annc'，SDP 文本体——fw: _sdpsession_sendAnnounce
      *  @0x22779ddd4 直切）。[paramsJson] = {"uuidU64":N,"localIp":"..",
      *  "ip6":B,"deviceName":"..","audioFormatBit":N,"authType":N,
