@@ -628,6 +628,9 @@ object NativeBridge {
         announceJson: ByteArray,
     ): String?
 
+    /** SDP 应答里的车机端口（空串 = 尚未收到；否则 {"serverPort","controlPort"}）。 */
+    external fun nativeAirplaySdpPorts(handle: Long): String?
+
     /** 发 ANNOUNCE（'annc'，SDP 文本体——fw: _sdpsession_sendAnnounce
      *  @0x22779ddd4 直切）。[paramsJson] = {"uuidU64":N,"localIp":"..",
      *  "ip6":B,"deviceName":"..","audioFormatBit":N,"authType":N,
