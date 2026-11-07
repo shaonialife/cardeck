@@ -84,6 +84,13 @@ object NativeBridge {
     /** 识别启动（链路就绪后调；0x1D00 → 0x1D01 → 0x1D02 全程固件链）。 */
     external fun nativeSessionStartIdentification(handle: Long): Int
 
+    /** 取走会话层入站事件（kind 0=hid/1=power/2=comm/3=feature/4=nowplaying；
+     *  返回 {"kind":N,"events":[{"msg":N,"params":[{"id":N,"data":[..]}]}]}）。 */
+    external fun nativeSessionTakeEvents(
+        handle: Long,
+        kind: Int,
+    ): String?
+
     /** 销毁会话（断开时调）。 */
     external fun nativeSessionDestroy(handle: Long)
 
