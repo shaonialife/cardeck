@@ -906,6 +906,58 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
   大包改走 `adb push + pm install`。
   几何推导集中在 `VirtualLauncher.dashSplitGeom` 纯函数（`DashSplitMathTest` 钉死
   四方一致性），改分屏相关代码勿在四处重新裸算。
+- **仪表盘右侧卡片 = 固定应用虚拟屏（2026-11-07 落地，0.1.28.63）**：设置→「仪表盘」
+  （原「默认地图」改名）可把右侧音乐卡替换为「固定应用」——独立虚拟屏
+  **CarPlayPinned**（密度=手机侧，px=卡片矩形×手机密度/200，复用
+  `mapDisplayGeometry` 换算），GL 合成进原音乐卡区域，音乐卡 View 隐藏
+  （GridActivity `pinnedCardActive` 闸）。跨会话结论：
+  ① **卡片矩形三方一致契约**：`VirtualLauncher.pinnedCardRect` 纯函数（应用区坐标
+  系，从 `dashSplitGeom.otherStart` 到末端留 `CARD_MARGIN_PX`）⇄ composer 绘制
+  矩形（横=tileEdgeOverride+DASH_GAP_PX、竖=handleEdge+DASH_GAP_PX 起）⇄
+  GridActivity layoutSplit 音乐卡 margin——三者必须同步改（DashSplitMathTest 钉死）。
+  ② **拖拽拉伸 + 松手 resize 与地图 tile 完全同构**：preview 只改绘制矩形，
+  `commitDashSplit` 同时 resize 地图屏与固定屏（`resizePinnedDisplay`）。
+  ③ **点击卡片 = 触摸直注固定屏**（活交互面，TouchRouter `pinnedCardRouteOrigin`
+  路由，屏内坐标×`pinnedDisplayScale`）；只有**冻结态**（应用被拉到手机侧）触摸才
+  拦截为拉回（`pinnedPullPressed` 整条手势消费，同 overlay 卡独占模式）。
+  ④ **拉回 = remove + 重建**：本 ROM `am start --display X` 对既有任务只带回前台
+  **不迁移**（2026-10-10 定谳），所以 `pullBackPinnedApp` =
+  `am stack remove` 其它屏上的同包任务（手机侧窗口消失，用户确认此语义）+
+  `-f 0x18000000` 在固定屏新建实例——应用内状态重置（同 am compat 杀应用的既有
+  代价）。**冻结看门狗只标记不自动拉回**（pinned-watchdog 线程 5s dumpsys 轮询，
+  固定屏无该包任务即 `pinnedFrozen=true`）；拉回触发点 = 触摸卡片 / 回仪表盘
+  （syncDashboard(true)）/ 点桌面固定应用图标。
+  ⑤ **全屏形态**：`TileLayout.PINNED_FULLSCREEN`（与地图全屏互斥）；从桌面/dock
+  点固定应用 → `launchApp` 顶部拦截 → `setPinnedFullscreen(true)`；⌂ 退出回仪表盘
+  （卡片形式）；`activeAppDisplayId` 全屏时切到固定屏（HID DPAD 跟随）。
+  ⑥ **会话中切换模式实时生效的关键**：composer **恒建**第 4 路输入（音乐模式也建，
+  `pinnedSurface()` 常在）——GL 线程进入合成循环后无法再建输入，设置面板切「音乐⇄
+  指定应用」全靠它现场建屏/释放（`applyDashCardChanged`）。同屏换应用 = 清旧包任务
+  （互斥）+ 新建实例。
+  ⑦ **应用单选弹窗**：列表 = 全部可启动应用**排除地图应用与自己**（同包在固定屏与
+  地图屏互抢任务）；强制深色主题（`ContextThemeWrapper(Theme_AppCompat)`——面板宿主
+  在车机屏可能是 DayNight 浅色形态）；行样式复用 item_map_option。
+  ⑧ 所选应用被卸载 → `resolveDashCard` 返回 null 回退音乐卡片（面板显示音乐选中，
+  存储保留，重装后下会话自动恢复固定模式）；DashCardPrefsTest 钉死。
+  ⑨ **装机反馈四修复（2026-11-07）**：车机设置菜单**按位置**取面板曾整体错位一档
+  （0.1.28.62 删超采样菜单后 `SettingsMenus` id 不再连续 0,2,3,4,5,6）→ 改视图→菜单
+  id 显式映射；固定应用全屏 ⌂ 失效根因 = TouchRouter 固定屏路由**漏 `!inDock` 闸**
+  （全屏命中域=应用区全部，dock 触摸被吞）——新增任何「大范围命中域」路由都必须带
+  dock 区闸 + 命中函数自身校验（双保险）；dock 图标只在显式点击时登记 runningApps
+  （自动拉起不上 dock，对齐地图 ensureMapTask）。
+  ⑩ **地图屏拉回与固定应用完全同构（0.1.28.66）**：display-watchdog 一个线程同管
+  `pinnedFrozen`/`mapFrozen`（5s dumpsys 只标记）；`pullBackApp` 公共路径（目标屏有
+  任务=解除标记幂等；无任务=清他屏任务），地图走 `startMapApp` 候选链；TouchRouter
+  `mapPullPressed` 与 pinned 同构，命中几何 `mapTileHit` 与路由分支同源。**触发点**
+  一致：冻结态点卡片/回仪表盘（syncDashboard 统一调两个 pullBack）/点桌面图标。
+  历史注：2026-10-10 曾移除「任务看护自动拉回」——本特性是它的受控复活（只在车机侧
+  明确交互时拉回，绝不自动）。
+  ⑪ **设置已统一为单 Activity 响应式（0.1.28.64）**：`SettingsActivity` 按宿主屏
+  configuration（宽≥600dp 且高≥400dp）分 wide 双栏 / narrow（列表⇄详情两层叠放）；
+  PhoneSettingsActivity/SettingsContentActivity/竖屏车机转发 hack 已删除（3 类→1 类，
+  「映射分叉」类 bug 根除）。坑：主题改继承不透明的 `Theme.CarPlaySender`——原
+  Launcher 派生透明窗口在手机侧会透出桌面；窄屏返回语义分形态（详情=回列表，
+  列表=关页）；narrow 用 onSaveInstanceState 保形态与详情态。
 - **BT 断链僵尸轮次 + specifier 永久挂起（2026-10-22 奥迪 3315 真机定谳）**：车机 15s
   AirPlay 看门狗（15.07s 实测，与 sysdiagnose 互证）拆链后**立即回连重发端点**，而我们的
   「sessionStarting 互斥」只认标志不认轮次存活性——WiFi 加入卡死（120s 窗）的僵尸轮次把

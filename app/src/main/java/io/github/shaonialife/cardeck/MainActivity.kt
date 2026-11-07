@@ -44,7 +44,6 @@ import io.github.shaonialife.cardeck.ui.DarkMessageDialog
 import io.github.shaonialife.cardeck.ui.PanelWindow
 import io.github.shaonialife.cardeck.ui.ScreenDimmer
 import io.github.shaonialife.cardeck.ui.SignalWavesView
-import io.github.shaonialife.cardeck.ui.WallpaperStore
 import io.github.shaonialife.cardeck.util.Bg
 import io.github.shaonialife.cardeck.util.LogExporter
 import java.util.Locale
@@ -167,22 +166,6 @@ class MainActivity : AppCompatActivity() {
     private val pendingStartAfterBtPermission =
         java.util.concurrent.atomic
             .AtomicBoolean(false)
-
-    /** 车机壁纸选择（Photo Picker；无需存储权限）。选中即持久化并通知合成器换图。 */
-    private val wallpaperPicker =
-        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-            if (uri == null) {
-                log("WALLPAPER: 未选择图片")
-                return@registerForActivityResult
-            }
-            val ok =
-                WallpaperStore
-                    .setFromUri(this, uri)
-            log(
-                "WALLPAPER: ${if (ok) "壁纸已更新（会话进行中约 1 秒内上车；下次连接自动生效）" else "保存失败"}",
-            )
-            if (ok) snack("壁纸已更新") else snack("保存失败")
-        }
 
     private val audioPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -884,21 +867,6 @@ class MainActivity : AppCompatActivity() {
             log("DIMMER: 手动假息屏（点击屏幕恢复）")
         }
 
-        findViewById<TextView>(R.id.btnWallpaperPick).setOnClickListener {
-            wallpaperPicker.launch(
-                androidx.activity.result.PickVisualMediaRequest(
-                    androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly,
-                ),
-            )
-        }
-        findViewById<TextView>(R.id.btnWallpaperReset).setOnClickListener {
-            val ok =
-                WallpaperStore
-                    .resetToDefault(this)
-            log("WALLPAPER: ${if (ok) "已恢复内置默认（CarPlay 官方深色壁纸）" else "恢复失败"}")
-            snack(if (ok) "已恢复默认壁纸" else "恢复失败")
-        }
-
         // ---- 折叠卡：高级 / 日志 ----
         bindExpandable(R.id.advHeader, advBody, advChevron)
         bindExpandable(R.id.logHeader, logBody, logChevron)
@@ -954,7 +922,7 @@ class MainActivity : AppCompatActivity() {
 
         // ---- 车机设置（手机侧二级菜单：桌面/横屏/dock/默认地图） ----
         findViewById<LinearLayout>(R.id.btnCarSettings).setOnClickListener {
-            startActivity(android.content.Intent(this, PhoneSettingsActivity::class.java))
+            startActivity(android.content.Intent(this, io.github.shaonialife.cardeck.launcher.SettingsActivity::class.java))
         }
 
         // 启动即检查：常亮开 + 无悬浮窗权限 → 主动请求

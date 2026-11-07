@@ -12,12 +12,14 @@ import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.SessionController
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.AppIcons
+import io.github.shaonialife.cardeck.launcher.DashCardPrefs
 import io.github.shaonialife.cardeck.launcher.DefaultMapPrefs
 import io.github.shaonialife.cardeck.launcher.DesktopApps
 import io.github.shaonialife.cardeck.launcher.DockPrefs
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppRowsAdapter.AppHolder
 import io.github.shaonialife.cardeck.ui.DarkMessageDialog
+import io.github.shaonialife.cardeck.ui.WallpaperStore
 import io.github.shaonialife.cardeck.util.Bg
 
 /**
@@ -454,7 +456,13 @@ class DockPanelFragment : SettingsPanelFragment() {
     }
 }
 
-class DefaultMapPanelFragment : SettingsPanelFragment() {
+/**
+ * 「仪表盘」面板（原「默认地图」，2026-11-07 扩展）：默认地图单选（现状不动）+
+ * 右侧卡片模式——音乐卡片（默认）或「固定应用」（独立虚拟屏 CarPlayPinned 承载的
+ * 指定应用，密度=手机侧）。固定应用切换实时生效（[VirtualLauncher.applyDashCardChanged]）；
+ * 所选应用被卸载时解析失败 → 自然回退音乐卡片（面板显示音乐卡片选中，存储保留）。
+ */
+class DashboardPanelFragment : SettingsPanelFragment() {
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -462,7 +470,12 @@ class DefaultMapPanelFragment : SettingsPanelFragment() {
     ): View = inflater.inflate(R.layout.fragment_panel_map, container, false)
 
     override fun onViewCreated(view: View) {
-        val container = view.findViewById<LinearLayout>(R.id.mapOptions)
+        buildMapSection(view.findViewById(R.id.mapOptions))
+        buildCardSection(view.findViewById(R.id.cardOptions))
+    }
+
+    /** 默认地图单选（原 DefaultMapPanelFragment 逻辑原样搬移）。 */
+    private fun buildMapSection(container: LinearLayout) {
         val installed =
             VirtualLauncher.MAP_PACKAGES_PRIORITY.mapNotNull { pkg ->
                 val launch =
@@ -524,6 +537,179 @@ class DefaultMapPanelFragment : SettingsPanelFragment() {
             container.addView(row)
         }
     }
+
+    /** 右侧卡片单选行刷新闭包（buildCardSection 内装配；选中态变化时逐行 invoke）。 */
+    private var refreshCardRows: (() -> Unit)? = null
+
+    private fun buildCardSection(container: LinearLayout) {
+        val ctx = requireContext()
+        val iconPx = (34 * resources.displayMetrics.density).toInt()
+
+        /** 当前行数据：图标 Drawable（可空=占位）+ 名称。 */
+        fun appIcon(pkg: String?) = pkg?.let { runCatching { ctx.packageManager.getApplicationIcon(it) }.getOrNull() }
+
+        val rowMusic =
+            layoutInflater.inflate(R.layout.item_map_option, container, false).apply {
+                runCatching {
+                    ctx.getDrawable(R.drawable.ic_music)?.let {
+                        findViewById<ImageView>(R.id.mapOptionIcon)
+                            .setImageBitmap(AppIcons.rounded(it, iconPx))
+                    }
+                }
+                findViewById<TextView>(R.id.mapOptionName).text = "音乐卡片"
+            }
+        val rowApp =
+            layoutInflater.inflate(R.layout.item_map_option, container, false).apply {
+                runCatching {
+                    ctx.getDrawable(R.drawable.ic_app_settings)?.let {
+                        findViewById<ImageView>(R.id.mapOptionIcon)
+                            .setImageBitmap(AppIcons.rounded(it, iconPx))
+                    }
+                }
+                findViewById<TextView>(R.id.mapOptionName).text = "指定应用"
+            }
+        // 当前固定应用展示行：app 模式且应用可用时显示图标+名称，点击重开选择器
+        val rowCurrent =
+            layoutInflater.inflate(R.layout.item_map_option, container, false).apply {
+                findViewById<ImageView>(R.id.mapOptionRadio).visibility = View.INVISIBLE
+            }
+        container.addView(rowMusic)
+        container.addView(rowApp)
+        container.addView(rowCurrent)
+
+        fun applyMode(
+            mode: String,
+            pkg: String?,
+            toastLabel: String,
+        ) {
+            DashCardPrefs.set(ctx, mode, pkg)
+            VirtualLauncher.applyDashCardChanged()
+            refreshCardRows?.invoke()
+            hostToast("右侧卡片：$toastLabel")
+        }
+
+        fun refresh() {
+            val resolved = DashCardPrefs.resolve(ctx)
+            val mode = DashCardPrefs.mode(ctx)
+            val appSelected = resolved != null
+            // 存了 app 模式但应用不可启动（已卸载）→ 显示音乐卡片选中（存储保留）
+            rowMusic.findViewById<ImageView>(R.id.mapOptionRadio).setImageResource(
+                if (!appSelected) R.drawable.bg_radio_on else R.drawable.bg_radio_off,
+            )
+            rowApp.findViewById<ImageView>(R.id.mapOptionRadio).setImageResource(
+                if (appSelected) R.drawable.bg_radio_on else R.drawable.bg_radio_off,
+            )
+            rowCurrent.visibility = if (appSelected) View.VISIBLE else View.GONE
+            if (resolved != null) {
+                val icon = appIcon(resolved.packageName)
+                if (icon != null) {
+                    rowCurrent
+                        .findViewById<ImageView>(R.id.mapOptionIcon)
+                        .setImageBitmap(AppIcons.rounded(icon, iconPx))
+                }
+                rowCurrent.findViewById<TextView>(R.id.mapOptionName).text =
+                    runCatching {
+                        ctx.packageManager
+                            .getApplicationLabel(
+                                ctx.packageManager.getApplicationInfo(resolved.packageName, 0),
+                            ).toString()
+                    }.getOrDefault(resolved.packageName)
+            }
+            if (mode == DashCardPrefs.MODE_APP && !appSelected) {
+                // 提示存储的固定应用已不可用（不弹窗打断——回退是静默的）
+                rowCurrent.findViewById<TextView>(R.id.mapOptionName).text = "所选应用不可用，已回退音乐卡片"
+            }
+        }
+        refresh()
+
+        rowMusic.setOnClickListener {
+            applyMode(DashCardPrefs.MODE_MUSIC, DashCardPrefs.pinnedPackage(ctx), "音乐卡片")
+        }
+        rowApp.setOnClickListener {
+            val resolved = DashCardPrefs.resolve(ctx)
+            if (resolved != null) {
+                val label =
+                    runCatching {
+                        ctx.packageManager
+                            .getApplicationLabel(
+                                ctx.packageManager.getApplicationInfo(resolved.packageName, 0),
+                            ).toString()
+                    }.getOrDefault(resolved.packageName)
+                applyMode(DashCardPrefs.MODE_APP, resolved.packageName, label)
+            } else {
+                showAppPicker()
+            }
+        }
+        rowCurrent.setOnClickListener { showAppPicker() }
+        refreshCardRows = { refresh() }
+    }
+
+    /**
+     * 全应用单选弹窗（车机/手机共用；强制深色主题——面板宿主在车机屏可能是
+     * DayNight 浅色形态）。列表 = 全部可启动应用，排除地图应用（同包在固定屏与
+     * 地图屏会互抢任务）。
+     *
+     * 交互：点行只**选中**（radio 高亮，2026-11-07 用户反馈「点应用即生效、却还要
+     * 关弹窗」），点「确定」才落偏好并实时生效。
+     */
+    private fun showAppPicker() {
+        loadApps {
+            val ctx = requireContext()
+            val candidates = apps.filter { !VirtualLauncher.isMapPackage(it.component.packageName) }
+            if (candidates.isEmpty()) {
+                hostToast("没有可选的应用")
+                return@loadApps
+            }
+            val themed = android.view.ContextThemeWrapper(ctx, androidx.appcompat.R.style.Theme_AppCompat)
+            var selectedPkg: String? = DashCardPrefs.resolve(ctx)?.packageName
+            val list =
+                LinearLayout(themed).apply {
+                    orientation = LinearLayout.VERTICAL
+                    val pad = (10 * resources.displayMetrics.density).toInt()
+                    setPadding(pad, pad / 2, pad, pad)
+                }
+            val iconPx = (34 * resources.displayMetrics.density).toInt()
+            val radios = mutableListOf<Pair<String, ImageView>>()
+
+            fun refreshRadios() {
+                radios.forEach { (pkg, radio) ->
+                    radio.setImageResource(
+                        if (pkg == selectedPkg) R.drawable.bg_radio_on else R.drawable.bg_radio_off,
+                    )
+                }
+            }
+            val scroll = android.widget.ScrollView(themed)
+            candidates.forEach { entry ->
+                val pkg = entry.component.packageName
+                val row = layoutInflater.inflate(R.layout.item_map_option, list, false)
+                row
+                    .findViewById<ImageView>(R.id.mapOptionIcon)
+                    .setImageBitmap(AppIcons.rounded(entry.icon, iconPx))
+                row.findViewById<TextView>(R.id.mapOptionName).text = entry.label
+                val radio = row.findViewById<ImageView>(R.id.mapOptionRadio)
+                radios.add(pkg to radio)
+                row.setOnClickListener {
+                    selectedPkg = pkg
+                    refreshRadios()
+                }
+                list.addView(row)
+            }
+            refreshRadios()
+            scroll.addView(list)
+            androidx.appcompat.app.AlertDialog
+                .Builder(themed)
+                .setTitle("选择固定应用")
+                .setView(scroll)
+                .setPositiveButton("确定") { _, _ ->
+                    val pkg = selectedPkg ?: return@setPositiveButton
+                    DashCardPrefs.set(ctx, DashCardPrefs.MODE_APP, pkg)
+                    VirtualLauncher.applyDashCardChanged()
+                    refreshCardRows?.invoke()
+                    hostToast("右侧卡片：${candidates.firstOrNull { it.component.packageName == pkg }?.label ?: pkg}")
+                }.setNegativeButton("取消", null)
+                .show()
+        }
+    }
 }
 
 /**
@@ -533,6 +719,27 @@ class DefaultMapPanelFragment : SettingsPanelFragment() {
  * （SessionController 快照），与本页偏好值相区别。
  */
 class DisplayPanelFragment : SettingsPanelFragment() {
+    /**
+     * 车机壁纸选择（Photo Picker，无需存储权限；2026-11-07 自首页「车机显示」迁入）。
+     * Fragment 属性初始化期注册（生命周期要求：必须早于 STARTED）。
+     */
+    private val wallpaperPicker =
+        registerForActivityResult(
+            androidx.activity.result.contract.ActivityResultContracts
+                .PickVisualMedia(),
+        ) { uri ->
+            if (uri == null) {
+                hostToast("未选择图片")
+                return@registerForActivityResult
+            }
+            val ok =
+                WallpaperStore
+                    .setFromUri(requireContext(), uri)
+            hostToast(
+                if (ok) "壁纸已更新（会话进行中约 1 秒内上车）" else "保存失败",
+            )
+        }
+
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -689,5 +896,19 @@ class DisplayPanelFragment : SettingsPanelFragment() {
                 }
             },
         )
+
+        // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
+        view.findViewById<TextView>(R.id.btnWallpaperPick).setOnClickListener {
+            wallpaperPicker.launch(
+                androidx.activity.result.PickVisualMediaRequest(
+                    androidx.activity.result.contract.ActivityResultContracts
+                        .PickVisualMedia.ImageOnly,
+                ),
+            )
+        }
+        view.findViewById<TextView>(R.id.btnWallpaperReset).setOnClickListener {
+            val ok = WallpaperStore.resetToDefault(requireContext())
+            hostToast(if (ok) "已恢复默认壁纸" else "恢复失败")
+        }
     }
 }

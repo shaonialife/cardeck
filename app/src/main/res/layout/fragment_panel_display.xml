@@ -206,5 +206,59 @@
             android:text="交互滞后但帧率正常（事件派发堆积）时调高试验；拖动即时生效"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="车机壁纸"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/btnWallpaperPick"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_tbtn"
+                android:gravity="center"
+                android:paddingLeft="14dp"
+                android:paddingTop="9dp"
+                android:paddingRight="14dp"
+                android:paddingBottom="9dp"
+                android:text="更换"
+                android:textColor="@color/m3_primary"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnWallpaperReset"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="6dp"
+                android:background="@drawable/bg_tbtn"
+                android:gravity="center"
+                android:paddingLeft="14dp"
+                android:paddingTop="9dp"
+                android:paddingRight="14dp"
+                android:paddingBottom="9dp"
+                android:text="恢复默认"
+                android:textColor="@color/m3_primary"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="全屏 aspectFill；车机桌面、dock 与仪表盘卡片的壁纸切片同步更新，会话中约 1 秒内生效"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
     </LinearLayout>
 </ScrollView>

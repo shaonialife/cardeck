@@ -13,7 +13,7 @@ class DisplayGeometryTest {
         // 1152x648 应用区（横屏画布去 dock），荣耀 560dpi：
         // 高 = 410×1.05×560/160 = 1507；宽 = 1507×1152/648 ≈ 2679
         val g = VirtualLauncher.appDisplayGeometry(1152, 648, dockAtBottom = false, phoneDensityDpi = phoneDensity)
-        assertEquals(PHONE_DENSITY, g.densityDpi)
+        assertEquals(phoneDensity, g.densityDpi)
         assertEquals(1507, g.heightPx)
         val expectedW = Math.round(1507f * 1152f / 648f)
         assertEquals(expectedW, g.widthPx)
@@ -25,7 +25,7 @@ class DisplayGeometryTest {
     fun `portrait app display uses 410dp window width`() {
         // 1080x1920 应用区（竖屏画布）：宽 = 410×560/160 = 1435；高按纵横比
         val g = VirtualLauncher.appDisplayGeometry(1080, 1920, dockAtBottom = true, phoneDensityDpi = phoneDensity)
-        assertEquals(PHONE_DENSITY, g.densityDpi)
+        assertEquals(phoneDensity, g.densityDpi)
         assertEquals(1435, g.widthPx)
         val expectedH = Math.round(1435f * 1920f / 1080f)
         assertEquals(expectedH, g.heightPx)
@@ -51,7 +51,7 @@ class DisplayGeometryTest {
     fun `map display scales canvas area by phone density over legacy 200`() {
         // dp = 应用区@200dpi 不变；px = dp×560/160 = 应用区×2.8
         val g = VirtualLauncher.mapDisplayGeometry(1152, 648, phoneDensityDpi = phoneDensity)
-        assertEquals(PHONE_DENSITY, g.densityDpi)
+        assertEquals(phoneDensity, g.densityDpi)
         assertEquals(Math.round(1152 * 2.8f), g.widthPx)
         assertEquals(Math.round(648 * 2.8f), g.heightPx)
         // dp 与旧密度下的窗口一致
@@ -62,5 +62,19 @@ class DisplayGeometryTest {
     fun `map display capped at max px`() {
         val g = VirtualLauncher.mapDisplayGeometry(2251, 1152, phoneDensityDpi = 560)
         assertTrue(maxOf(g.widthPx, g.heightPx) <= VirtualLauncher.MAX_DISPLAY_PX)
+    }
+
+    @Test
+    fun `pinned card display reuses map formula at phone density`() {
+        // 固定应用卡片（仪表盘右侧）：屏几何 = 卡片矩形（画布域）× 手机密度/200，
+        // 密度=手机侧（与地图屏同一换算——固定应用字号与手机一致）。
+        // 500x570 卡片矩形 @560dpi：px = 矩形 × 2.8
+        val g = VirtualLauncher.mapDisplayGeometry(500, 570, phoneDensityDpi = phoneDensity)
+        assertEquals(phoneDensity, g.densityDpi)
+        assertEquals(Math.round(500 * 2.8f), g.widthPx)
+        assertEquals(Math.round(570 * 2.8f), g.heightPx)
+        // dp 窗口 = 卡片矩形 @200dpi（500/1.25、570/1.25）
+        assertEquals(400f, g.dpWidth, 0.5f)
+        assertEquals(456f, g.dpHeight, 0.5f)
     }
 }

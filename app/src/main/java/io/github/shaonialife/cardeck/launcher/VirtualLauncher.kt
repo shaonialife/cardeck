@@ -183,6 +183,95 @@ object VirtualLauncher {
     /** 分屏主轴长度（应用区坐标系）：横=appAreaWidth、竖=appAreaHeight。 */
     private fun splitMainLen(): Int = if (dockAtBottom) appAreaHeight else appAreaWidth
 
+    /** 固定应用卡片矩形（应用区坐标系，顶部原点）。 */
+    data class PinnedCardGeom(
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+    ) {
+        val width: Int get() = right - left
+        val height: Int get() = bottom - top
+    }
+
+    /**
+     * 固定应用卡片矩形纯函数（单测钉死）：卡片占「对侧」区域——从 [dashSplitGeom]
+     * 的 otherStart（tile 把手侧边缘 + 中缝宽）到应用区末端，四周留 [CARD_MARGIN_PX]。
+     * 与 DualDisplayComposer 的卡片绘制矩形、GridActivity layoutSplit 的音乐卡
+     * panel 边距三方一致（同 DASH_GAP_PX/CARD_MARGIN_PX 契约）。
+     */
+    fun pinnedCardRect(
+        appMainLen: Int,
+        appCrossLen: Int,
+        fraction: Float,
+        dockAtBottom: Boolean,
+    ): PinnedCardGeom {
+        val otherStart = dashSplitGeom(appMainLen, fraction).otherStart.toInt()
+        return if (dockAtBottom) {
+            // 竖屏：主轴=纵向（地图上、卡片下），x 全宽留边距
+            PinnedCardGeom(
+                CARD_MARGIN_PX,
+                otherStart,
+                appCrossLen - CARD_MARGIN_PX,
+                appMainLen - CARD_MARGIN_PX,
+            )
+        } else {
+            // 横屏：主轴=横向（地图左、卡片右），y 全高留边距
+            PinnedCardGeom(
+                otherStart,
+                CARD_MARGIN_PX,
+                appMainLen - CARD_MARGIN_PX,
+                appCrossLen - CARD_MARGIN_PX,
+            )
+        }
+    }
+
+    /** 固定应用卡片矩形（流像素，顶部原点；横屏含 dock 偏移）。 */
+    private fun pinnedCardRectStream(): PinnedCardGeom? {
+        if (appAreaWidth <= 0 || appAreaHeight <= 0 || dashSplitPos < 0) return null
+        val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
+        val rect = pinnedCardRect(splitMainLen(), crossLen, dashSplitFraction, dockAtBottom)
+        return if (dockAtBottom) {
+            rect
+        } else {
+            rect.copy(left = rect.left + dockWidthPx, right = rect.right + dockWidthPx)
+        }
+    }
+
+    /** 流坐标触点是否落在固定应用卡片内（TouchRouter 冻结拉回的命中判定用）。 */
+    fun pinnedCardHit(
+        x: Float,
+        y: Float,
+    ): Boolean {
+        val rect = pinnedCardRectStream() ?: return false
+        return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+    }
+
+    /**
+     * 固定应用屏触摸路由信息：命中返回「屏内坐标原点（流坐标域）」——屏内坐标 =
+     * (触点 − 原点) × [pinnedDisplayScale]；未命中/不可路由返回 null。
+     * 全屏=应用区原点；卡片=卡片矩形原点（仅仪表盘分屏、非滑动中、非地图全屏）。
+     */
+    fun pinnedCardRouteOrigin(
+        px: Int,
+        py: Int,
+    ): Pair<Int, Int>? {
+        if (pinnedDisplayId < 0 || !pinnedCardActive) return null
+        if (pinnedFullscreen) {
+            // 应用区边界双保险：dock 区不属于固定屏（调用方虽有 !inDock 闸，此函数
+            // 自身也必须成立——否则新增调用点极易复发「dock 触摸被固定屏吞掉」）
+            if (if (dockAtBottom) py >= appHeightPx else px < dockWidthPx) return null
+            return (if (dockAtBottom) 0 else dockWidthPx) to 0
+        }
+        if (!dashboardMode || mapFullscreen || tileSlideFraction > 0.01f) return null
+        val rect = pinnedCardRectStream() ?: return null
+        if (px < rect.left || px >= rect.right || py < rect.top || py >= rect.bottom) return null
+        return rect.left to rect.top
+    }
+
+    /** 固定应用屏相对画布卡片的缩放（显示 px/画布 px；密度=手机侧，语义同 [mapDisplayScale]）。 */
+    fun pinnedDisplayScale(): Float = pinnedDisplayDensity / MAP_DISPLAY_DPI.toFloat()
+
     val runningApps = LinkedHashSet<ComponentName>()
 
     private val runningAppsListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
@@ -358,6 +447,36 @@ object VirtualLauncher {
     var mapFullscreen: Boolean = false
         private set
 
+    /**
+     * 地图应用被拉到手机侧（或已退出）：地图屏上没有该包任务，地图卡/全屏停在
+     * 最后一帧。由显示看门狗标记（与固定应用屏同一套）；触摸地图卡/回仪表盘时经
+     * [pullBackMapApp] 拉回。**只标记，不自动拉回**（用户可能在手机侧主动用地图）。
+     */
+    @Volatile
+    var mapFrozen: Boolean = false
+        private set
+
+    /**
+     * 流坐标触点是否落在地图可交互区（TouchRouter 冻结拉回判定用；与路由分支同几何）：
+     * 全屏=应用区；仪表盘分屏=tile 矩形（滑动中不算——那是指把手/pager 的手势）。
+     */
+    fun mapTileHit(
+        x: Float,
+        y: Float,
+    ): Boolean {
+        if (mapDisplayId < 0) return false
+        if (mapFullscreen) return if (dockAtBottom) y < appHeightPx else x >= dockWidthPx
+        if (!dashboardMode || tileSlideFraction > 0.01f) return false
+        return if (dockAtBottom) {
+            y >= CARD_MARGIN_PX && y < CARD_MARGIN_PX + mapTileHeight &&
+                x >= CARD_MARGIN_PX && x < appAreaWidth - CARD_MARGIN_PX
+        } else {
+            val tileX = x - dockWidthPx
+            tileX >= CARD_MARGIN_PX && tileX < CARD_MARGIN_PX + mapTileWidth &&
+                y >= CARD_MARGIN_PX && y < appAreaHeight - CARD_MARGIN_PX
+        }
+    }
+
     /** 地图屏当前逻辑尺寸（resize 幂等基线；0 = 未创建/已释放）。 */
     @Volatile
     private var mapDisplayW = 0
@@ -414,6 +533,68 @@ object VirtualLauncher {
         mapLayoutListeners.forEach { runCatching { it(mapFullscreen) } }
     }
 
+    // ---- 仪表盘右侧卡片（固定应用虚拟屏 CarPlayPinned）----
+    // 音乐卡片（默认，GridActivity 的 View）⇄ 固定应用（独立虚拟屏，密度=手机侧）。
+    // 模式经 DashCardPrefs 持久化；会话中由设置面板经 [applyDashCardChanged] 实时切换。
+
+    /** 固定应用组件（DashCardPrefs 解析结果；null = 音乐卡片模式/回退）。 */
+    @Volatile
+    var pinnedComponent: ComponentName? = null
+        private set
+
+    /** 右侧卡片=固定应用模式（GridActivity 隐藏音乐卡 View；屏可能尚未建）。 */
+    @Volatile
+    var pinnedCardActive: Boolean = false
+        private set
+
+    /** 固定应用屏 displayId（-1 = 未创建：音乐模式/创建失败/已释放）。 */
+    @Volatile
+    var pinnedDisplayId: Int = -1
+        private set
+
+    /** 固定应用屏当前逻辑尺寸（resize 幂等基线）。 */
+    @Volatile
+    private var pinnedDisplayW = 0
+
+    @Volatile
+    private var pinnedDisplayH = 0
+
+    /** 固定应用屏密度（= 手机侧，attach 时赋值；resize 恒定，同地图屏语义）。 */
+    @Volatile
+    private var pinnedDisplayDensity = MAP_DISPLAY_DPI
+
+    /** 固定应用屏全屏形态（桌面点被固定应用图标进入；⌂ 退出回仪表盘）。 */
+    @Volatile
+    var pinnedFullscreen: Boolean = false
+        private set
+
+    /**
+     * 固定应用被拉到手机侧（或已退出）：固定屏上没有该包任务，卡片停在最后一帧。
+     * 由冻结看门狗标记；触摸卡片/回仪表盘时经 [pullBackPinnedApp] 拉回。**只标记，
+     * 不自动拉回**（用户可能在手机侧主动使用，仅车机侧明确交互才收回）。
+     */
+    @Volatile
+    var pinnedFrozen: Boolean = false
+        private set
+
+    /** 回退形态的固定应用屏句柄（受信形态经 shell 创建，无本进程句柄）。 */
+    private var pinnedDisplay: VirtualDisplay? = null
+
+    /** 固定应用模式变化监听（GridActivity 切换音乐卡 View 可见性；Bg 线程回调，UI 侧自行切主线程）。 */
+    private val pinnedCardListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    fun addPinnedCardListener(listener: () -> Unit) {
+        pinnedCardListeners.add(listener)
+    }
+
+    fun removePinnedCardListener(listener: () -> Unit) {
+        pinnedCardListeners.remove(listener)
+    }
+
+    private fun notifyPinnedCardChanged() {
+        pinnedCardListeners.forEach { runCatching { it() } }
+    }
+
     /** 地图应用白名单（优先序：车机版高德 → 车机版百度 → 手机高德 → 手机百度 → 腾讯）。 */
     val MAP_PACKAGES_PRIORITY =
         listOf(
@@ -457,8 +638,13 @@ object VirtualLauncher {
     private var mapDisplay: VirtualDisplay? = null
     private var composer: DualDisplayComposer? = null
 
-    /** 当前活动应用屏 ID（TouchRouter 注入目标）。 */
-    fun activeAppDisplayId(): Int = if (composer?.isActiveAppHi() == true && appHiDisplayId >= 0) appHiDisplayId else appDisplayId
+    /** 当前活动应用屏 ID（TouchRouter 注入目标；固定屏全屏时 HID DPAD 目标切到固定屏）。 */
+    fun activeAppDisplayId(): Int =
+        when {
+            pinnedFullscreen && pinnedDisplayId >= 0 -> pinnedDisplayId
+            composer?.isActiveAppHi() == true && appHiDisplayId >= 0 -> appHiDisplayId
+            else -> appDisplayId
+        }
 
     /** 当前活动应用屏的坐标倍率（单应用屏架构下恒 = [appDisplayScale]）。 */
     fun activeAppScale(): Float = appDisplayScale
@@ -567,6 +753,24 @@ object VirtualLauncher {
                 .getSharedPreferences("settings", Context.MODE_PRIVATE)
                 .getFloat(PREF_KEY_DASH_SPLIT, DASH_SPLIT_DEFAULT_FRACTION)
                 .let(::clampDashSplitFraction)
+        // 固定应用卡片（右侧卡片=指定应用时）：卡片矩形 = 音乐卡区域（随分屏比例），
+        // 屏几何 = 卡片矩形 × 手机密度/200（同地图屏换算——密度=手机侧、字号一致）。
+        // 所选应用已卸载时 resolve=null → 音乐卡片回退（DashCardPrefs）。
+        // composer 输入恒按卡片尺寸创建（音乐模式也传，Surface 常在供会话中切换），
+        // 此处仅决定建不建虚拟屏。
+        pinnedComponent = DashCardPrefs.resolve(context)
+        pinnedCardActive = pinnedComponent != null
+        pinnedFrozen = false
+        pinnedFullscreen = false
+        val pinnedCard =
+            pinnedCardRect(
+                if (dockAtBottom) appHeightPx else appWidth,
+                if (dockAtBottom) appWidth else appHeightPx,
+                dashSplitFraction,
+                dockAtBottom,
+            )
+        val pinnedGeom = mapDisplayGeometry(pinnedCard.width, pinnedCard.height, phoneDensityDpi)
+        pinnedDisplayDensity = pinnedGeom.densityDpi
         if (dockAtBottom) {
             val geom = dashSplitGeom(appHeightPx, dashSplitFraction)
             mapTileWidth = appWidth - CARD_MARGIN_PX * 2
@@ -604,7 +808,7 @@ object VirtualLauncher {
                 .fps(context)
         this.composer = composer
         val displaysCreated = arrayOf(false)
-        composer.onSurfacesReady = { dockSurface, appSurface, appHiSurface, mapSurface ->
+        composer.onSurfacesReady = { dockSurface, appSurface, appHiSurface, mapSurface, pinnedSurface ->
             // 优先：Shizuku shell 创建受信虚拟屏（VIRTUAL_DISPLAY_FLAG_TRUSTED）——
             // 允许第三方应用的新任务落在该屏；解决「应用内跳转的任务被重定向到手机主屏」。
             var viaService = false
@@ -621,7 +825,8 @@ object VirtualLauncher {
                             it.name == "CarPlayDock" ||
                                 it.name == "CarPlayApp" ||
                                 it.name == "CarPlayAppHi" ||
-                                it.name == "CarPlayMap"
+                                it.name == "CarPlayMap" ||
+                                it.name == "CarPlayPinned"
                         }.forEach { stale ->
                             runCatching { svc!!.releaseDisplay(stale.displayId) }
                                 .onSuccess { log("LAUNCHER: 已释放残留虚拟屏 ${stale.name}#${stale.displayId}") }
@@ -660,6 +865,20 @@ object VirtualLauncher {
                         } else {
                             -1
                         }
+                    // 固定应用屏（右侧卡片=指定应用时才建；Surface 恒有——composer 预建输入）
+                    val pinnedId =
+                        if (pinnedSurface != null && pinnedComponent != null) {
+                            svc!!.createDisplay(
+                                "CarPlayPinned",
+                                pinnedGeom.widthPx,
+                                pinnedGeom.heightPx,
+                                pinnedGeom.densityDpi,
+                                pinnedSurface,
+                                true,
+                            )
+                        } else {
+                            -1
+                        }
                     if (dockId >= 0 && appId >= 0) {
                         dockDisplayId = dockId
                         appDisplayId = appId
@@ -672,6 +891,13 @@ object VirtualLauncher {
                             mapDisplayH = mapGeom.heightPx
                         } else if (mapSurface != null) {
                             log("LAUNCHER: 地图屏创建失败——仪表盘无地图 tile")
+                        }
+                        if (pinnedId >= 0) {
+                            pinnedDisplayId = pinnedId
+                            pinnedDisplayW = pinnedGeom.widthPx
+                            pinnedDisplayH = pinnedGeom.heightPx
+                        } else if (pinnedComponent != null) {
+                            log("LAUNCHER: 固定应用屏创建失败——右侧卡片回退音乐卡")
                         }
                         viaService = true
                     } else {
@@ -689,6 +915,7 @@ object VirtualLauncher {
                         if (dockId >= 0) runCatching { svc!!.releaseDisplay(dockId) }
                         if (appId >= 0) runCatching { svc!!.releaseDisplay(appId) }
                         if (mapId >= 0) runCatching { svc!!.releaseDisplay(mapId) }
+                        if (pinnedId >= 0) runCatching { svc!!.releaseDisplay(pinnedId) }
                         // 本次整体回退应用侧屏：VDM 会话不留到下轮（下轮 attach 会重设）
                         runCatching { svc!!.closeVirtualDevice() }
                     }
@@ -700,7 +927,8 @@ object VirtualLauncher {
                     "LAUNCHER: 三屏创建(受信) dock=$dockDisplayId(${dockWidthPx}px) " +
                         "app=$appDisplayId(${appGeom.widthPx}x${appGeom.heightPx} @${appGeom.densityDpi}dpi " +
                         "dp=${appGeom.dpWidth.toInt()}x${appGeom.dpHeight.toInt()} scale=x$appDisplayScale) " +
-                        "map=$mapDisplayId(${mapGeom.widthPx}x${mapGeom.heightPx} @${mapGeom.densityDpi}dpi)",
+                        "map=$mapDisplayId(${mapGeom.widthPx}x${mapGeom.heightPx} @${mapGeom.densityDpi}dpi)" +
+                        " pinned=$pinnedDisplayId(${pinnedGeom.widthPx}x${pinnedGeom.heightPx} @${pinnedGeom.densityDpi}dpi app=${pinnedComponent?.packageName})",
                 )
                 // 会话建立：为「强制应用横屏」名单写入兼容覆盖——**已提前到 attach 开头**
                 // （先写覆盖再拉应用，见 attach 开头注释；此处不再重复入队）。
@@ -766,6 +994,29 @@ object VirtualLauncher {
                         log("LAUNCHER: 地图屏（回退）创建失败——仪表盘无地图 tile")
                     }
                 }
+                // 固定应用屏同样建（应用侧 PUBLIC）：右侧卡片=指定应用时仪表盘才有固定应用画面
+                if (pinnedSurface != null && pinnedComponent != null) {
+                    pinnedDisplay =
+                        dm.createVirtualDisplay(
+                            "CarPlayPinned",
+                            pinnedGeom.widthPx,
+                            pinnedGeom.heightPx,
+                            pinnedGeom.densityDpi,
+                            pinnedSurface,
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+                            null,
+                            null,
+                        )
+                    val fallbackPinnedId = pinnedDisplay?.display?.displayId ?: -1
+                    if (fallbackPinnedId >= 0) {
+                        pinnedDisplayId = fallbackPinnedId
+                        pinnedDisplayW = pinnedGeom.widthPx
+                        pinnedDisplayH = pinnedGeom.heightPx
+                    } else {
+                        log("LAUNCHER: 固定应用屏（回退）创建失败——右侧卡片回退音乐卡")
+                    }
+                }
                 dockDisplayId = dockDisplay?.display?.displayId ?: -1
                 appDisplayId = appDisplay?.display?.displayId ?: -1
                 appDisplayW = appGeom.widthPx
@@ -774,7 +1025,8 @@ object VirtualLauncher {
                     "LAUNCHER: 三屏创建(回退) dock=$dockDisplayId(${dockWidthPx}px) " +
                         "app=$appDisplayId(${appGeom.widthPx}x${appGeom.heightPx} @${appGeom.densityDpi}dpi " +
                         "dp=${appGeom.dpWidth.toInt()}x${appGeom.dpHeight.toInt()} scale=x$appDisplayScale) " +
-                        "map=$mapDisplayId(${mapDisplayW}x$mapDisplayH @${mapGeom.densityDpi}dpi)——受信屏不可用，已回退应用侧 PUBLIC 屏",
+                        "map=$mapDisplayId(${mapDisplayW}x$mapDisplayH @${mapGeom.densityDpi}dpi)" +
+                        " pinned=$pinnedDisplayId(${pinnedGeom.widthPx}x${pinnedGeom.heightPx} app=${pinnedComponent?.packageName})——受信屏不可用，已回退应用侧 PUBLIC 屏",
                 )
             }
             displaysCreated[0] = dockDisplayId >= 0 && appDisplayId >= 0
@@ -792,6 +1044,8 @@ object VirtualLauncher {
                 0,
                 mapGeom.widthPx,
                 mapGeom.heightPx,
+                pinnedGeom.widthPx,
+                pinnedGeom.heightPx,
             )
             // 分屏把手位置推给合成器（覆盖默认中线公式；拖动时 previewDashSplit 持续更新）
             composer.setTileEdgeOverride(dashSplitPos - DASH_GAP_PX / 2f)
@@ -806,7 +1060,7 @@ object VirtualLauncher {
             // 而合成器按整幅映射、触摸按未旋转坐标换算 —— 表现为「分辨率变了 +
             // 点击漂移、点不到目标」，退回桌面也仍是旋转态（2026-10-18 实测）。
             // 缩在 letterbox 里（见下方 aspectRatio）才是车机该有的形态。
-            applyIgnoreOrientationRequest(appDisplayId, appHiDisplayId, mapDisplayId)
+            applyIgnoreOrientationRequest(appDisplayId, appHiDisplayId, mapDisplayId, pinnedDisplayId)
             // 放宽竖屏应用的 letterbox 窗口（默认窄条 → 手机宽度）；断开时还原（detach）
             Shell.exec("cmd window set-letterbox-style --aspectRatio $LETTERBOX_ASPECT_RATIO")
             log(
@@ -824,6 +1078,14 @@ object VirtualLauncher {
             val gridOk = startOn(gridDisplayId, "$selfPkg/${GridActivity::class.java.name}")
             appContextRef = context.applicationContext
             log("LAUNCHER: dock=$dockOk grid=$gridOk gridDisplay=$gridDisplayId")
+            // 固定应用启动到固定屏（新屏无既有任务：MULTIPLE_TASK 直接新建实例）。
+            // 应用侧会话启动放 display 创建成功之后（awaitPending 已在 attach 开头排空）。
+            if (pinnedDisplayId >= 0 && pinnedComponent != null) {
+                composer.pinnedCardVisible = true
+                launchPinnedAppFresh(pinnedComponent!!, pinnedDisplayId)
+            }
+            // 冻结看门狗无条件启动：固定应用屏与地图屏共用（回仪表盘/触摸拉回依赖标记）
+            startDisplayWatchdog()
             // 桌面在超采样屏时默认活动屏 = 超采样屏（启动即显示桌面）
             if (appHiDisplayId >= 0) composer.requestActiveApp(true)
             startShizukuHealer()
@@ -857,12 +1119,13 @@ object VirtualLauncher {
         // 执行时机：投递后立即释放虚拟屏，但后台任务与释放是并发的——为保证命令
         // 命中的是**尚存活的 displayId**，这里先同步取好 id 字符串并在投递时即排队；
         // 若已被释放（id 失效）命令只会报错，不影响后续会话（下轮创建时会重新设置）。
-        val orientationIds = intArrayOf(appDisplayId, appHiDisplayId, mapDisplayId).filter { it >= 0 }
+        val orientationIds = intArrayOf(appDisplayId, appHiDisplayId, mapDisplayId, pinnedDisplayId).filter { it >= 0 }
         if (orientationIds.isNotEmpty()) {
             Bg.run("orientation-cleanup") {
                 orientationIds.forEach { runCatching { setIgnoreOrientationRequest(it, false, verify = false) } }
             }
         }
+        stopDisplayWatchdog()
         if (displaysViaService) {
             val svc = CarInputClient.service
             if (svc != null) {
@@ -871,6 +1134,7 @@ object VirtualLauncher {
                 if (appHiDisplayId >= 0) runCatching { svc.releaseDisplay(appHiDisplayId) }
                 // 地图屏同样由 shell 持有：不释放会在断开后残留（重装后由启动检测兜底发现）
                 if (mapDisplayId >= 0) runCatching { svc.releaseDisplay(mapDisplayId) }
+                if (pinnedDisplayId >= 0) runCatching { svc.releaseDisplay(pinnedDisplayId) }
                 // VDM 会话收口：余屏兜底释放 → device.close → 解除本次创建的伴侣关联
                 // （既有关联复用后原样保留）。幂等：无会话时返回 true。
                 runCatching { svc.closeVirtualDevice() }
@@ -896,11 +1160,21 @@ object VirtualLauncher {
         appHiDisplay = null
         runCatching { mapDisplay?.release() }
         mapDisplay = null
+        runCatching { pinnedDisplay?.release() }
+        pinnedDisplay = null
         dockDisplayId = -1
         appDisplayId = -1
         appHiDisplayId = -1
         gridDisplayId = -1
         mapDisplayId = -1
+        pinnedDisplayId = -1
+        pinnedDisplayW = 0
+        pinnedDisplayH = 0
+        pinnedFrozen = false
+        pinnedFullscreen = false
+        pinnedComponent = null
+        pinnedCardActive = false
+        mapFrozen = false
         mapTileWidth = 0
         mapTileHeight = 0
         dashSplitPos = -1f
@@ -968,6 +1242,11 @@ object VirtualLauncher {
      */
     fun onHomePressed() {
         when {
+            pinnedFullscreen -> {
+                setPinnedFullscreen(false)
+                showDashboard()
+            }
+
             mapFullscreen -> {
                 setMapFullscreen(false)
                 showDashboard()
@@ -997,12 +1276,18 @@ object VirtualLauncher {
         if (changed) notifyDashboard()
         if (dashboard) {
             Bg.run("dashboard-enter") {
+                // 冻结对账先行（幂等）：地图/固定应用被拉到手机侧 → 回仪表盘即自动拉回
+                // （pullBack 内部健康态只花一次 dumpsys 快照）；之后再补默认地图任务
+                pullBackMapApp()
+                pullBackPinnedApp()
                 ensureMapTask()
                 if (mapFullscreen) setMapFullscreen(false)
                 // 期间用户可能已点开普通应用（launchApp 会置 HIDDEN 并退出仪表盘）：
                 // 复查模式，别把地图层又盖回去
                 if (dashboardMode) {
                     resizeMapDisplay(fullscreen = false)
+                    // 固定应用屏同步回卡片尺寸（从全屏退出由 setPinnedFullscreen 负责，兜底幂等）
+                    resizePinnedDisplay(fullscreen = false)
                     composer?.setTileLayout(DualDisplayComposer.TileLayout.SPLIT)
                 }
             }
@@ -1052,6 +1337,341 @@ object VirtualLauncher {
         }
     }
 
+    // ---- 固定应用屏（仪表盘右侧卡片）：全屏 ⇄ 卡片、拉回、冻结看门狗 ----
+
+    /**
+     * 固定应用屏全屏 ⇄ 卡片：动态 resize（全屏=应用区×倍率、卡片=卡片矩形×倍率，
+     * 密度恒=手机侧），合成器切 PINNED_FULLSCREEN / 仪表盘 SPLIT（桌面 HIDDEN）。
+     * 应用任务不迁移（同地图屏：resize 由系统派发配置变更，应用状态连续）。
+     */
+    fun setPinnedFullscreen(fullscreen: Boolean) {
+        if (pinnedDisplayId < 0 || pinnedFullscreen == fullscreen) return
+        pinnedFullscreen = fullscreen
+        resizePinnedDisplay(fullscreen)
+        composer?.setTileLayout(
+            when {
+                fullscreen -> DualDisplayComposer.TileLayout.PINNED_FULLSCREEN
+                dashboardMode -> DualDisplayComposer.TileLayout.SPLIT
+                else -> DualDisplayComposer.TileLayout.HIDDEN
+            },
+        )
+        logSink?.invoke("LAUNCHER: 固定应用屏 ${if (fullscreen) "全屏" else "卡片"}")
+    }
+
+    /** resize 固定应用屏到目标布局尺寸（幂等；镜像 [resizeMapDisplay]，含消费端 buffer 同步）。 */
+    private fun resizePinnedDisplay(fullscreen: Boolean) {
+        val id = pinnedDisplayId
+        if (id < 0) return
+        val scale = pinnedDisplayDensity / MAP_DISPLAY_DPI.toFloat()
+        val w: Int
+        val h: Int
+        if (fullscreen) {
+            w = (appAreaWidth * scale).toInt()
+            h = (appAreaHeight * scale).toInt()
+        } else {
+            val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
+            val card = pinnedCardRect(splitMainLen(), crossLen, dashSplitFraction, dockAtBottom)
+            w = (card.width * scale).toInt()
+            h = (card.height * scale).toInt()
+        }
+        if (w <= 0 || h <= 0 || (w == pinnedDisplayW && h == pinnedDisplayH)) return
+        runCatching {
+            val applied =
+                if (displaysViaService) {
+                    val svc = CarInputClient.service ?: return@runCatching
+                    svc.resizeDisplay(id, w, h, pinnedDisplayDensity)
+                } else {
+                    val display = pinnedDisplay ?: return@runCatching
+                    display.resize(w, h, pinnedDisplayDensity)
+                    true
+                }
+            if (applied) {
+                pinnedDisplayW = w
+                pinnedDisplayH = h
+                composer?.resizePinnedInput(w, h)
+                logSink?.invoke(
+                    "LAUNCHER: 固定应用屏 resize → ${w}x$h@${pinnedDisplayDensity}dpi（${if (fullscreen) "全屏" else "卡片"}）",
+                )
+            }
+        }
+    }
+
+    /**
+     * 固定应用强制新建实例到固定屏（-f MULTIPLE_TASK）。
+     *
+     * ⚠️ **不登记 runningApps**——dock 栏只显示用户显式打开过的应用（对齐地图行为：
+     * `ensureMapTask` 自动拉起不上 dock，点 grid 图标才上）。自动路径有三处：
+     * attach 启动 / 冻结拉回 / 设置切换，都不该把图标塞进 dock（2026-11-07 用户反馈）。
+     * 显式点击走 [launchApp] 的固定应用拦截分支，由它登记。
+     */
+    private fun launchPinnedAppFresh(
+        component: ComponentName,
+        displayId: Int,
+    ) {
+        val target = component.flattenToShortString()
+        val result = Shell.exec("am start -n $target --display $displayId -f 0x18000000", timeoutMs = 8000)
+        val ok = result.ok && result.output.contains("Starting:", ignoreCase = true)
+        pinnedFrozen = false
+        logSink?.invoke("PINNED: 固定应用 ${component.packageName} → 固定屏#$displayId ok=$ok out=${result.output.take(80)}")
+    }
+
+    /**
+     * 把固定应用拉回固定屏（冻结态下：触摸卡片 / 回仪表盘 / 点桌面固定应用图标）。
+     *
+     * 本 ROM `am start --display X` 对既有任务只带回前台**不迁移**（2026-10-10 定谳），
+     * 所以拉回 = remove 其它屏上的同包任务（手机侧窗口随之消失——用户已确认此语义）
+     * + 在固定屏强制新建实例。应用内状态重置（同 am compat 杀应用的既有代价）。
+     * 幂等：任务已在固定屏时只花一次 dumpsys 快照，无操作。
+     */
+    fun pullBackPinnedApp() {
+        val component = pinnedComponent ?: return
+        val id = pinnedDisplayId
+        if (id < 0) return
+        if (pullBackApp(component.packageName, id, "PINNED", "固定屏")) {
+            launchPinnedAppFresh(component, id)
+        }
+    }
+
+    /**
+     * 把地图应用拉回地图屏（冻结态下：触摸地图卡/全屏地图 / 回仪表盘）——与
+     * [pullBackPinnedApp] 完全同构（同一 remove+重建机制，目标屏/入口组件不同）：
+     * 地图屏用 [startMapApp]（含车机版显式主界面候选链），固定屏用 [launchPinnedAppFresh]。
+     */
+    fun pullBackMapApp() {
+        val ctx = appContextRef ?: return
+        val id = mapDisplayId
+        if (id < 0) return
+        val component = defaultMapComponent(ctx) ?: return
+        if (pullBackApp(component.packageName, id, "MAP", "地图屏")) {
+            val result = startMapApp(component, id, forceNewTask = true)
+            val ok = result.ok && result.output.contains("Starting:", ignoreCase = true)
+            mapFrozen = false
+            logSink?.invoke("MAP: 拉回启动 ${component.packageName} → 地图屏#$id ok=$ok out=${result.output.take(80)}")
+        }
+    }
+
+    /**
+     * 拉回公共路径（返回 true = 需要调用方继续在目标屏启动应用）：目标屏已有任务
+     * → 只解除冻结标记（幂等，无操作）；否则清掉其它屏上的同包任务后返回 true。
+     */
+    private fun pullBackApp(
+        pkg: String,
+        displayId: Int,
+        tag: String,
+        screenName: String,
+    ): Boolean {
+        val tasks = taskIdsByDisplayPkg()
+        if (tasksOf(tasks, pkg, displayId).isNotEmpty()) {
+            if (pinnedFrozen && displayId == pinnedDisplayId) {
+                pinnedFrozen = false
+                logSink?.invoke("$tag: 任务已在$screenName——解除冻结标记")
+            } else if (mapFrozen && displayId == mapDisplayId) {
+                mapFrozen = false
+                logSink?.invoke("$tag: 任务已在$screenName——解除冻结标记")
+            }
+            return false
+        }
+        // 其它屏（手机主屏等）上的同包任务先清掉：避免「车机活了但手机侧还挂着一个」
+        tasks.forEach { (display, pkgs) ->
+            if (display != displayId) {
+                pkgs[pkg]?.forEach { taskId ->
+                    val removed = Shell.exec("am stack remove $taskId", timeoutMs = 4000)
+                    logSink?.invoke("$tag: 移除他屏任务 taskId=$taskId disp=$display ok=${removed.ok}")
+                }
+            }
+        }
+        logSink?.invoke("$tag: 冻结→拉回（他屏任务已清，重新启动到$screenName#$displayId）")
+        return true
+    }
+
+    // ---- 冻结看门狗（固定应用屏 + 地图屏共用；只标记不自动拉回——拉回只在
+    //      车机侧明确交互时发生：点卡片/tile、回仪表盘、点桌面图标）----
+
+    private const val DISPLAY_WATCHDOG_INTERVAL_MS = 5_000L
+
+    @Volatile
+    private var displayWatchdogRunning = false
+
+    private var displayWatchdogThread: Thread? = null
+
+    private fun startDisplayWatchdog() {
+        if (displayWatchdogRunning) return
+        displayWatchdogRunning = true
+        displayWatchdogThread =
+            Thread {
+                while (displayWatchdogRunning) {
+                    runCatching { updateFrozenStates() }
+                    try {
+                        Thread.sleep(DISPLAY_WATCHDOG_INTERVAL_MS)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }.apply {
+                name = "display-watchdog"
+                isDaemon = true
+                start()
+            }
+    }
+
+    private fun stopDisplayWatchdog() {
+        displayWatchdogRunning = false
+        displayWatchdogThread?.interrupt()
+        displayWatchdogThread = null
+    }
+
+    /**
+     * 看门狗快照：目标屏上无该包任务 = 冻结（被拉到手机侧或已被关闭）。状态迁移打日志。
+     * 固定应用屏与地图屏同一套判定（屏 id + 包名 → dumpsys 任务快照）。
+     */
+    private fun updateFrozenStates() {
+        val pinnedPkg = pinnedComponent?.packageName
+        if (pinnedPkg != null && pinnedDisplayId >= 0) {
+            val frozen = tasksOf(taskIdsByDisplayPkg(), pinnedPkg, pinnedDisplayId).isEmpty()
+            if (frozen != pinnedFrozen) {
+                pinnedFrozen = frozen
+                logSink?.invoke(
+                    "PINNED: " +
+                        if (frozen) {
+                            "冻结（固定屏无任务——应用被移到手机侧或已退出；点卡片/回仪表盘自动拉回）"
+                        } else {
+                            "恢复（任务回到固定屏）"
+                        },
+                )
+            }
+        }
+        val ctx = appContextRef
+        val mapPkg = ctx?.let { defaultMapComponent(it)?.packageName }
+        if (mapPkg != null && mapDisplayId >= 0) {
+            val frozen = tasksOf(taskIdsByDisplayPkg(), mapPkg, mapDisplayId).isEmpty()
+            if (frozen != mapFrozen) {
+                mapFrozen = frozen
+                logSink?.invoke(
+                    "MAP: " +
+                        if (frozen) {
+                            "冻结（地图屏无任务——地图被移到手机侧或已退出；点地图卡自动拉回）"
+                        } else {
+                            "恢复（任务回到地图屏）"
+                        },
+                )
+            }
+        }
+    }
+
+    /**
+     * 设置面板切换右侧卡片模式后实时应用（无需重连；appContextRef 为空=无会话，
+     * 下次 attach 自然生效）。app 且屏未建 → 现场建屏（Surface 由 composer 预建输入
+     * 提供，start 恒按卡片尺寸建输入）→ 启动应用 → 显示卡片；music → 退出全屏 →
+     * 释放屏 → 卡片区域交还音乐卡 View；同屏换应用 → 清旧包任务（互斥）→ 新建。
+     */
+    fun applyDashCardChanged() {
+        val ctx = appContextRef ?: return
+        Bg.run("dash-card-apply") {
+            val previous = pinnedComponent
+            val component = DashCardPrefs.resolve(ctx)
+            pinnedComponent = component
+            if (component != null) {
+                if (pinnedDisplayId < 0) {
+                    // 建屏：目标几何 = 当前分屏比例下的卡片矩形（密度=手机侧已定）
+                    val card = currentPinnedCardGeom()
+                    val surface = composer?.pinnedSurface()
+                    if (card == null || surface == null) {
+                        pinnedCardActive = false
+                        composer?.pinnedCardVisible = false
+                        logSink?.invoke("PINNED: 无法建屏（surface=${surface != null}）——右侧卡片回退音乐卡")
+                        notifyPinnedCardChanged()
+                        return@run
+                    }
+                    val created: Int
+                    if (displaysViaService) {
+                        created =
+                            CarInputClient.service?.createDisplay(
+                                "CarPlayPinned",
+                                card.widthPx,
+                                card.heightPx,
+                                card.densityDpi,
+                                surface,
+                                true,
+                            ) ?: -1
+                    } else {
+                        val dm =
+                            ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                        val vd =
+                            dm.createVirtualDisplay(
+                                "CarPlayPinned",
+                                card.widthPx,
+                                card.heightPx,
+                                card.densityDpi,
+                                surface,
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+                                null,
+                                null,
+                            )
+                        pinnedDisplay = vd
+                        created = vd?.display?.displayId ?: -1
+                    }
+                    if (created < 0) {
+                        pinnedDisplay = null
+                        pinnedCardActive = false
+                        composer?.pinnedCardVisible = false
+                        logSink?.invoke("PINNED: 固定应用屏创建失败——右侧卡片回退音乐卡")
+                        notifyPinnedCardChanged()
+                        return@run
+                    }
+                    pinnedDisplayId = created
+                    pinnedDisplayW = card.widthPx
+                    pinnedDisplayH = card.heightPx
+                    setIgnoreOrientationRequest(created, true, verify = false)
+                    composer?.pinnedCardVisible = true
+                    launchPinnedAppFresh(component, created)
+                } else if (component.packageName != previous?.packageName) {
+                    // 同屏换应用：旧包任务清掉（互斥，同 launchMapOnMapDisplay 白名单互斥语义）
+                    if (previous != null) {
+                        taskIdsOnDisplayPkg(previous.packageName, pinnedDisplayId).forEach { taskId ->
+                            Shell.exec("am stack remove $taskId", timeoutMs = 4000)
+                        }
+                    }
+                    composer?.pinnedCardVisible = true
+                    launchPinnedAppFresh(component, pinnedDisplayId)
+                } else {
+                    composer?.pinnedCardVisible = true
+                }
+                pinnedCardActive = true
+            } else {
+                pinnedCardActive = false
+                if (pinnedDisplayId >= 0) {
+                    if (pinnedFullscreen) setPinnedFullscreen(false)
+                    runCatching {
+                        if (displaysViaService) {
+                            CarInputClient.service?.releaseDisplay(pinnedDisplayId)
+                        } else {
+                            pinnedDisplay?.release()
+                            pinnedDisplay = null
+                        }
+                    }
+                    pinnedDisplayId = -1
+                    pinnedDisplayW = 0
+                    pinnedDisplayH = 0
+                    composer?.pinnedCardVisible = false
+                }
+            }
+            logSink?.invoke(
+                "PINNED: 右侧卡片切换 → " +
+                    (component?.let { "固定应用 ${it.packageName}" } ?: "音乐卡片"),
+            )
+            notifyPinnedCardChanged()
+        }
+    }
+
+    /** 当前分屏比例下的固定应用卡片几何（会话中建屏用；未 attach 返回 null）。 */
+    private fun currentPinnedCardGeom(): DisplayGeometry? {
+        if (appAreaWidth <= 0 || appAreaHeight <= 0) return null
+        val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
+        val card = pinnedCardRect(splitMainLen(), crossLen, dashSplitFraction, dockAtBottom)
+        return mapDisplayGeometry(card.width, card.height, mapDisplayDensity)
+    }
+
     /**
      * 拖动中预览分屏位置：**只改合成器绘制矩形**（地图纹理整幅拉伸渲染，不动
      * buffer、不动虚拟屏）——拖动流畅、不触发地图应用配置变更。松手才
@@ -1082,6 +1702,8 @@ object VirtualLauncher {
         if (dockAtBottom) mapTileHeight = geom.tileLen else mapTileWidth = geom.tileLen
         composer?.setTileEdgeOverride(clamped - DASH_GAP_PX / 2f)
         if (!mapFullscreen) resizeMapDisplay(false)
+        // 固定应用卡片同步 resize（拖拽中纹理整幅拉伸，松手才真实 resize——同地图 tile）
+        if (!mapFullscreen) resizePinnedDisplay(false)
         notifyMapLayout()
         appContextRef
             ?.getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -1340,6 +1962,20 @@ object VirtualLauncher {
         // 必须等队列排空再启动，否则应用刚起来就被覆盖写入杀掉（表现为闪退/落回手机屏）。
         // 执行器单线程 FIFO，正常情况下覆盖早已写完，这里立即返回。
         AppOrientationCompat.awaitPending()
+        // 固定应用 → 固定屏全屏（任何启动入口：桌面图标/dock/运行列表——被固定的应用
+        // 只有固定屏一个任务载体，不在应用屏新建实例）。冻结态先拉回（resize 先行，
+        // 新实例直接以全屏尺寸出生）
+        if (pinnedCardActive &&
+            pinnedDisplayId >= 0 &&
+            component.packageName == pinnedComponent?.packageName
+        ) {
+            setPinnedFullscreen(true)
+            if (pinnedFrozen) pullBackPinnedApp()
+            // 显式点击（grid 图标 / dock 图标）才上 dock 栏（自动拉起不上，同地图行为）
+            synchronized(runningApps) { runningApps.add(component) }
+            notifyRunningAppsChanged()
+            return true
+        }
         // 地图应用 → 地图屏全屏（任务常驻地图屏；从桌面 grid 点击同样去地图屏，
         // 与仪表盘共用同一任务，导航状态不丢）
         if (isMapPackage(component.packageName) && mapDisplayId >= 0) {
@@ -1384,11 +2020,12 @@ object VirtualLauncher {
         if (ok) {
             synchronized(runningApps) { runningApps.add(component) }
             notifyRunningAppsChanged()
-            // 仪表盘/全屏地图中打开普通应用：退出仪表盘并隐藏地图层，
+            // 仪表盘/全屏地图/固定应用全屏中打开普通应用：全部退出并隐藏叠加层，
             // 否则 SPLIT 带区继续画在应用上面（实测地图 tile 盖住打开的应用）
-            if (dashboardMode || mapFullscreen) {
+            if (dashboardMode || mapFullscreen || pinnedFullscreen) {
                 dashboardMode = false
                 mapFullscreen = false
+                pinnedFullscreen = false
                 notifyDashboard()
                 composer?.setTileLayout(DualDisplayComposer.TileLayout.HIDDEN)
                 logSink?.invoke("LAUNCHER: 退出仪表盘（普通应用已打开）")

@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 设置窄屏形态（单 Activity 响应式）：列表态 ↔ 详情态两层叠放切换。
+     宿主为车机虚拟屏（竖屏车机）或手机屏——与双栏 wide 形态共用同一套面板 Fragment。
+     settingsToast 与 activity_settings.xml 同 id 同样式：页内轻提示在虚拟屏上
+     位置可控（系统 Toast 在虚拟屏上显示位置不可控，勿退回）。 -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/m3_surface">
+
+    <!-- 列表态：设置入口清单（原手机侧二级菜单页） -->
+    <LinearLayout
+        android:id="@+id/narrowList"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="12dp"
+            android:paddingTop="10dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="10dp">
+
+            <ImageView
+                android:id="@+id/btnBack"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:background="@drawable/bg_ripple_circle"
+                android:contentDescription="返回"
+                android:padding="8dp"
+                android:src="@drawable/ic_chev_left" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:text="@string/car_settings"
+                android:textColor="#EDF3F3"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingBottom="24dp"
+            android:scrollbars="none">
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/menuList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:overScrollMode="never" />
+        </ScrollView>
+    </LinearLayout>
+
+    <!-- 详情态：M3 头部 + 内容 Fragment 容器（容器 id 与 wide 形态一致） -->
+    <LinearLayout
+        android:id="@+id/narrowDetail"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/m3_surface"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="12dp"
+            android:paddingTop="10dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="10dp">
+
+            <ImageView
+                android:id="@+id/btnBackDetail"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:background="@drawable/bg_ripple_circle"
+                android:contentDescription="返回"
+                android:padding="8dp"
+                android:src="@drawable/ic_chev_left" />
+
+            <TextView
+                android:id="@+id/contentTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:textColor="#EDF3F3"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <FrameLayout
+            android:id="@+id/settingsContainer"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/settingsToast"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="21dp"
+        android:alpha="0"
+        android:background="@drawable/bg_settings_toast"
+        android:paddingLeft="13dp"
+        android:paddingTop="7dp"
+        android:paddingRight="13dp"
+        android:paddingBottom="7dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="13sp" />
+</FrameLayout>

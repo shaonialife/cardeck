@@ -168,8 +168,31 @@ class DualDisplayComposer(
     @Volatile
     private var mapInput: Input? = null
 
+    /**
+     * 固定应用屏输入（仪表盘右侧卡片）：**恒创建**（音乐卡片模式也建）——设置面板
+     * 会话中切换「音乐 ⇄ 指定应用」时要用它的 Surface 现场建虚拟屏，届时 GL 线程
+     * 已进入合成循环、无法再走 runGl 的建输入路径。
+     */
     @Volatile
-    var onSurfacesReady: ((dock: Surface, app: Surface, appHi: Surface?, map: Surface?) -> Unit)? = null
+    private var pinnedInput: Input? = null
+
+    /** 右侧卡片是否画固定应用屏（VirtualLauncher 按模式切换；false = 音乐卡 View 区域）。 */
+    @Volatile
+    var pinnedCardVisible: Boolean = false
+
+    /** 固定应用屏 Surface（会话中建屏用；GL 未就绪/未创建时 null）。 */
+    fun pinnedSurface(): Surface? = pinnedInput?.surface
+
+    /** 固定应用屏动态 resize 后同步消费端 buffer 尺寸（同 [resizeMapInput] 铁律）。 */
+    fun resizePinnedInput(
+        width: Int,
+        height: Int,
+    ) {
+        pinnedInput?.surfaceTexture?.setDefaultBufferSize(width, height)
+    }
+
+    @Volatile
+    var onSurfacesReady: ((dock: Surface, app: Surface, appHi: Surface?, map: Surface?, pinned: Surface?) -> Unit)? = null
 
     @Throws(IllegalStateException::class)
     fun start(
@@ -181,6 +204,8 @@ class DualDisplayComposer(
         appHiHeightPx: Int = 0,
         mapWidthPx: Int = 0,
         mapHeightPx: Int = 0,
+        pinnedWidthPx: Int = 0,
+        pinnedHeightPx: Int = 0,
     ) {
         if (running.getAndSet(true)) return
         hasHiInput = appHiWidthPx > 0 && appHiHeightPx > 0
@@ -191,7 +216,18 @@ class DualDisplayComposer(
         glThread =
             Thread({
                 try {
-                    runGl(dockWidthPx, dockHeightPx, appWidthPx, appHeightPx, appHiWidthPx, appHiHeightPx, mapWidthPx, mapHeightPx)
+                    runGl(
+                        dockWidthPx,
+                        dockHeightPx,
+                        appWidthPx,
+                        appHeightPx,
+                        appHiWidthPx,
+                        appHiHeightPx,
+                        mapWidthPx,
+                        mapHeightPx,
+                        pinnedWidthPx,
+                        pinnedHeightPx,
+                    )
                 } catch (error: IllegalStateException) {
                     failure = error
                 } finally {
@@ -233,10 +269,12 @@ class DualDisplayComposer(
 
     /**
      * 地图屏（tile）布局状态：HIDDEN=普通桌面；SPLIT=采样画面中央带区映射到
-     * 应用区左半（地图中心≈车辆位置，裁剪语义正确）；FULLSCREEN=整个应用区。
-     * 地图屏始终以全屏尺寸创建（应用窗口稳定，任务不迁移），分/全屏只是采样几何。
+     * 应用区左半（地图中心≈车辆位置，裁剪语义正确）；FULLSCREEN=整个应用区；
+     * PINNED_FULLSCREEN=整个应用区被固定应用屏占据（右侧卡片模式的应用全屏，
+     * 此时地图 tile 不绘制）。地图屏始终以全屏尺寸创建（应用窗口稳定，任务不迁移），
+     * 分/全屏只是采样几何。
      */
-    enum class TileLayout { HIDDEN, SPLIT, FULLSCREEN }
+    enum class TileLayout { HIDDEN, SPLIT, FULLSCREEN, PINNED_FULLSCREEN }
 
     @Volatile
     private var tileLayout = TileLayout.HIDDEN
@@ -300,6 +338,8 @@ class DualDisplayComposer(
         hiH: Int,
         mapW: Int,
         mapH: Int,
+        pinnedW: Int,
+        pinnedH: Int,
     ) {
         // ---- EGL ----
         val display: EGLDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
@@ -372,6 +412,9 @@ class DualDisplayComposer(
         val app = newInput(appW, appH).also { appInput = it }
         val hi = if (hasHiInput) newInput(hiW, hiH).also { appHi = it } else null
         val map = if (hasMapInput) newInput(mapW, mapH).also { mapInput = it } else null
+        // 固定应用屏输入恒创建（buffer 尺寸=卡片矩形×密度，音乐模式无帧不绘制）：
+        // Surface 常在，设置面板会话中切换模式才能现场建虚拟屏（见 pinnedInput 注释）
+        val pinned = newInput(pinnedW, pinnedH).also { pinnedInput = it }
 
         // ---- 着色器 ----
         val program = buildProgram(oes = true)
@@ -571,6 +614,14 @@ class DualDisplayComposer(
                     it.surfaceTexture.updateTexImage()
                 }
             }
+            pinnedInput?.let {
+                if (it.hasNewFrame) {
+                    it.hasNewFrame = false
+                    it.hasContent = true
+                    it.frameCount++
+                    it.surfaceTexture.updateTexImage()
+                }
+            }
             val activeInput = if (activeAppHi) hi else app
             if (dockAtBottom) {
                 // 竖屏：dock 横条贴底（GL 坐标 y=0 为底边），app 在其余区域；
@@ -580,11 +631,11 @@ class DualDisplayComposer(
                     drawInput(activeInput, 0f, outWidth.toFloat(), dockH.toFloat(), outHeight.toFloat())
                 }
                 val layoutP = tileLayout
-                if (map?.hasContent == true && layoutP != TileLayout.HIDDEN) {
+                if (map?.hasContent == true && layoutP != TileLayout.HIDDEN && layoutP != TileLayout.PINNED_FULLSCREEN) {
                     if (layoutP == TileLayout.FULLSCREEN) {
                         drawInput(map!!, 0f, outWidth.toFloat(), dockH.toFloat(), outHeight.toFloat())
                     } else {
-                        // 上半卡片：左右留 16、顶留 16；pager 水平滑动 → tile 向左滑出（跟手）
+                        // 上半卡片：左右各留 16、顶留 16；pager 水平滑动 → tile 向左滑出（跟手）
                         // tileEdgeOverride = tile 把手侧边缘（顶部原点 y，即 tile 下缘）；
                         // GL y = outHeight − 顶部 y（底部原点换算，勿翻转——坐标系约定见类注释）
                         val tileH = (outHeight - dockH) / 2f - CARD_MARGIN_PX * 1.5f
@@ -620,6 +671,28 @@ class DualDisplayComposer(
                         )
                     }
                 }
+                // 固定应用屏（右侧卡片）：PINNED_FULLSCREEN=盖满应用区（地图不画）；
+                // SPLIT=画在地图卡下方（= 音乐卡 View 的区域），同 slide 跟手滑动。
+                if (pinnedInput?.hasContent == true && layoutP != TileLayout.HIDDEN) {
+                    if (layoutP == TileLayout.PINNED_FULLSCREEN) {
+                        drawInput(pinnedInput!!, 0f, outWidth.toFloat(), dockH.toFloat(), outHeight.toFloat())
+                    } else if (pinnedCardVisible) {
+                        val tileH = (outHeight - dockH) / 2f - CARD_MARGIN_PX * 1.5f
+                        val handleEdge =
+                            if (tileEdgeOverride > 0f) tileEdgeOverride else CARD_MARGIN_PX + tileH
+                        val slide = tileSlideFraction * outWidth
+                        val cardTop = handleEdge + DASH_GAP_PX
+                        val cardBottom = (outHeight - dockH - CARD_MARGIN_PX).toFloat()
+                        drawInputUV(
+                            pinnedInput!!,
+                            CARD_MARGIN_PX - slide,
+                            outWidth - CARD_MARGIN_PX - slide,
+                            outHeight - cardBottom,
+                            outHeight - cardTop,
+                            cornerRadius = TILE_CORNER_RADIUS,
+                        )
+                    }
+                }
             } else {
                 if (activeInput?.hasContent == true) {
                     drawInput(activeInput, dockW.toFloat(), outWidth.toFloat(), 0f, outHeight.toFloat())
@@ -630,7 +703,7 @@ class DualDisplayComposer(
                 //  全屏=应用区尺寸），屏上地图应用 relayout——两种布局都是整幅
                 //  1:1 映射（旧的「全尺寸屏+中央带区裁剪采样」方案已移除）。
                 val layout = tileLayout
-                if (map?.hasContent == true && layout != TileLayout.HIDDEN) {
+                if (map?.hasContent == true && layout != TileLayout.HIDDEN && layout != TileLayout.PINNED_FULLSCREEN) {
                     if (layout == TileLayout.FULLSCREEN) {
                         drawInput(map!!, dockW.toFloat(), outWidth.toFloat(), 0f, outHeight.toFloat())
                     } else {
@@ -657,6 +730,28 @@ class DualDisplayComposer(
                         )
                     }
                 }
+                // 固定应用屏（右侧卡片）：PINNED_FULLSCREEN=盖满应用区（地图不画）；
+                // SPLIT=把手右侧到应用区右缘（= 音乐卡 View 的区域），同 slide 跟手、
+                // 拖动中随 tileEdgeOverride 整幅拉伸（松手才 resize，与地图 tile 一致）。
+                if (pinnedInput?.hasContent == true && layout != TileLayout.HIDDEN) {
+                    if (layout == TileLayout.PINNED_FULLSCREEN) {
+                        drawInput(pinnedInput!!, dockW.toFloat(), outWidth.toFloat(), 0f, outHeight.toFloat())
+                    } else if (layout == TileLayout.SPLIT && pinnedCardVisible) {
+                        val half = (outWidth - dockW) / 2f
+                        val tileW = half - CARD_MARGIN_PX - CARD_MARGIN_PX / 2f
+                        val tileEdge =
+                            if (tileEdgeOverride > 0f) tileEdgeOverride else dockW + CARD_MARGIN_PX + tileW
+                        val slide = tileSlideFraction * (outWidth - dockW)
+                        drawInputUV(
+                            pinnedInput!!,
+                            tileEdge + DASH_GAP_PX - slide,
+                            outWidth - CARD_MARGIN_PX - slide,
+                            CARD_MARGIN_PX.toFloat(),
+                            (outHeight - CARD_MARGIN_PX).toFloat(),
+                            cornerRadius = TILE_CORNER_RADIUS,
+                        )
+                    }
+                }
                 // dock 最后绘制（最上层）：tile 滑动经过 dock 区域时从其下方穿过
                 if (dock.hasContent) drawInput(dock, 0f, dockW.toFloat(), 0f, outHeight.toFloat())
             }
@@ -669,7 +764,8 @@ class DualDisplayComposer(
                 dock.hasContent ||
                 app.hasContent ||
                 hi?.hasContent == true ||
-                map?.hasContent == true
+                map?.hasContent == true ||
+                pinnedInput?.hasContent == true
             ) {
                 EGL14.eglSwapBuffers(display, outputSurface)
             }
@@ -681,7 +777,7 @@ class DualDisplayComposer(
         GLES20.glClearColor(0.04f, 0.07f, 0.09f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         EGL14.eglSwapBuffers(display, outputSurface)
-        onSurfacesReady?.invoke(dock.surface, app.surface, hi?.surface, map?.surface)
+        onSurfacesReady?.invoke(dock.surface, app.surface, hi?.surface, map?.surface, pinned.surface)
         startLatch?.countDown()
 
         // ---- 合成循环 ----
@@ -703,7 +799,13 @@ class DualDisplayComposer(
                     overlayDirty ||
                         dock.hasNewFrame ||
                         (if (activeAppHi) appHi else app)?.hasNewFrame == true ||
-                        (tileLayout != TileLayout.HIDDEN && mapInput?.hasNewFrame == true)
+                        (tileLayout != TileLayout.HIDDEN && mapInput?.hasNewFrame == true) ||
+                        // 固定应用屏：卡片可见（仪表盘 SPLIT）或全屏时才驱动快车道
+                        (
+                            pinnedCardVisible &&
+                                tileLayout != TileLayout.HIDDEN &&
+                                pinnedInput?.hasNewFrame == true
+                        )
                 val now = System.currentTimeMillis()
                 val intervalMs = if (hasNew) 1000L / targetFps.coerceIn(1, 120) else 33L
                 if (now - lastComposeAt >= intervalMs) {
@@ -726,6 +828,11 @@ class DualDisplayComposer(
             map?.let {
                 runCatching { it.surface.release() }
                 runCatching { it.surfaceTexture.release() }
+            }
+            pinnedInput?.let {
+                runCatching { it.surface.release() }
+                runCatching { it.surfaceTexture.release() }
+                pinnedInput = null
             }
             hi?.let {
                 runCatching { it.surface.release() }

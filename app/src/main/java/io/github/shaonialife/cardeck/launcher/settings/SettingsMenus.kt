@@ -25,7 +25,7 @@ object SettingsMenus {
             Item(DESKTOP, "管理桌面应用", "勾选的应用显示在车机桌面", R.drawable.ic_menu_grid),
             Item(ORIENTATION, "应用横屏", "竖屏应用在车机横屏全屏显示", R.drawable.ic_screen_rotation),
             Item(DOCK, "dock 栏设置", "壁纸暗幕透明度与模糊程度", R.drawable.ic_menu_dock),
-            Item(DEFAULT_MAP, "默认地图", "仪表盘地图屏使用的地图应用", R.drawable.ic_menu_map),
+            Item(DEFAULT_MAP, "仪表盘", "仪表盘地图与右侧卡片", R.drawable.ic_menu_map),
             Item(DISPLAY, "显示", "流分辨率、帧率与触摸节流", R.drawable.ic_menu_display),
             // 杂项：不属于任何主题域的开关（曾挤在「显示」里，2026-10-26 拆出）
             Item(MISC, "杂项设置", "上车自动连接与调试日志开关", R.drawable.ic_app_settings),
@@ -40,6 +40,6 @@ object SettingsMenus {
             DOCK -> DockPanelFragment()
             DISPLAY -> DisplayPanelFragment()
             MISC -> MiscPanelFragment()
-            else -> DefaultMapPanelFragment()
+            else -> DashboardPanelFragment()
         }
 }

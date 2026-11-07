@@ -25,9 +25,12 @@
         <item name="android:windowLightNavigationBar">false</item>
     </style>
 
-    <!-- 车机设置：进入/退出用滑动转场（windowAnimationStyle 全版本可用，
-         不依赖 API 34 已废弃的 overridePendingTransition） -->
-    <style name="Theme.CarPlaySender.Settings" parent="Theme.CarPlaySender.Launcher">
+    <!-- 设置宿主（单 Activity 响应式，2026-11-07 统一）：车机屏与手机屏共用本主题。
+         曾继承 Launcher 的透明窗口——车机侧设置滑入时透出桌面；统一后手机侧也用
+         它，透明会透出手机桌面，故改继承不透明的 Theme.CarPlaySender
+         （colorBackground=#101418 深底），车机侧滑动转场保留（差异仅滑入瞬间
+         从「透出桌面」变「深底滑入」）。 -->
+    <style name="Theme.CarPlaySender.Settings" parent="Theme.CarPlaySender">
         <item name="android:windowAnimationStyle">@style/CarPlaySettingsAnimation</item>
     </style>
 

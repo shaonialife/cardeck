@@ -95,6 +95,11 @@ class GridActivity : AppCompatActivity() {
     private val mapLayoutListener: (Boolean) -> Unit =
         { _ -> runOnUiThread { refreshDashWallpaper() } }
 
+    /** 右侧卡片模式变化（音乐 ⇄ 固定应用；VirtualLauncher 在 Bg 线程回调）。
+     *  具名字段：onDestroy 对称移除（同 mapLayoutListener 的泄漏教训）。 */
+    private val pinnedCardListener: () -> Unit =
+        { runOnUiThread { applyPinnedCardMode() } }
+
     /** OEM「返回车机」块出现/变化（info 事件晚于桌面首帧到达——会话线程 fire）。 */
     private val oemListener: () -> Unit = { runOnUiThread { reload() } }
 
@@ -219,6 +224,9 @@ class GridActivity : AppCompatActivity() {
      * 状态统一写死两行，避免二者来自不同来源。
      */
     private fun renderMediaCard() {
+        // 固定应用模式：卡片区域归 CarPlayPinned 虚拟屏（合成器绘制），音乐卡 View
+        // 已隐藏——不写内容也不再续排 1s tick（模式切回时 applyPinnedCardMode 重启）
+        if (VirtualLauncher.pinnedCardActive) return
         val panel = dashboardView ?: return
         val now = MediaSessionsState.nowPlaying
         val title = now?.title?.takeIf { it.isNotBlank() }
@@ -314,6 +322,21 @@ class GridActivity : AppCompatActivity() {
         if (!dashboard && pager.currentItem == 0) pager.setCurrentItem(1, false)
     }
 
+    /**
+     * 右侧卡片=固定应用：隐藏音乐卡面板（区域由合成器画 CarPlayPinned，触摸经
+     * TouchRouter 直达固定屏）；切回音乐模式恢复显示并重启媒体卡渲染。
+     */
+    private fun applyPinnedCardMode() {
+        val panel = dashboardView ?: return
+        val pinned = VirtualLauncher.pinnedCardActive
+        panel.visibility = if (pinned) View.GONE else View.VISIBLE
+        if (pinned) {
+            tickHandler.removeCallbacks(mediaTick)
+        } else {
+            renderMediaCard()
+        }
+    }
+
     /** 音乐控制：系统媒体键（AudioManager 全局路由给活跃媒体会话，无需权限）。 */
     private fun dispatchMediaKey(keyCode: Int) {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
@@ -384,6 +407,7 @@ class GridActivity : AppCompatActivity() {
                 .addCanvasReadyListener(canvasReadyListener)
             VirtualLauncher.addDashboardListener(dashboardListener)
             VirtualLauncher.addMapLayoutListener(mapLayoutListener)
+            VirtualLauncher.addPinnedCardListener(pinnedCardListener)
             applyDashboardMode(VirtualLauncher.dashboardMode)
         }
 
@@ -591,6 +615,10 @@ class GridActivity : AppCompatActivity() {
 
         fun bind() {
             dashboardView = panel
+            // 右侧卡片=固定应用时面板整块隐藏（区域由合成器画固定屏）；把手/壁纸
+            // 切片照常工作（拖拽仍可用），媒体卡函数按 pinnedCardActive 短路
+            panel.visibility =
+                if (VirtualLauncher.pinnedCardActive) View.GONE else View.VISIBLE
             val scale = VirtualLauncher.gridScale()
             val cardMargin = (CARD_MARGIN_PX * scale).toInt()
             panel.layoutParams =
@@ -839,6 +867,7 @@ class GridActivity : AppCompatActivity() {
             .removeListener(wallpaperListener)
         VirtualLauncher.removeDashboardListener(dashboardListener)
         VirtualLauncher.removeMapLayoutListener(mapLayoutListener)
+        VirtualLauncher.removePinnedCardListener(pinnedCardListener)
         VirtualLauncher.removeOemListener(oemListener)
         MediaSessionsState
             .removeListener(mediaStateListener)

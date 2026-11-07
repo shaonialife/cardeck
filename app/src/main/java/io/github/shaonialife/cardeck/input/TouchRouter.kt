@@ -62,6 +62,16 @@ object TouchRouter {
     private var splitHandlePressed = false
 
     /**
+     * 固定应用卡片冻结拉回手势状态：冻结态（应用被拉到手机侧）按下卡片即消费整条
+     * 触摸流（不注入），改为触发 [VirtualLauncher.pullBackPinnedApp]。模式同
+     * overlay 卡手势独占——只有「按下那一刻在卡片上」的整条手势才被消费。
+     */
+    private var pinnedPullPressed = false
+
+    /** 地图卡/全屏地图冻结拉回手势状态（与 [pinnedPullPressed] 完全同构，目标屏不同）。 */
+    private var mapPullPressed = false
+
+    /**
      * MOVE 注入节流：0 = 关闭；>0 时距上次注入不足该毫秒数的 move
      * 直接合并丢弃（down/up 边界事件与跨屏切换永不节流，最终位置由 up 携带）。
      * 症状：交互滞后但帧率正常（事件派发堆积）。设置「显示」面板可调，默认 24ms。
@@ -126,6 +136,63 @@ object TouchRouter {
         val launcher = VirtualLauncher
         val dockW = launcher.dockWidthPx
         if (dockW <= 0 || launcher.appDisplayId < 0 || launcher.dockDisplayId < 0) return
+        // dock 区判定（横屏=x<dock 宽；竖屏=y≥应用区高）——固定屏的冻结拉回与路由
+        // 都必须以此为闸：全屏态的「应用区全部」命中域若不含此闸，dock 触摸会被
+        // 送进固定屏，⌂ 键变死（2026-11-07 用户实测「home 回不了桌面」根因）。
+        val inDockZone =
+            if (launcher.dockAtBottom) py >= launcher.appHeightPx else px < dockW
+        // 固定应用卡片冻结态：卡片区域（或固定屏全屏的应用区）触摸 = 拉回固定屏。
+        // 消费整条手势不注入——卡片停在最后一帧，注入没有意义；健康态触摸照常
+        // 注入固定屏（活交互面，应用内部自己响应）。
+        run {
+            if (launcher.pinnedFrozen && launcher.pinnedDisplayId >= 0) {
+                val hit =
+                    !inDockZone &&
+                        (
+                            launcher.pinnedFullscreen ||
+                                (
+                                    launcher.dashboardMode &&
+                                        launcher.tileSlideFraction <= 0.01f &&
+                                        !launcher.mapFullscreen &&
+                                        launcher.pinnedCardHit(px.toFloat(), py.toFloat())
+                                )
+                        )
+                if (hit) {
+                    if (contact.down && !pressed && !pinnedPullPressed) {
+                        pinnedPullPressed = true
+                        Bg.run("pinned-pull") { VirtualLauncher.pullBackPinnedApp() }
+                    }
+                    if (pinnedPullPressed) {
+                        if (!contact.down) pinnedPullPressed = false
+                        return
+                    }
+                }
+            } else {
+                pinnedPullPressed = false
+            }
+        }
+        // 地图冻结拉回（与固定应用同一套机制，目标屏=地图屏）：地图被拉到手机侧后
+        // 点地图卡/全屏地图 = 拉回；健康态触摸照常注入地图屏（平移/缩放不受影响）。
+        run {
+            if (launcher.mapFrozen && launcher.mapDisplayId >= 0) {
+                val hit =
+                    !inDockZone &&
+                        launcher.mapTileHit(px.toFloat(), py.toFloat()) &&
+                        !launcher.dashHandleHit(px.toFloat(), py.toFloat())
+                if (hit) {
+                    if (contact.down && !pressed && !mapPullPressed) {
+                        mapPullPressed = true
+                        Bg.run("map-pull") { VirtualLauncher.pullBackMapApp() }
+                    }
+                    if (mapPullPressed) {
+                        if (!contact.down) mapPullPressed = false
+                        return
+                    }
+                }
+            } else {
+                mapPullPressed = false
+            }
+        }
         var svc = CarInputClient.service
         if (svc == null) {
             // 主动触发重绑（手机重启/Shizuku 重启后 binder 丢失）。
@@ -157,6 +224,7 @@ object TouchRouter {
         var localX = 0
         var localY = 0
         var routedToMap = false
+        var routedToPinned = false
         // 分屏把手粘性路由：按下落在把手条内 → 整条触摸流固定路由应用屏（Grid 所在屏）
         // 直至抬起。快拖时把手落后手指、坐标会越出把手条（甚至越过地图 tile 边缘），
         // 按坐标逐帧改判会跨屏重注（pointerUp 应用屏 + pointerDown 地图屏），掐断拖拽
@@ -199,7 +267,21 @@ object TouchRouter {
                 localY = ((if (launcher.mapFullscreen) py else py - CARD_MARGIN_PX) * mapScale).toInt()
                 routedToMap = true
             }
-            if (!routedToMap) {
+            if (!routedToMap && !inDock) {
+                // 固定应用卡片（仪表盘下半）/全屏（应用区全部）：优先于应用区回退。
+                // ⚠️ 必须 !inDock 闸住——全屏命中域=应用区全部，不带闸会把 dock 触摸
+                // 也送进固定屏（⌂ 失效，2026-11-07 实测）
+                val origin = launcher.pinnedCardRouteOrigin(px, py)
+                if (origin != null) {
+                    inDock = false
+                    targetDisplay = launcher.pinnedDisplayId
+                    val scale = launcher.pinnedDisplayScale()
+                    localX = ((px - origin.first) * scale).toInt()
+                    localY = ((py - origin.second) * scale).toInt()
+                    routedToPinned = true
+                }
+            }
+            if (!routedToMap && !routedToPinned) {
                 targetDisplay = if (inDock) launcher.dockDisplayId else launcher.appDisplayId
                 localX = px
                 localY = if (inDock) py - appH else py
@@ -224,7 +306,21 @@ object TouchRouter {
                     routedToMap = true
                 }
             }
-            if (!routedToMap) {
+            if (!routedToMap && !inDock) {
+                // 固定应用卡片（把手右侧）/全屏（应用区全部）：优先于应用区回退。
+                // ⚠️ 必须 !inDock 闸住——全屏命中域=应用区全部，不带闸会把 dock 触摸
+                // 也送进固定屏（⌂ 失效，2026-11-07 实测）
+                val origin = launcher.pinnedCardRouteOrigin(px, py)
+                if (origin != null) {
+                    inDock = false
+                    targetDisplay = launcher.pinnedDisplayId
+                    val scale = launcher.pinnedDisplayScale()
+                    localX = ((px - origin.first) * scale).toInt()
+                    localY = ((py - origin.second) * scale).toInt()
+                    routedToPinned = true
+                }
+            }
+            if (!routedToMap && !routedToPinned) {
                 targetDisplay = if (inDock) launcher.dockDisplayId else launcher.activeAppDisplayId()
                 val scale = if (inDock) 1f else launcher.activeAppScale().coerceAtLeast(1f)
                 localX = if (inDock) px else ((px - dockW) * scale).toInt()
@@ -332,6 +428,8 @@ object TouchRouter {
         pressedDisplay = -1
         overlayPressed = false
         splitHandlePressed = false
+        pinnedPullPressed = false
+        mapPullPressed = false
         cancelMapTileTap()
         tapDragSlot = -1
         coordScaleX = 1f

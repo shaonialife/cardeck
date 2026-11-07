@@ -71,16 +71,6 @@
             </intent-filter>
         </activity>
 
-        <!-- 车机设置（手机侧）：二级菜单页 + 内容 Fragment 宿主（与车机双栏共用面板）。
-             不声明 configChanges：这两页是短暂的工具页，旋转重建无状态损失；
-             首页才是要保留滚动/折叠/已填内容的长驻操作台。 -->
-        <activity
-            android:name=".PhoneSettingsActivity"
-            android:exported="false" />
-        <activity
-            android:name=".SettingsContentActivity"
-            android:exported="false" />
-
         <service
             android:name=".service.CarPlayService"
             android:exported="false"

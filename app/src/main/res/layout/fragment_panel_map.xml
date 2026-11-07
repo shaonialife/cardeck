@@ -22,4 +22,19 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:layout_marginBottom="11dp"
+        android:text="右侧卡片：仪表盘另一侧的卡片内容。固定应用以手机侧密度独立成屏，点桌面图标可全屏；切换实时生效。"
+        android:textColor="#FF8E8E93"
+        android:textSize="12sp" />
+
+    <LinearLayout
+        android:id="@+id/cardOptions"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical" />
 </LinearLayout>

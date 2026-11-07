@@ -772,90 +772,7 @@
                         android:src="@drawable/ic_chev_right" />
                 </LinearLayout>
 
-                <View
-                    android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:layout_marginStart="54dp"
-                    android:background="#5A394444" />
 
-                <!-- 车机壁纸 -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:gravity="center_vertical"
-                    android:minHeight="60dp"
-                    android:orientation="horizontal"
-                    android:paddingTop="6dp"
-                    android:paddingBottom="8dp">
-
-                    <FrameLayout
-                        android:layout_width="38dp"
-                        android:layout_height="38dp"
-                        android:background="@drawable/bg_icon_tile">
-
-                        <ImageView
-                            android:layout_width="20dp"
-                            android:layout_height="20dp"
-                            android:layout_gravity="center"
-                            android:contentDescription="壁纸"
-                            android:src="@drawable/ic_wallpaper" />
-                    </FrameLayout>
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="14dp"
-                        android:layout_weight="1"
-                        android:orientation="vertical">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="车机壁纸"
-                            android:textColor="@color/m3_on_surface"
-                            android:textSize="14.5sp"
-                            android:textStyle="bold" />
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="2dp"
-                            android:text="全屏 aspectFill"
-                            android:textColor="@color/m3_on_var"
-                            android:textSize="12sp" />
-                    </LinearLayout>
-
-                    <TextView
-                        android:id="@+id/btnWallpaperPick"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:background="@drawable/bg_tbtn"
-                        android:gravity="center"
-                        android:paddingStart="12dp"
-                        android:paddingTop="9dp"
-                        android:paddingEnd="12dp"
-                        android:paddingBottom="9dp"
-                        android:text="更换"
-                        android:textColor="@color/m3_primary"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/btnWallpaperReset"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="4dp"
-                        android:background="@drawable/bg_tbtn"
-                        android:gravity="center"
-                        android:paddingStart="12dp"
-                        android:paddingTop="9dp"
-                        android:paddingEnd="12dp"
-                        android:paddingBottom="9dp"
-                        android:text="恢复默认"
-                        android:textColor="@color/m3_primary"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-                </LinearLayout>
             </LinearLayout>
 
             <!-- 强制应用横屏（跳转新页） -->
@@ -907,7 +824,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="2dp"
-                        android:text="桌面应用 · 应用横屏 · 超采样 · dock 栏 · 默认地图"
+                        android:text="桌面应用 · 应用横屏 · dock 栏 · 仪表盘"
                         android:textColor="@color/m3_on_var"
                         android:textSize="12sp" />
                 </LinearLayout>
