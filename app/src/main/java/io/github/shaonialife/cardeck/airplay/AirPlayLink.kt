@@ -982,7 +982,15 @@ class AirPlayLink(
             if (event.isEmpty()) continue
             val json = org.json.JSONObject(event)
             when (json.optString("type")) {
-                "controlSetup" -> controlJson = json
+                "controlSetup" -> {
+                    controlJson = json
+                    // G6：controlSetup 已给车机 timingPort——提前启动客户端轮询，
+                    // 争取在 recorded/起流前拿到 offset 样本
+                    timingServer.startClient(
+                        sock.inetAddress.hostAddress ?: "",
+                        json.optInt("timingPort"),
+                    )
+                }
                 "recorded" -> {
                     pendingSetupInfo = buildSetupInfo(controlJson)
                     if (pendingSetupInfo == null) {
@@ -994,11 +1002,7 @@ class AirPlayLink(
                             "timingPort=${pendingSetupInfo!!.timingPort} " +
                             "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
                     )
-                    // G6：客户端态轮询车机 timingPort（offset 记录；消费待接）
-                    timingServer.startClient(
-                        sock.inetAddress.hostAddress ?: "",
-                        pendingSetupInfo!!.timingPort,
-                    )
+                    // G6：offset 已记录；屏幕锚消费待真车证伪后再接
                     // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者）
                     sock.soTimeout = 1_000
                     startSessionPump(handle, input, output)
