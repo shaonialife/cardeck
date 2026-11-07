@@ -570,6 +570,11 @@ class AirPlayLink(
                     val json = runCatching { org.json.JSONObject(event) }.getOrNull()
                     if (json != null && json.optString("type") == "streamSetup") {
                         controlEventQueue.offer(json)
+                    } else if (json != null && json.optString("type") == "sdpSetup") {
+                        log(
+                            "AIRPLAY: SDP 端口 server=${json.optInt("serverPort")} " +
+                                "control=${json.optInt("controlPort")}",
+                        )
                     }
                 }
             }
