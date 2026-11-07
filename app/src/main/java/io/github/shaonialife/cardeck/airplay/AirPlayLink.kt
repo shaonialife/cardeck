@@ -990,6 +990,12 @@ class AirPlayLink(
                 }
                 "controlSetup" -> {
                     controlJson = json
+                    json.optJSONObject("timingPeerInfo")?.let {
+                        log("AIRPLAY: 车机 timingPeerInfo=$it")
+                    }
+                    json.optJSONArray("timingPeerList")?.let {
+                        log("AIRPLAY: 车机 timingPeerList=$it")
+                    }
                     // G6：controlSetup 已给车机 timingPort——提前启动客户端轮询，
                     // 争取在 recorded/起流前拿到 offset 样本
                     timingServer.startClient(

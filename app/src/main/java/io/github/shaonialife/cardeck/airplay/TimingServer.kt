@@ -49,6 +49,8 @@ class TimingServer(
 
     private var clientSamples = 0L
     private var clientAttempts = 0L
+    private var clientHost: String? = null
+    private var clientPort = 0
 
     /** 收到的 timesync 请求计数（诊断：车机是否真的来同步媒体时钟）。 */
     private var syncRequests = 0L
@@ -102,13 +104,19 @@ class TimingServer(
         port: Int,
     ) {
         if (port <= 0) return
-        if (clientRunning && clientThread?.isAlive == true) return
+        if (clientRunning && clientThread?.isAlive == true) {
+            if (clientHost == host && clientPort == port) return
+            // 端口变了（重连/新一轮 controlSetup）——旧目标必须换，否则永远打旧端口
+            stopClient()
+        }
         stopClient()
         try {
             val s = DatagramSocket()
             s.soTimeout = 1500
             clientSocket = s
             clientRunning = true
+            clientHost = host
+            clientPort = port
             log("TIMING: 客户端启动 host=$host port=$port")
             clientAttempts = 0
             clientThread =
