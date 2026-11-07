@@ -373,6 +373,15 @@ object NativeBridge {
     /** 会话收尾 TEARDOWN（fw: sendTeardownWithStreamDescArray；连接级空体）。 */
     external fun nativeAirplayTeardown(handle: Long): String?
 
+    /** 发 FLUSH（fw: _carAudioStream_sendFlush @0x22775b8a4；
+     *  体 {streamID, RTP-Info:"seq=%u;rtptime=%u"}）。 */
+    external fun nativeAirplaySendFlush(
+        handle: Long,
+        streamId: Long,
+        seq: Int,
+        rtpTime: Int,
+    ): String?
+
     /** 发起配对 M1（决策 = orchestrator：isPeerKnown ? verify : setup）。
      *  返回事件 JSON（空 = 无事件；{"type":"pinRequired"} = /pair-pin-start
      *  已发，车机应显示配对码，等 [nativeAirplayProvidePin]）。 */
