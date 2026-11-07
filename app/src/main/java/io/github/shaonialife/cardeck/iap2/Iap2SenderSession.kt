@@ -51,6 +51,12 @@ class Iap2SenderSession(
         val sourceVersion: String?,
         val ipAddresses: List<String>,
         val advertisedFeatures: Long? = null,
+        /** 0x4301 参数 8（mutualAuth；旧实现丢弃）。 */
+        val mutualAuth: Int = 0,
+        /** 0x4301 参数 6（sdkVersion；旧实现丢弃）。 */
+        val sdkVersion: Long = 0,
+        /** 0x4301 参数 7（asset；旧实现丢弃）。 */
+        val asset: String? = null,
     )
 
     /** WiFi 凭据（EV_WIFI 事件载荷解析产物）。 */
@@ -168,6 +174,21 @@ class Iap2SenderSession(
         val pass = nulString()
         val channel = b.getOrNull(off)?.toInt()?.and(0xFF) ?: 0
         val security = b.getOrNull(off + 1)?.toInt()?.and(0xFF) ?: 0
+        // 4301 参数 6/7/8 尾块（Rust endpoint.rs 2026-11-07+）：
+        // [mutualAuth u8][sdkVersion u32 BE][asset ]；旧载荷无此块时取默认。
+        val mutualAuth = b.getOrNull(off + 2)?.toInt()?.and(0xFF) ?: 0
+        var sdkVersion = 0L
+        var asset: String? = null
+        if (b.size >= off + 7) {
+            sdkVersion =
+                ((b[off + 3].toInt() and 0xFF).toLong() shl 24) or
+                ((b[off + 4].toInt() and 0xFF).toLong() shl 16) or
+                ((b[off + 5].toInt() and 0xFF).toLong() shl 8) or
+                (b[off + 6].toInt() and 0xFF).toLong()
+            if (b.size > off + 7) {
+                asset = String(b, off + 7, b.size - off - 7).trimEnd(' ').takeIf { it.isNotEmpty() }
+            }
+        }
         return CarPlayEndpoint(
             ssid = ssid,
             passphrase = pass,
@@ -178,6 +199,9 @@ class Iap2SenderSession(
             publicKey = pubkey,
             sourceVersion = srcvers,
             ipAddresses = ips,
+            mutualAuth = mutualAuth,
+            sdkVersion = sdkVersion,
+            asset = asset,
         )
     }
 }

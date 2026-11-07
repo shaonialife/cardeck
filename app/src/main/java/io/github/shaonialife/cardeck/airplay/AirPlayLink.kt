@@ -1,6 +1,7 @@
 package io.github.shaonialife.cardeck.airplay
 
 import android.content.Context
+import android.os.Build
 import android.os.SystemClock
 import io.github.shaonialife.cardeck.audio.AudioCodec
 import io.github.shaonialife.cardeck.audio.AudioProfile
@@ -10,6 +11,7 @@ import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.TcpLiveness
 import io.github.shaonialife.cardeck.protocol.NativeBridge
+import io.github.shaonialife.cardeck.util.DeviceIdentity
 import java.io.IOException
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -102,6 +104,9 @@ class AirPlayLink(
 
     /** pair-setup M6 取得的接收端静态身份（fw: 配对库源，verify FindPeerEx 用）。 */
     var setupReceiverIdentity: ReceiverIdentity? = null
+
+    /** 配对库持久化的接收端身份（fw: SavePeer——跨进程/重连的 verify 验签源）。 */
+    private var storedReceiverIdentity: ReceiverIdentity? = null
 
     /** pair-setup SRP 密码（车机侧展示的 PIN；null = Rust 回落 "3939"）。 */
     var setupCodeOverride: String? = null
@@ -283,13 +288,16 @@ class AirPlayLink(
      * 句柄，接收端按连接维护状态机）。返回 flow 上报 JSON。
      */
     private fun pairingRound(identity: ControllerIdentity): String {
+        // 配对库持久化身份先加载（peerKnown 判定必须看到它；否则进程重启后
+        // 明明存过 SavePeer 仍走 setup，且 verify 无钥可验）。
+        if (storedReceiverIdentity == null) storedReceiverIdentity = loadReceiverIdentity()
         // peerKnown = fw: isPeerKnown——**我方配对库存有对端 LTPK** 的分支
         // 语义：本会话 setup 完成（done）或 403（车机视 iAP2 信任为已配对）
         // 才算已知；endpoint.publicKey 是车机自己的身份，不是「车机已配对
         // 我们」的证据——误当 peerKnown 会跳过 pair-setup，车机验 M3 签名
         // 无记录 → M4 空 type5（16:40 真机 121 次循环实证）。
         val peerKnown =
-            if (setupReceiverIdentity != null || pairingForbidden) 1 else 0
+            if (storedReceiverIdentity != null || setupReceiverIdentity != null || pairingForbidden) 1 else 0
         // 配对码注入（§10.49：PIN 流接收端）。纯平台 IO：files/pair_pin.txt
         // 存在即读，每次尝试重读（adb 写入 → 下一次尝试携带）。
         if (setupCodeOverride == null) {
@@ -318,6 +326,7 @@ class AirPlayLink(
             log("AIRPLAY: ⚠ 会话创建失败（so 未加载？）")
             return "{\"op\":\"pairFail\"}"
         }
+        applyPlatformIdentity(handle)
         val outcome = pumpPairingSession(handle)
         // 失败路径才销毁（成功路径句柄移交 controlSessionHandle）
         if (controlSessionHandle != handle) {
@@ -446,6 +455,7 @@ class AirPlayLink(
                                 ident,
                                 if (pub.isEmpty()) ByteArray(0) else hexToBytes(pub) ?: ByteArray(0),
                             )
+                        setupReceiverIdentity?.let { saveReceiverIdentity(it) }
                     }
                     val write = hexToBytes(json.getString("writeKey")) ?: ByteArray(0)
                     val read = hexToBytes(json.getString("readKey")) ?: ByteArray(0)
@@ -622,12 +632,33 @@ class AirPlayLink(
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
 
     fun close() {
+        teardownSession()
         timingServer.stop()
         runCatching { socket?.close() }
         socket = null
         activeHost = null
         activeAddress = null
         iapLink = null
+        val h = controlSessionHandle
+        controlSessionHandle = 0L
+        if (sessionPumpHandle == h) sessionPumpHandle = 0L
+        if (h != 0L) NativeBridge.nativeAirplayDestroy(h)
+    }
+
+    /** fw: sendTeardownWithStreamDescArray——会话收尾通知。 */
+    private fun teardownSession() {
+        val h = controlSessionHandle
+        if (h == 0L) return
+        runCatching {
+            NativeBridge.nativeAirplayTeardown(h)
+            NativeBridge.nativeAirplayTakeOutbound(h)?.let { bytes ->
+                val out = socket?.getOutputStream() ?: return@let
+                synchronized(rtspWriteLock) {
+                    out.write(bytes)
+                    out.flush()
+                }
+            }
+        }
     }
 
     /**
@@ -641,7 +672,8 @@ class AirPlayLink(
         deviceUuidHex: String,
         mode: Int = 0,
     ): Boolean {
-        val result = NativeBridge.nativeAirplaySendHidSetInputMode(controlSessionHandle, deviceUuidHex, mode)
+        // bytes 传输（jstring 通路在荣耀 ROM 上会走 GetArrayLength 误判——2026-11-07 闪退实证）
+        val result = NativeBridge.nativeAirplaySendHidSetInputMode(controlSessionHandle, deviceUuidHex.toByteArray(), mode)
         val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
         if (!sent) log("EVENT: hidSetInputMode 发送失败(rust) - $result")
         pumpEventOutbound()
@@ -842,6 +874,7 @@ class AirPlayLink(
      *  'stup' → 流 100/101 → 'annc' → 'rcrd' 由会话机**自驱**（setup_auto_advance），
      *  Kotlin 只泵字节至 recorded/error。 */
     private fun setupRound(): String {
+        if (storedReceiverIdentity == null) storedReceiverIdentity = loadReceiverIdentity()
         if (!timingServer.start()) {
             log("AIRPLAY: 计时服务未启动（继续，但媒体时钟无法同步）")
         }
@@ -855,13 +888,14 @@ class AirPlayLink(
                     identity.pairingId.toByteArray(),
                     identity.privateKey,
                     (android.os.Build.MODEL ?: "CarDeck").toByteArray(),
-                    0,
+                    if (storedReceiverIdentity != null) 1 else 0,
                     null,
                 )
             if (handle == 0L) {
                 log("AIRPLAY: ⚠ 明文会话句柄创建失败")
                 return "{\"op\":\"setupFail\"}"
             }
+            applyPlatformIdentity(handle)
             controlSessionHandle = handle
         }
         NativeBridge.nativeAirplaySetTimingPort(handle, timingServer.port)
@@ -962,17 +996,45 @@ class AirPlayLink(
         val root = rustInfoEvent
         val displays = root?.optJSONArray("displays")
         val display = displays?.optJSONObject(0)
+        // fw: 接收端协商结果（enabledFeatures）——旧实现恒空，能力集被丢弃。
+        val enabledFeatures = ArrayList<String>()
+        cj.optJSONArray("enabledFeatures")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                arr.optString(i).takeIf { it.isNotEmpty() }?.let { enabledFeatures += it }
+            }
+        }
+        if (enabledFeatures.isEmpty()) {
+            cj.optString("enabledFeaturesHex").takeIf { it.isNotEmpty() }?.let { enabledFeatures += it }
+        }
+        // fw: /info hidDevices[]（uuid + hidDescriptor）——hidSetInputMode 武装源。
+        val hidUuids = ArrayList<String>()
+        val hidDescriptors = HashMap<String, ByteArray>()
+        root?.optJSONArray("hidDevices")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val d = arr.optJSONObject(i) ?: continue
+                val uuid = d.optString("uuid")
+                if (uuid.isEmpty()) continue
+                hidUuids += uuid
+                hexToBytes(d.optString("descriptorHex"))?.let { hidDescriptors[uuid] = it }
+            }
+        }
+        if (enabledFeatures.isNotEmpty()) {
+            log("AIRPLAY: enabledFeatures=" + enabledFeatures.joinToString(","))
+        }
+        if (hidUuids.isNotEmpty()) {
+            log("AIRPLAY: hidDevices=" + hidUuids.joinToString(",") + "（武装 hidSetInputMode）")
+        }
         return SetupInfo(
             eventPort = cj.optInt("eventPort"),
             timingPort = cj.optInt("timingPort"),
             keepAlivePort = cj.optInt("keepAlivePort").takeIf { it != 0 },
-            enabledFeatures = emptyList(),
+            enabledFeatures = enabledFeatures,
             displayWidth = (display?.optLong("widthPixels") ?: 1080L).toInt(),
             displayHeight = (display?.optLong("heightPixels") ?: 2320L).toInt(),
             displayUuid = display?.optString("uuid").orEmpty(),
             maxFps = (display?.optLong("maxFPS") ?: 30L).toInt(),
-            hidDeviceUuids = emptyList(),
-            hidDescriptors = emptyMap(),
+            hidDeviceUuids = hidUuids,
+            hidDescriptors = hidDescriptors,
             // R3 恢复接线（M5.2 起断链——/info 该键无人读；奥迪 3315 声明 true，
             // true = keepAlive 帧须携统计体 opcode=5+bplist）
             keepAliveSendStatsAsBody = root?.optBoolean("keepAliveSendStatsAsBody", false) ?: false,
@@ -1657,6 +1719,68 @@ class AirPlayLink(
         return ControllerIdentity(pairingId, privateKey, publicKey)
     }
 
+    /** 本进程 boot 关联 UUID（fw: APSCopyBootUUID 的宿主等价数据初值）。 */
+    private val bootUuid: String by lazy { UUID.randomUUID().toString() }
+
+    /** fw: appendControlSetupRequest 恒写身份键注入（平台值）。 */
+    private fun applyPlatformIdentity(handle: Long) {
+        val mac = DeviceIdentity.cachedBluetoothMac() ?: "02:00:00:00:00:00"
+        val model = Build.MODEL?.takeIf { it.isNotBlank() } ?: "iPhone"
+        val name = context?.let { DeviceIdentity.deviceName(it) } ?: model
+        NativeBridge.nativeAirplaySetIdentityEx(
+            handle,
+            mac.toByteArray(),
+            mac.toByteArray(),
+            model.toByteArray(),
+            name.toByteArray(),
+            (Build.DISPLAY ?: "").toByteArray(),
+            bootUuid.toByteArray(),
+            "iOS".toByteArray(),
+            (Build.VERSION.RELEASE ?: "").toByteArray(),
+        )
+        val featuresJson = CONTROLLER_FEATURES.joinToString(",", "[", "]") { "\"" + it + "\"" }
+        NativeBridge.nativeAirplaySetFeatures(handle, featuresJson.toByteArray())
+        val stored = storedReceiverIdentity ?: loadReceiverIdentity().also { storedReceiverIdentity = it }
+        stored?.publicKey?.takeIf { it.size == 32 }?.let {
+            NativeBridge.nativeAirplaySetPeerPublicKey(handle, it)
+        }
+    }
+
+    /** 配对库键：按车机区分（多台车不能共用一把对端公钥）。 */
+    private fun receiverKey(): String {
+        val e = endpoint
+        val id = e.deviceIdentifier?.trim().orEmpty()
+        if (id.isNotEmpty()) return id
+        val ssid = e.ssid.trim()
+        return if (ssid.isNotEmpty()) ssid else "default"
+    }
+
+    /** fw: SavePeer 持久化（identifier + 长期公钥，按车机分键）。 */
+    private fun saveReceiverIdentity(identity: ReceiverIdentity) {
+        if (identity.publicKey.size != 32 || identity.identifier.isEmpty()) return
+        storedReceiverIdentity = identity
+        val key = receiverKey()
+        context
+            ?.getSharedPreferences("airplay_identity", Context.MODE_PRIVATE)
+            ?.edit()
+            ?.putString("receiverId:$key", identity.identifier)
+            ?.putString("receiverPub:$key", Base64.getEncoder().encodeToString(identity.publicKey))
+            ?.apply()
+    }
+
+    private fun loadReceiverIdentity(): ReceiverIdentity? {
+        val prefs = context?.getSharedPreferences("airplay_identity", Context.MODE_PRIVATE) ?: return null
+        val key = receiverKey()
+        val ident = prefs.getString("receiverId:$key", null) ?: return null
+        val pub =
+            prefs
+                .getString("receiverPub:$key", null)
+                ?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
+                ?: return null
+        if (pub.size != 32) return null
+        return ReceiverIdentity(ident, pub)
+    }
+
     // ---- 工具 ----
 
     /**
@@ -1800,3 +1924,27 @@ data class ControllerIdentity(
 
 /** fw: session+0x64 发送端主形态（createAirPlayPairingSession @0x2277AD69C）。 */
 const val FLAGS_AIRPLAY_SENDER: Int = 0xC
+
+/**
+ * 'stup' 的 features 能力提议（**数据初值**：旧 Kotlin CONTROLLER_FEATURES，
+ * catplay/奥迪真车验证；不是固件表）。接收端按「车机支持 ∩ 提议」算
+ * enabledFeatures——缺 videoPlayback/viewAreas 时奥迪直接对屏幕流 SETUP 回 400。
+ * 由 Rust appendControlSetupRequest 在 session_type==5 时原样写入。
+ */
+private val CONTROLLER_FEATURES =
+    listOf(
+        "uiContext",
+        "viewAreas",
+        "cornerMasks",
+        "focusTransfer",
+        "h.264Level5.1",
+        "mainBuffered",
+        "altScreen",
+        "enhancedSiri",
+        "hevc",
+        "sessionManagement",
+        "logTransfer",
+        "iAPChannel",
+        "vehicleStateProtocol",
+        "videoPlayback",
+    )

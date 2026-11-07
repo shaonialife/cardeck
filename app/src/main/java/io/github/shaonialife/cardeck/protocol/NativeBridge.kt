@@ -342,6 +342,37 @@ object NativeBridge {
         osVersion: ByteArray?,
     )
 
+    /** 注入 'stup' 全量平台身份键（fw: appendControlSetupRequest 恒写域——
+     *  deviceID/macAddress/model/name/osBuildVersion/correlationUUID/osName/
+     *  osVersion；缺这些键接收端视本端为匿名设备）。 */
+    external fun nativeAirplaySetIdentityEx(
+        handle: Long,
+        deviceId: ByteArray?,
+        macAddress: ByteArray?,
+        model: ByteArray?,
+        name: ByteArray?,
+        osBuildVersion: ByteArray?,
+        correlationUuid: ByteArray?,
+        osName: ByteArray?,
+        osVersion: ByteArray?,
+    )
+
+    /** 注入对端长期公钥（fw: SavePeer/FindPeerEx——verify-only M2 验签源）。 */
+    external fun nativeAirplaySetPeerPublicKey(
+        handle: Long,
+        pubkey: ByteArray,
+    )
+
+    /** 注入 'stup' features 能力数组（JSON 字符串数组；fw:
+     *  appendControlSetupRequest param_3——接收端按交集算 enabledFeatures）。 */
+    external fun nativeAirplaySetFeatures(
+        handle: Long,
+        featuresJson: ByteArray,
+    )
+
+    /** 会话收尾 TEARDOWN（fw: sendTeardownWithStreamDescArray；连接级空体）。 */
+    external fun nativeAirplayTeardown(handle: Long): String?
+
     /** 发起配对 M1（决策 = orchestrator：isPeerKnown ? verify : setup）。
      *  返回事件 JSON（空 = 无事件；{"type":"pinRequired"} = /pair-pin-start
      *  已发，车机应显示配对码，等 [nativeAirplayProvidePin]）。 */
@@ -515,7 +546,7 @@ object NativeBridge {
      *  命令体在 Rust）。返回 "" 或错误 JSON。 */
     external fun nativeAirplaySendHidSetInputMode(
         handle: Long,
-        uuid: String,
+        uuid: ByteArray,
         mode: Int,
     ): String?
 

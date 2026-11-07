@@ -14,6 +14,11 @@ import io.github.shaonialife.cardeck.protocol.NativeBridge
  * Kotlin 侧只剩：字节搬运（事件通道 onCarBytes 进、事件通道 iAPSendMessage 出）、
  * DETECT marker 应答（传输层探测，6 字节常量）、
  * HID 报文 → 媒体键/旋钮的平台注入（ConsumerKeys/HidNavigation）。
+ *
+ * ⚠ **2026-11-07 已知错误接线（勿当固件形）**：2026-11-06 iPhone 字节定谳
+ * 真隧道 = RTSP `SETUP streams[{type:130}]` 的 ChaCha20-Poly1305 NetSocket
+ * 数据流（流内跑第二套 iAP2 链），**不是事件通道**。本类仍把出站导向
+ * `iAPSendMessage`——待 G3 重接（docs/FIRMWARE-GAP-ANALYSIS.md）。
  */
 class NativeTunnelIap2Link(
     private val log: (String) -> Unit,
