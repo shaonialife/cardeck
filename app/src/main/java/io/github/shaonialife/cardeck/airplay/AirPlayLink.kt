@@ -857,6 +857,22 @@ class AirPlayLink(
      *  UUID 首 8B BE、地址 = 本端 socket、设备名。协议常量（音频位 15、
      *  authType 8、latency 512/2048）与 KeyHolder 随机键 IV 的缺省域已下沉
      *  Rust（session::send_announce 固件锚注释）。 */
+
+    /** G2 实验开关：`adb shell setprop debug.cardeck.sdp 1` 或 -Dcardeck.sdp=1。 */
+    private fun sdpModeEnabled(): Boolean {
+        if (System.getProperty("cardeck.sdp") == "1") return true
+        return runCatching {
+            val cls = Class.forName("android.os.SystemProperties")
+            val get =
+                cls.getMethod(
+                    "getBoolean",
+                    String::class.java,
+                    Boolean::class.javaPrimitiveType,
+                )
+            get.invoke(null, "debug.cardeck.sdp", false) as Boolean
+        }.getOrDefault(false)
+    }
+
     private fun buildAnnounceParams(socket: java.net.Socket?): String {
         val ia = (socket?.localSocketAddress as? java.net.InetSocketAddress)?.address
         val ip = ia?.hostAddress?.replace("%.*".toRegex(), "") ?: "0.0.0.0"
@@ -970,7 +986,7 @@ class AirPlayLink(
         }
         // 自动链启动（ANNOUNCE 参数 = 宿主平台数据：本机地址/UUID/设备名/键 IV）
         val announce = buildAnnounceParams(sock).toByteArray()
-        if (System.getProperty("cardeck.sdp") == "1") {
+        if (sdpModeEnabled()) {
             // 实验开关：走固件 SDP 序（ANNOUNCE→ssdp→volume→RECORD）
             val local = SdpLocalPorts.allocate()
             sdpLocalPorts = local
