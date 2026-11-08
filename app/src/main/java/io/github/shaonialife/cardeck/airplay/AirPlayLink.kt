@@ -1021,12 +1021,10 @@ class AirPlayLink(
                     json.optJSONArray("timingPeerList")?.let {
                         log("AIRPLAY: 车机 timingPeerList=$it")
                     }
-                    // G6：controlSetup 已给车机 timingPort——提前启动客户端轮询，
-                    // 争取在 recorded/起流前拿到 offset 样本
-                    timingServer.startClient(
-                        sock.inetAddress.hostAddress ?: "",
-                        json.optInt("timingPort"),
-                    )
+                    // G6：单 CarPlay 会话固件不会 addPeerToNetworkClock，车机也不回
+                    // 客户端 NTP（台架 2026-11-08 实测 0 样本）。客户端仅组/多 peer
+                    // 场景启用；当前单会话不启动，只保留 timesync 服务器应答。
+                    // 组会话接入点：future group/session hook 调 timingServer.startClient。
                 }
                 "recorded" -> {
                     pendingSetupInfo = buildSetupInfo(controlJson)
