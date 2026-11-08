@@ -202,7 +202,7 @@ class Iap2LinkChannel(
             val now = System.currentTimeMillis()
             if (now - lastEventPollMs >= 1000) {
                 lastEventPollMs = now
-                for (kind in 0..4) {
+                for (kind in 0..5) {
                     val ev = NativeBridge.nativeSessionTakeEvents(handle, kind)
                     if (!ev.isNullOrEmpty() && !ev.contains("\"events\":[]")) {
                         log("IAP2-EVT k=$kind " + ev.take(300))
