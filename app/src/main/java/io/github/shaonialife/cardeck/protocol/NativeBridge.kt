@@ -84,6 +84,14 @@ object NativeBridge {
     /** 识别启动（链路就绪后调；0x1D00 → 0x1D01 → 0x1D02 全程固件链）。 */
     external fun nativeSessionStartIdentification(handle: Long): Int
 
+    /** 发 MediaLibrary 信息/更新（kind 0=0x4C01 info / 1=0x4C04 update；
+     *  [paramsJson] = [{"id":N,"data":[..]}]）。 */
+    external fun nativeSessionSendMediaLibrary(
+        handle: Long,
+        kind: Int,
+        paramsJson: ByteArray,
+    ): Int
+
     /** 取走会话层入站事件（kind 0=hid/1=power/2=comm/3=feature/4=nowplaying；
      *  返回 {"kind":N,"events":[{"msg":N,"params":[{"id":N,"data":[..]}]}]}）。 */
     external fun nativeSessionTakeEvents(
