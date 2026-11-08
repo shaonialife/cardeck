@@ -783,7 +783,20 @@ object SessionController {
         }
         if (audioSender?.isRunning == true) return
         appendLog("MODE: 会话进行中，动态补启音频通道…")
-        startAudioChannel(context, client, secret != null, currentAudioHost)
+        val profile = client.audioCandidates().firstOrNull()
+        val planJson = client.endpointAudioPlanJsonFromInfo()
+        if (profile == null || planJson == null) {
+            appendLog("AUDIO: 动态音频 plan 不可用——跳过（不再走旧 SETUP 编排）")
+            return
+        }
+        val plan = client.runFirmwareSetupPlan(planJson)
+        val ev = plan?.streams?.get(profile.streamType.toInt())
+        val info = ev?.let { client.audioStreamInfoFromEvent(it, profile) }
+        if (info == null) {
+            appendLog("AUDIO: 动态音频 plan 无流密钥——跳过")
+            return
+        }
+        startAudioChannel(context, client, secret != null, currentAudioHost, profile to info)
     }
 
     /**
@@ -1761,6 +1774,7 @@ object SessionController {
         client: AirPlayLink,
         paired: Boolean,
         host: String?,
+        preNegotiated: Pair<AudioProfile, AirPlayLink.AudioStreamInfo>? = null,
     ): Boolean {
         if (!audioEnabledForSession) {
             appendLog("AUDIO: 本次连接未开启车机侧声音（「启动连接」弹窗选择）——仅推视频")
@@ -1782,30 +1796,11 @@ object SessionController {
             val tuning = AudioTuning.RAW_SPF
             // 候选序 = Rust D7 选择（R3 起 AudioProfileMemory 记忆退役——
             // 候选位图即车机自报声明，按序重试已覆盖「某档不被接受」场景）
-            val ordered = client.audioCandidates()
-            if (ordered.isEmpty()) {
-                appendLog("AUDIO: 没有可用音频档位——仅推视频")
-                return false
-            }
-            appendLog("AUDIO: 音频档位候选=${ordered.map { it.label }}（封装=${tuning.detail}）")
-            // SETUP 失败不会扰动会话（车机只是不接这条流的请求），所以本会话内就把候选
-            // 试完，不必等下一次连接。这一点对当前场景很关键：102/AAC-LC 与 100/PCM 是
-            // 两条完全不同的通路，前者不被接受时应当立刻退到后者，而不是让用户白连一次。
-            var chosen: AudioProfile? = null
-            var streamInfo: AirPlayLink.AudioStreamInfo? = null
-            for (candidate in ordered) {
-                val result = client.runAudioStream(candidate, tuning)
-                if (result != null) {
-                    chosen = candidate
-                    streamInfo = result
-                    break
-                }
-                appendLog("AUDIO: 档位 ${candidate.label} 协商失败——本会话继续试下一档")
-            }
-            val profile = chosen
-            val audio = streamInfo
+            // SetupPlan 已预协商：不得再发一次 SETUP；旧候选循环已删除。
+            val profile = preNegotiated?.first
+            val audio = preNegotiated?.second
             if (profile == null || audio == null) {
-                appendLog("AUDIO: 全部候选档位协商失败（共 ${ordered.size} 档）——本次仅推视频")
+                appendLog("AUDIO: 无预协商音频流——本次仅推视频")
                 return false
             }
             // 首选 REMOTE_SUBMIX 采集（shell UserService，免投屏授权链）：submix 输入
@@ -2383,7 +2378,18 @@ object SessionController {
                         appendLog(
                             "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}",
                         )
-                        val screen = client.runScreenStream(setup.displayUuid)
+                        val audioProfile = if (audioEnabledForSession) client.audioCandidates().firstOrNull() else null
+                        val planJson =
+                            client.endpointPlanJsonFromInfo()
+                                ?: client.setupPlanJson(setup.displayUuid, audioProfile)
+                        val plan = client.runFirmwareSetupPlan(planJson)
+                        val screen = plan?.streams?.get(110)?.let { client.screenStreamInfoFromEvent(it) }
+                        var preAudio: Pair<AudioProfile, AirPlayLink.AudioStreamInfo>? = null
+                        if (audioProfile != null) {
+                            val audioEv = plan?.streams?.get(audioProfile.streamType.toInt())
+                            val audioInfo = audioEv?.let { client.audioStreamInfoFromEvent(it, audioProfile) }
+                            if (audioInfo != null) preAudio = audioProfile to audioInfo
+                        }
                         if (screen != null) {
                             // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
                             // 视频数据端口与 keepAlive 都按它建 socket；IPv6 端点也算
@@ -2501,7 +2507,6 @@ object SessionController {
                             // 返回同一毫秒、且 5 次实测全部复现。故顺序改为：
                             //   屏幕 SETUP → 连数据端口 → RECORD → 起编码器（出帧）→ 音频 SETUP
                             // 音频 SETUP 失败只丢声音，视频会话保持。
-                            client.record()
                             if (host != null) {
                                 val videoW = pendingVideoW
                                 val videoH = pendingVideoH
@@ -2541,8 +2546,14 @@ object SessionController {
                             }
                             // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
                             // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
-                            val audioStarted = startAudioChannel(context, client, sessionKey != null, host)
-                            if (audioStarted) {
+                            val audioStarted =
+                                if (audioProfile != null && preAudio == null) {
+                                    appendLog("AUDIO: SetupPlan 音频流未成功（缺 streamKey/端口）——不再二次发 SETUP")
+                                    false
+                                } else {
+                                    startAudioChannel(context, client, sessionKey != null, host, preAudio)
+                                }
+                            if (audioStarted && preAudio == null) {
                                 // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
                                 // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200
                                 // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：

@@ -94,10 +94,14 @@ object BridgeClient {
 
     private var tapInstalled = false
 
+    @Synchronized
     fun start(context: Context) {
         appContext = context.applicationContext
         installTap()
-        if (running) return
+        if (running) {
+            DebugFileLog.append(context, "BRIDGE: 重复 start 被忽略（已有连接循环）")
+            return
+        }
         running = true
         // 蜂窝通道必须先就位：首次连接就可能发生在车机会话里（进程网络已被绑走）
         route = InternetRoute(context.applicationContext).also { it.start() }
@@ -107,6 +111,7 @@ object BridgeClient {
         }
     }
 
+    @Synchronized
     fun stop() {
         running = false
         route?.stop()

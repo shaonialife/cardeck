@@ -5,8 +5,6 @@ import android.os.Build
 import android.os.SystemClock
 import io.github.shaonialife.cardeck.audio.AudioCodec
 import io.github.shaonialife.cardeck.audio.AudioProfile
-import io.github.shaonialife.cardeck.audio.AudioSender
-import io.github.shaonialife.cardeck.audio.AudioTuning
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.TcpLiveness
@@ -571,9 +569,10 @@ class AirPlayLink(
                 drainRustOutbound(handle, output)
                 if (!event.isNullOrEmpty()) {
                     val json = runCatching { org.json.JSONObject(event) }.getOrNull()
-                    if (json != null && json.optString("type") == "streamSetup") {
+                    val t = json?.optString("type")
+                    if (json != null && (t == "streamSetup" || t == "recorded")) {
                         controlEventQueue.offer(json)
-                    } else if (json != null && json.optString("type") == "sdpSetup") {
+                    } else if (json != null && t == "sdpSetup") {
                         log(
                             "AIRPLAY: SDP 端口 server=${json.optInt("serverPort")} " +
                                 "control=${json.optInt("controlPort")}",
@@ -954,36 +953,9 @@ class AirPlayLink(
                 }
             }
         }
-        // info：明文路径未拉过（配对路径已在配对泵拉）——fw: fetchInitialInfo
-        // 先行（@0x227763824）
-        if (rustInfoEvent == null) {
-            NativeBridge.nativeAirplayInfo(handle)
-            drain()
-            val infoDeadline = System.currentTimeMillis() + 8_000
-            val infoBuf = ByteArray(16 * 1024)
-            while (rustInfoEvent == null && System.currentTimeMillis() < infoDeadline && !cancelled) {
-                val n =
-                    try {
-                        input.read(infoBuf)
-                    } catch (_: java.net.SocketTimeoutException) {
-                        continue
-                    } catch (error: IOException) {
-                        log("AIRPLAY: info 读断开 - ${error.message}")
-                        return "{\"op\":\"setupFail\"}"
-                    }
-                if (n < 0) return "{\"op\":\"setupFail\"}"
-                val ev = NativeBridge.nativeAirplayOnBytes(handle, infoBuf.copyOf(n)) ?: continue
-                drain()
-                if (ev.isNotEmpty() && org.json.JSONObject(ev).optString("type") == "info") {
-                    rustInfoEvent = org.json.JSONObject(ev)
-                    log("AIRPLAY: info deviceID=${rustInfoEvent?.optString("deviceID")}")
-                    rustInfoEvent?.let { publishOemBlock(it) }
-                }
-            }
-            if (rustInfoEvent == null) {
-                log("AIRPLAY: ⚠ info 未取得（继续连接序——display 用默认值）")
-            }
-        }
+        // info 顺序已下沉 Rust：Stage2StartTransaction 先 ensureInfoFetched
+        // （fw @0x2276cef90，+0xc4==0 → fetchInfo @0x22784e67c）；宿主只消费
+        // 自动链上抛的 info 事件。
         // 自动链启动（ANNOUNCE 参数 = 宿主平台数据：本机地址/UUID/设备名/键 IV）
         val announce = buildAnnounceParams(sock).toByteArray()
         if (sdpModeEnabled()) {
@@ -1023,6 +995,27 @@ class AirPlayLink(
             if (event.isEmpty()) continue
             val json = org.json.JSONObject(event)
             when (json.optString("type")) {
+                "info" -> {
+                    rustInfoEvent = json
+                    log("AIRPLAY: info deviceID=${json.optString("deviceID")}")
+                    publishOemBlock(json)
+                    if (controlJson != null) {
+                        pendingSetupInfo = buildSetupInfo(controlJson)
+                        if (pendingSetupInfo == null) {
+                            log("AIRPLAY: info 完成但缺 controlSetup 事件")
+                            return "{\"op\":\"setupFail\"}"
+                        }
+                        log(
+                            "AIRPLAY: ✓ 连接序完成（control+info，宿主驱动屏流）" +
+                                " eventPort=${pendingSetupInfo!!.eventPort} " +
+                                "timingPort=${pendingSetupInfo!!.timingPort} " +
+                                "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
+                        )
+                        sock.soTimeout = 1_000
+                        startSessionPump(handle, input, output)
+                        return "{\"op\":\"setupOk\"}"
+                    }
+                }
                 "volume" -> {
                     // G8：初始音量事件（SDP 序 GET /volume 回包；fw:
                     // __NTPClock... 同层）——先记录，宿主音量执行面后续接。
@@ -1037,10 +1030,31 @@ class AirPlayLink(
                     json.optJSONArray("timingPeerList")?.let {
                         log("AIRPLAY: 车机 timingPeerList=$it")
                     }
-                    // G6：单 CarPlay 会话固件不会 addPeerToNetworkClock，车机也不回
-                    // 客户端 NTP（台架 2026-11-08 实测 0 样本）。客户端仅组/多 peer
-                    // 场景启用；当前单会话不启动，只保留 timesync 服务器应答。
-                    // 组会话接入点：future group/session hook 调 timingServer.startClient。
+                    // DiPlay 等接收端在配对前 /info 已成功；Rust 自动链在
+                    // control setup 后停止，不再补发 info。此时必须立即交回宿主，
+                    // 否则等 info 事件 30s 超时（v83 DiPlay 实测）。
+                    val cachedInfo = rustInfoEvent
+                    val usable =
+                        cachedInfo != null &&
+                            (
+                                cachedInfo.optString("deviceID").isNotEmpty() ||
+                                    (cachedInfo.optJSONArray("displays")?.length() ?: 0) > 0
+                            )
+                    if (usable) {
+                        pendingSetupInfo = buildSetupInfo(controlJson)
+                        if (pendingSetupInfo != null) {
+                            log(
+                                "AIRPLAY: ✓ 连接序完成（control+cached info，宿主驱动屏流）" +
+                                    " eventPort=${pendingSetupInfo!!.eventPort} " +
+                                    "timingPort=${pendingSetupInfo!!.timingPort} " +
+                                    "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
+                            )
+                            sock.soTimeout = 1_000
+                            startSessionPump(handle, input, output)
+                            return "{\"op\":\"setupOk\"}"
+                        }
+                    }
+                    // 无缓存 info：等 Rust 自动链补发的 Info 事件。
                 }
                 "recorded" -> {
                     pendingSetupInfo = buildSetupInfo(controlJson)
@@ -1311,100 +1325,6 @@ class AirPlayLink(
     }
 
     /**
-     * SETUP：协商主音频流（type 100，RTP over UDP）。
-     *
-     * 线格式与视频同族但传输不同：接收端在应答里开 **UDP** dataPort/controlPort，
-     * 手机把 PCM 帧按 [AudioSender] 的格式发过去。
-     *
-     * **流钥 A3 起随 Rust streamSetup 应答交付**（fw:
-     * `_coreUtilsKeyHolder_CreateEncryptionKeysForStream` @0x2276c9a20——
-     * HKDF-SHA512(shared, "DataStream-Salt<connId>",
-     * "DataStream-Output-Encryption-Key")；事件 `streamKey` 键）——宿主零本地
-     * 派生，未配对会话（无 DataStream 钥域）Rust 不交付 → 本壳跳过。
-     *
-     * 字段按 catplay 发送端（`StreamDescriptionAudio::new`）对齐：
-     *  - `audioLatencyMs` 必填（接收端会读；漏发会让严格实现拆会话）
-     *  - `audioType` **按车机 /info 声明协商**（D7 候选 = Rust 选择，[audioCandidates]）：
-     *    媒体音频优先 `media` 通道；曾经写死 `compatibility` 时车机接受 SETUP、给端口、
-     *    照收包，但不接入播放通路（无声）——这是 2026-10-17 的主根因之一
-     *  - `streamConnectionID` 用随机正 i64（catplay 同款 `rand::random::<u64>()`）：时间戳
-     *    余数在短时间重连时会撞号
-     *  - 不额外 GET /info（实测多花 ~2.5s；/info 已在握手阶段拉过并缓存复用）
-     *
-     * 格式由候选档给定（Rust D7 选择）；采样率下发给 [AudioSender] 保持一致。
-     */
-    fun runAudioStream(
-        profile: AudioProfile,
-        tuning: AudioTuning = AudioTuning.RAW_SPF,
-    ): AudioStreamInfo? {
-        // 档位由调用方按「车机 /info 声明的候选（Rust D7 选择）+ 本车机历史记忆」
-        // 选定后传进来：同一台车机上不同 audioType 档位的可用性完全不同（见
-        // AudioProfile 注释），单档失败就换下一档，而不是每次连接都盲试同一档。
-        log(
-            "AIRPLAY: 音频协商 → audioType=${profile.audioType} " +
-                "format=0x${profile.formatBit.toString(16)} ${profile.sampleRate}Hz " +
-                "latency=${profile.latencyMs}ms（档位=${profile.label}，" +
-                "封装=${tuning.detail}）",
-        )
-        // 随机正 i64：掩掉符号位避免负数（plist 有符号整数编码）
-        val connectionId = (SecureRandom().nextLong() and Long.MAX_VALUE).coerceAtLeast(1L)
-        // spf 取值：AAC 一帧 1024 采样；PCM 与发送端每包 352 帧保持一致
-        // （2026-10-20 Honda 实测：不声明 spf 时车机照样收包但喇叭无声）
-        val spfValue =
-            tuning.spf?.let {
-                if (profile.codec == AudioCodec.AAC_LC) it.toLong() else AudioSender.SAMPLES_PER_PACKET.toLong()
-            }
-        // §10.60：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）。
-        // connectionId 本端生成并**随请求携带**（fw: 调用方流字典原样并入
-        // @0x2276c5428；DataStream 解密钥两侧同值域），Rust 尊重调用方值并回带。
-        // input/redundancy/highAccuracy 缺省已下沉 Rust（R2 壳层定形）。
-        var controlPortFromEv = 0
-        if (sessionPumpHandle != 0L) {
-            val connIdJson = connectionId.toString()
-            val spfJson = spfValue?.let { ",\"spf\":$it" } ?: ""
-            val ev =
-                rustStreamSetupWait(
-                    "{\"streamType\":${profile.streamType},\"streamConnectionID\":\"" + connIdJson +
-                        "\",\"audioFormat\":${profile.formatBit},\"audioType\":\"${profile.audioType}\"" +
-                        ",\"audioLatencyMs\":${profile.latencyMs}" +
-                        ",\"supportsHighAccuracyTimestamps\":${tuning.highAccuracyTimestamps}" +
-                        spfJson + "}",
-                    timeoutMs = 8_000,
-                ) ?: run {
-                    log("AIRPLAY: 音频流协商失败（Rust 泵超时/断开）")
-                    return null
-                }
-            val dataPort = ev.optInt("dataPort")
-            if (dataPort == 0) {
-                log("AIRPLAY: 音频流被拒绝（ev=$ev）")
-                return null
-            }
-            controlPortFromEv = ev.optInt("controlPort")
-            // A3 下沉：流钥随应答交付（fw: DataStream-Output-Encryption-Key
-            // @0x2276c9a20）；未交付 = 未配对会话（无 DataStream 钥域）——跳过
-            val streamKey = hexToBytes(ev.optString("streamKey"))
-            if (streamKey == null) {
-                log("AIRPLAY: 流密钥未交付（未配对会话无 DataStream 钥域）——音频跳过")
-                return null
-            }
-            log(
-                "AIRPLAY: ✓ 音频流协商成功（Rust）type=${profile.streamType} " +
-                    "dataPort=$dataPort controlPort=$controlPortFromEv connId=$connectionId",
-            )
-            // 音量探测/抬升待 Rust 'gsp'/'spp' 原语（GET/SET_PARAMETER）——跳过不影响主链路
-            return AudioStreamInfo(
-                streamConnectionId = connectionId,
-                dataPort = dataPort,
-                controlPort = controlPortFromEv,
-                streamKey = streamKey,
-                sampleRate = profile.sampleRate,
-            )
-        }
-        // legacy RTSP 直写段已删（§10.62：泵恒在，Rust 快路唯一路径）。
-        return null
-    }
-
-    /**
      * D7 音频候选（R2 起全在 Rust）：会话 'info' 存档 → fw::airplay::session
      * `InfoReply::audio_candidates`（位图匹配 + media 优先 + 250ms 钳制，
      * Honda/Alpine 定谳语义见 Rust 侧注释）。Kotlin 只做 JSON→AudioProfile
@@ -1473,51 +1393,131 @@ class AirPlayLink(
      * → AES-128-CTR（全零会话钥派生，catplay 对照域））——宿主零本地派生，
      * 事件 `cipher` 键选择形态、`streamKey`/`key`+`iv` 携钥。
      */
-    fun runScreenStream(displayUuid: String? = null): ScreenStreamInfo? {
-        val streamUuid =
-            displayUuid ?: java.util.UUID
-                .randomUUID()
-                .toString()
-        log(
-            "AIRPLAY: 主屏流 SETUP uuid=$streamUuid " +
-                if (displayUuid == null) {
-                    "（⚠️ /info 未提供 displayUuid，只能用随机值——车机可能收下流却不绑到任何屏）"
-                } else {
-                    "（来自 /info displays[].uuid）"
-                },
-        )
-        // §10.57：Rust 会话态走 native 流 SETUP（控制通道写计数器单持有者）。
-        // streamType=110/latencyMs=25 协议常量已下沉 Rust（R2 壳层定形）；
-        // uuid 必须是接收端 /info displays[] 声明的显示屏 UUID（真车会校验；
-        // 随机值曾致 Audi 直接 400 拆会话）。
-        if (sessionPumpHandle != 0L) {
-            val ev =
-                rustStreamSetupWait(
-                    "{\"streamType\":110,\"uuid\":\"$streamUuid\"}",
-                ) ?: run {
-                    log("AIRPLAY: 流协商失败（Rust 泵超时/断开）")
-                    return null
-                }
-            val dataPort = ev.optInt("dataPort")
-            if (dataPort == 0) {
-                log("AIRPLAY: 主屏流被拒绝（ev=$ev）")
-                return null
-            }
-            // 帧密钥与 legacy 同构：connectionId = Rust 请求侧生成值（事件回带）
-            val connectionId =
-                ev.optString("streamConnectionID").toLongOrNull()
-                    ?: (java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L)
-            // A4 下沉：封包态驻留 Rust 会话（fw: cryptor 驻留流存储域）——
-            // 事件不再携钥，帧密封经 nativeAirplayScreenSealFrame 在 Rust 完成
-            log("AIRPLAY: ✓ 主屏流已接受（Rust）dataPort=$dataPort connId=$connectionId")
-            // 注意：**不可**在此 armMib3VirtualLink()——那是 MIB3 隧道机型的
-            // 移交序列（拆蓝牙+detect）；非隧道机（DiPlay，iAPChannel=false）
-            // 调用即自拆会话（真机 22:28:59 实证：BT 退役 → EVENT reset →
-            // 视频 dataPort REFUSED）。门禁留在 legacy 分支。
-            return ScreenStreamInfo(connectionId, dataPort)
+
+    /** 屏流的 endpoint 描述（SetupPlan 输入；uuid 来自 /info displays[0]）。 */
+    fun screenStreamPlanJson(displayUuid: String?): String {
+        val uuid = displayUuid?.takeIf { it.isNotBlank() }
+        return if (uuid == null) {
+            "[{\"streamType\":110}]"
+        } else {
+            "[{\"streamType\":110,\"uuid\":\"$uuid\"}]"
         }
-        // legacy RTSP 直写段已删（§10.62）。
+    }
+
+    /** SetupPlan 结果：各流 SETUP 事件（按 streamType）+ RECORD 完成。 */
+    class PlanResult(
+        val streams: Map<Int, org.json.JSONObject>,
+        val recorded: Boolean,
+    )
+
+    /** 屏 + 可选音频的 endpoint plan JSON（音频格式由 /info 候选档提供）。 */
+    fun setupPlanJson(
+        displayUuid: String?,
+        audio: AudioProfile?,
+    ): String {
+        val items = ArrayList<String>()
+        val uuid = displayUuid?.takeIf { it.isNotBlank() }
+        items +=
+            if (uuid == null) {
+                "{\"streamType\":110}"
+            } else {
+                "{\"streamType\":110,\"uuid\":\"$uuid\"}"
+            }
+        if (audio != null) {
+            items += "{\"streamType\":${audio.streamType}," +
+                "\"audioType\":\"${audio.audioType}\"," +
+                "\"audioFormat\":${audio.formatBit}," +
+                "\"audioLatencyMs\":${audio.latencyMs}}"
+        }
+        return items.joinToString(",", "[", "]")
+    }
+
+    /** Rust 侧 /info 构造的 endpoint 集合 JSON；空 = /info 未取得。 */
+    fun endpointPlanJsonFromInfo(preferCompat: Boolean = false): String? {
+        val h = sessionPumpHandle
+        if (h == 0L) return null
+        val json = NativeBridge.nativeAirplayPlanFromInfo(h, if (preferCompat) 1 else 0)
+        return json.takeIf { it.isNotEmpty() && it != "[]" }
+    }
+
+    /** Rust /info 生成的仅音频 plan；空 = /info 未取得。 */
+    fun endpointAudioPlanJsonFromInfo(preferCompat: Boolean = false): String? {
+        val h = sessionPumpHandle
+        if (h == 0L) return null
+        val json = NativeBridge.nativeAirplayAudioPlanFromInfo(h, if (preferCompat) 1 else 0)
+        return json.takeIf { it.isNotEmpty() && it != "[]" }
+    }
+
+    /** 固件式 SetupPlan：control→info 已完成，modes 已发；本方法推进 流→RECORD。 */
+    fun runFirmwareSetupPlan(
+        planJson: String,
+        timeoutMs: Long = 8_000,
+    ): PlanResult? {
+        val h = sessionPumpHandle
+        val sock = socket ?: return null
+        if (h == 0L) return null
+        controlEventQueue.clear()
+        NativeBridge.nativeAirplaySetupPlan(h, planJson.toByteArray(), 1)
+        drainRustOutbound(h, sock.getOutputStream())
+        NativeBridge.nativeAirplayMarkPlanModes(h)
+        drainRustOutbound(h, sock.getOutputStream())
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val streams = HashMap<Int, org.json.JSONObject>()
+        while (System.currentTimeMillis() < deadline) {
+            val ev = controlEventQueue.poll(deadline - System.currentTimeMillis(), java.util.concurrent.TimeUnit.MILLISECONDS) ?: break
+            when (ev.optString("type")) {
+                "streamSetup" -> {
+                    val t = ev.optInt("streamType")
+                    log("AIRPLAY: SetupPlan stream[$t]=$ev")
+                    if (t != 0) streams[t] = ev
+                }
+                "recorded" -> {
+                    log("AIRPLAY: ✓ SetupPlan 完成（流+RECORD）")
+                    return PlanResult(streams, true)
+                }
+            }
+        }
+        log("AIRPLAY: SetupPlan 超时/失败")
         return null
+    }
+
+    /** 由 SetupPlan 的 streamSetup 事件构造屏流信息（不重复发 SETUP）。 */
+    fun screenStreamInfoFromEvent(ev: org.json.JSONObject): ScreenStreamInfo? {
+        val dataPort = ev.optInt("dataPort")
+        if (dataPort == 0) {
+            log("AIRPLAY: 主屏流被拒绝（ev=$ev）")
+            return null
+        }
+        val connectionId =
+            ev.optString("streamConnectionID").toLongOrNull()
+                ?: (java.security.SecureRandom().nextLong() and Long.MAX_VALUE or 1L)
+        log("AIRPLAY: ✓ 主屏流已接受（SetupPlan）dataPort=$dataPort connId=$connectionId")
+        return ScreenStreamInfo(connectionId, dataPort)
+    }
+
+    /** 由 SetupPlan 的音频 streamSetup 事件构造预协商音频流。 */
+    fun audioStreamInfoFromEvent(
+        ev: org.json.JSONObject,
+        profile: AudioProfile,
+    ): AudioStreamInfo? {
+        val dataPort = ev.optInt("dataPort")
+        if (dataPort == 0) {
+            log("AIRPLAY: 音频流被拒绝（ev=$ev）")
+            return null
+        }
+        val streamKey = hexToBytes(ev.optString("streamKey"))
+        if (streamKey == null) {
+            log("AIRPLAY: 音频流缺少 streamKey")
+            return null
+        }
+        val connId = ev.optString("streamConnectionID").toLongOrNull() ?: 0L
+        return AudioStreamInfo(
+            streamConnectionId = connId,
+            dataPort = dataPort,
+            controlPort = ev.optInt("controlPort"),
+            streamKey = streamKey,
+            sampleRate = profile.sampleRate,
+        )
     }
 
     /** RECORD：激活会话（接收端 onSessionActive）。路径用相对 `/`（catplay record() 同款）。 */

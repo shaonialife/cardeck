@@ -84,6 +84,28 @@ object NativeBridge {
     /** 识别启动（链路就绪后调；0x1D00 → 0x1D01 → 0x1D02 全程固件链）。 */
     external fun nativeSessionStartIdentification(handle: Long): Int
 
+    /** 由 Rust 的 /info 存档构造 EndpointStreamSet JSON（屏 + D7 首条音频）。 */
+    external fun nativeAirplayPlanFromInfo(
+        handle: Long,
+        preferCompat: Int,
+    ): String
+
+    /** 仅音频的 endpoint plan（动态补启音频）。 */
+    external fun nativeAirplayAudioPlanFromInfo(
+        handle: Long,
+        preferCompat: Int,
+    ): String
+
+    /** 固件式 SetupPlan：streamsJson=[{streamType,...}]；control→info→modes 回执→流→RECORD。 */
+    external fun nativeAirplaySetupPlan(
+        handle: Long,
+        streamsJson: ByteArray,
+        afterControl: Int,
+    ): String
+
+    /** modesChanged 已发送的回执，允许 SetupPlan 继续发流。 */
+    external fun nativeAirplayMarkPlanModes(handle: Long): String
+
     /** 发 MediaLibrary 信息/更新（kind 0=0x4C01 info / 1=0x4C04 update；
      *  [paramsJson] = [{"id":N,"data":[..]}]）。 */
     external fun nativeSessionSendMediaLibrary(

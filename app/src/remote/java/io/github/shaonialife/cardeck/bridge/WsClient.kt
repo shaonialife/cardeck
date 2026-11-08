@@ -130,8 +130,8 @@ class WsClient(
                     runCatching { sendFrame(OPCODE_PING, ByteArray(0), mask = true) }
                         .onFailure { runCatching { socket?.close() } }
                 },
-                25,
-                25,
+                10,
+                10,
                 TimeUnit.SECONDS,
             )
         try {
