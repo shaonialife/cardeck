@@ -639,12 +639,14 @@ class AirPlayLink(
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
 
     fun close() {
+        stopTunnelDataPlane()
         teardownSession()
         timingServer.stop()
         runCatching { socket?.close() }
         socket = null
         activeHost = null
         activeAddress = null
+        iapLink?.close()
         iapLink = null
         val h = controlSessionHandle
         controlSessionHandle = 0L
@@ -1284,6 +1286,105 @@ class AirPlayLink(
         obtainIapLink().onCarBytes(data)
     }
 
+    // ---- iAP2 数据隧道（stream 130）数据面（G3 第二刀，2026-11-08）----
+    //
+    // 130 SETUP 应答 dataPort → Rust attach（编解码接管第二端传输槽，宿主
+    // 零钥面）→ TCP 连入 → 泵线程：socket 读 → nativeAirplayTunnelFeed →
+    // 返回值（endpoint 出站已封帧密文）→ socket 写；soTimeout 周期 drain
+    // （tick/takeEvents 蹦床产物）。fw 锚见 fw::airplay::tunnel 模块头。
+
+    @Volatile
+    private var tunnelSocket: java.net.Socket? = null
+
+    @Volatile
+    private var tunnelThread: Thread? = null
+
+    /** 隧道数据面已激活（事件通道 iAP 入口让路的判据）。 */
+    val tunnelActive: Boolean
+        get() = iapLink?.tunnelActive == true
+
+    /** 由 streamSetup 事件（streamType=130）建立隧道数据面。 */
+    fun startTunnelDataPlane(streamEvent: org.json.JSONObject): Boolean {
+        val port = streamEvent.optInt("dataPort")
+        if (port <= 0) {
+            log("TUNNEL: 应答无 dataPort（车机拒绝隧道形态）——事件通道 fallback 保持")
+            return false
+        }
+        val h = sessionPumpHandle
+        if (h == 0L) return false
+        val link = obtainIapLink()
+        val iap2 = link.handle
+        if (iap2 == 0L) return false
+        val attach = NativeBridge.nativeAirplayTunnelAttach(h, iap2)
+        if (attach != 0) {
+            log("TUNNEL: attach 失败 code=$attach（seed/共享密钥缺失？）")
+            return false
+        }
+        val host =
+            activeHost ?: run {
+                log("TUNNEL: 无 activeHost——数据面未建立")
+                NativeBridge.nativeAirplayTunnelDetach(iap2)
+                return false
+            }
+        return try {
+            val sock = java.net.Socket()
+            sock.tcpNoDelay = true
+            sock.connect(java.net.InetSocketAddress(host, port), 5_000)
+            sock.soTimeout = 200
+            tunnelSocket = sock
+            val out = sock.getOutputStream()
+            val input = sock.getInputStream()
+            val th =
+                Thread(
+                    {
+                        val buf = ByteArray(16 * 1024)
+                        try {
+                            while (link.handle == iap2 && !sock.isClosed) {
+                                val n =
+                                    try {
+                                        input.read(buf)
+                                    } catch (_: java.net.SocketTimeoutException) {
+                                        0
+                                    }
+                                if (n < 0) break
+                                if (n > 0) {
+                                    val w = NativeBridge.nativeAirplayTunnelFeed(iap2, buf.copyOf(n))
+                                    if (w != null && w.isNotEmpty()) out.write(w)
+                                }
+                                // 周期冲洗：tick/takeEvents 蹦床产物（出站响应）
+                                val d = NativeBridge.nativeAirplayTunnelDrain(iap2)
+                                if (d != null && d.isNotEmpty()) out.write(d)
+                            }
+                        } catch (_: Exception) {
+                            // socket 失败 = 隧道亡（网络切换/车机拆链）；会话级
+                            // 失败回执由既有 onConnectFailed 链路处理
+                        } finally {
+                            runCatching { sock.close() }
+                        }
+                    },
+                    "iap2-tunnel-pump",
+                )
+            th.isDaemon = true
+            th.start()
+            tunnelThread = th
+            link.markTunnelActive()
+            log("TUNNEL: 数据面建立 host=$host port=$port iap2=$iap2（真车序：隧道链随车机 SYN 自推进）")
+            true
+        } catch (e: Exception) {
+            log("TUNNEL: TCP 连入失败 ${e.message}——事件通道 fallback 保持")
+            runCatching { NativeBridge.nativeAirplayTunnelDetach(iap2) }
+            false
+        }
+    }
+
+    /** 拆隧道数据面（会话收尾；第二 iAP2 会话由 [NativeTunnelIap2Link.close] 销毁）。 */
+    private fun stopTunnelDataPlane() {
+        tunnelThread?.interrupt()
+        tunnelThread = null
+        runCatching { tunnelSocket?.close() }
+        tunnelSocket = null
+    }
+
     /** 音频流协商结果（RTP over UDP；密钥同视频流规则，盐用音频连接 ID）。 */
     class AudioStreamInfo(
         val streamConnectionId: Long,
@@ -1432,11 +1533,15 @@ class AirPlayLink(
         return items.joinToString(",", "[", "]")
     }
 
-    /** Rust 侧 /info 构造的 endpoint 集合 JSON；空 = /info 未取得。 */
-    fun endpointPlanJsonFromInfo(preferCompat: Boolean = false): String? {
+    /** Rust 侧 /info 构造的 endpoint 集合 JSON；空 = /info 未取得。
+     *  withTunnel = true 时首条为 iAP2 隧道流 130（真车序，隧道数据面待接）。 */
+    fun endpointPlanJsonFromInfo(
+        preferCompat: Boolean = false,
+        withTunnel: Boolean = false,
+    ): String? {
         val h = sessionPumpHandle
         if (h == 0L) return null
-        val json = NativeBridge.nativeAirplayPlanFromInfo(h, if (preferCompat) 1 else 0)
+        val json = NativeBridge.nativeAirplayPlanFromInfo(h, if (preferCompat) 1 else 0, if (withTunnel) 1 else 0)
         return json.takeIf { it.isNotEmpty() && it != "[]" }
     }
 
@@ -1470,6 +1575,11 @@ class AirPlayLink(
                     val t = ev.optInt("streamType")
                     log("AIRPLAY: SetupPlan stream[$t]=$ev")
                     if (t != 0) streams[t] = ev
+                    if (t == 130) {
+                        // 真车序：隧道应答即建数据面（TCP 连入 + 泵；屏流
+                        // SETUP 前——车机对无隧道的媒体流可能拒绝，G3）
+                        startTunnelDataPlane(ev)
+                    }
                 }
                 "recorded" -> {
                     log("AIRPLAY: ✓ SetupPlan 完成（流+RECORD）")
@@ -1632,6 +1742,7 @@ class AirPlayLink(
                     log("EVENT: 读取结束 - ${error.message}")
                     // 事件通道断开 = 整条会话将拆：虚拟链路的 MFi 静默计时必须停
                     // （断链≠静默，防止把该车所有挑战档位污染成快速跳过）
+                    stopTunnelDataPlane()
                     iapLink?.close()
                     iapLink = null
                 }

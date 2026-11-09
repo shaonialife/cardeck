@@ -84,11 +84,34 @@ object NativeBridge {
     /** 识别启动（链路就绪后调；0x1D00 → 0x1D01 → 0x1D02 全程固件链）。 */
     external fun nativeSessionStartIdentification(handle: Long): Int
 
-    /** 由 Rust 的 /info 存档构造 EndpointStreamSet JSON（屏 + D7 首条音频）。 */
+    /** 由 Rust 的 /info 存档构造 EndpointStreamSet JSON（屏 + D7 首条音频；
+     *  withTunnel != 0 时首条 = iAP2 隧道流 130（真车序：隧道先于屏/音频）。 */
     external fun nativeAirplayPlanFromInfo(
         handle: Long,
         preferCompat: Int,
+        withTunnel: Int,
     ): String
+
+    /** iAP2 数据隧道（stream 130）编解码接管：以 130 应答暂存 seed+共享密钥
+     *  建隧道编解码并接管第二 iAP2 会话传输槽（编解码全在 Rust，宿主零钥面）。
+     *  返回 0 成功 / -1 无 seed / -2 无共享密钥 / -3 注册表毒化。 */
+    external fun nativeAirplayTunnelAttach(
+        airplayHandle: Long,
+        iap2Handle: Long,
+    ): Int
+
+    /** 隧道密文进（socket 读面）→ 解帧+记录分帧+喂第二 iAP2 Endpoint；
+     *  返回 endpoint 出站已封帧密文（socket 写面）。流错位返回空数组。 */
+    external fun nativeAirplayTunnelFeed(
+        iap2Handle: Long,
+        rawTcp: ByteArray,
+    ): ByteArray
+
+    /** 取走隧道出站缓冲（tick/takeEvents/flowStart 之后的冲洗面）。 */
+    external fun nativeAirplayTunnelDrain(iap2Handle: Long): ByteArray
+
+    /** 拆隧道态（socket 关闭/会话销毁时；传输槽蹦床随之空操作）。 */
+    external fun nativeAirplayTunnelDetach(iap2Handle: Long)
 
     /** 仅音频的 endpoint plan（动态补启音频）。 */
     external fun nativeAirplayAudioPlanFromInfo(

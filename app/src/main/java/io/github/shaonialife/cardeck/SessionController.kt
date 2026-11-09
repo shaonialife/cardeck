@@ -2379,8 +2379,11 @@ object SessionController {
                             "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}",
                         )
                         val audioProfile = if (audioEnabledForSession) client.audioCandidates().firstOrNull() else null
+                        // 真车序（2026-11-08 固件直切 + iPhone transcript）：隧道
+                        // 130 → 屏 110 → 音频；DiPlay/xcertplay 接收端支持 130。
+                        // 车机拒隧道（200 无 dataPort）时事件通道 fallback 自动保持。
                         val planJson =
-                            client.endpointPlanJsonFromInfo()
+                            client.endpointPlanJsonFromInfo(withTunnel = true)
                                 ?: client.setupPlanJson(setup.displayUuid, audioProfile)
                         val plan = client.runFirmwareSetupPlan(planJson)
                         val screen = plan?.streams?.get(110)?.let { client.screenStreamInfoFromEvent(it) }
