@@ -860,6 +860,14 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
      安装确认另有前台 Activity 转发兜底（InstallReceiver → BridgeSetupActivity）。
   ⑥ remote 变体禁自动暗幕（`ScreenDimmer.autoDimAllowed=false`，排障要看屏幕），
      常亮与手动假息屏保留。
+  ⑦ **AS 点 Run 装出 remote 版（2026-11-09 定谳）**：构建变体选择只存在本地
+     `.idea/`（gitignore），任何 IDE 重导/缓存失效后记忆丢失 → AS 落到**默认变体 =
+     flavor 字母序第一 × debug**，而 `remote` < `standard` → 默认 remoteDebug，点 Run
+     静默装出 `.rd` 包（.idea 全量搜索无任何变体记录可证）。修法：Build → Select
+     Build Variant → app → `standardDebug`（存在本地 .idea）；自验看 Run 面板任务名
+     `:app:assembleStandardDebug` 或装机 versionName 是否带 `-rd`。仓库侧无解（新版
+     AS 的 Run Configuration 没有变体字段，改名 flavor 又会牵动 CI 任务名）——每台
+     开发机重导项目后都要切一次。
 - **远程调试桥真机联调五雷**（2026-10-21 全链路打通时逐一定谳，含组件命名/网络/安装三族）：
   ① **`.rd` 包下自启组件必须写「applicationId/绝对类名」**：`am -n` 只认带斜杠的规范，
   相对类名按 applicationId 展开成不存在的 `…rd.launcher.DockActivity`、纯类名直接
