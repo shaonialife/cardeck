@@ -524,21 +524,20 @@
                             android:textSize="14.5sp"
                             android:textStyle="bold" />
 
-                        <EditText
-                            android:id="@+id/ssidInput"
+                        <!-- 只读显示（2026-11-10 用户要求去掉输入框）：SSID 由车机蓝牙
+                             0x5703 下发（SessionController.ssidSink 推送），不是用户输入的
+                             数据；空态显示提示文案（见 MainActivity.renderSsid） -->
+                        <TextView
+                            android:id="@+id/ssidValue"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
                             android:background="@drawable/bg_ssid_sel"
-                            android:hint="接收端热点 SSID（0x5703 下发）"
-                            android:importantForAutofill="no"
-                            android:inputType="text"
                             android:paddingStart="10dp"
                             android:paddingTop="6dp"
                             android:paddingEnd="10dp"
                             android:paddingBottom="6dp"
                             android:textColor="#C4D2D1"
-                            android:textColorHint="#5A6B7A"
                             android:textSize="13.5sp"
                             android:textStyle="bold" />
                     </LinearLayout>

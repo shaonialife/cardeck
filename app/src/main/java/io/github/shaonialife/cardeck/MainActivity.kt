@@ -18,7 +18,6 @@ import android.os.Looper
 import android.os.SystemClock
 import android.text.method.ScrollingMovementMethod
 import android.view.View
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -81,7 +80,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ctaLabel: TextView
     private lateinit var audioTag: TextView
     private lateinit var readyCount: TextView
-    private lateinit var ssidInput: EditText
+    private lateinit var ssidValue: TextView
     private lateinit var btDesc: TextView
     private lateinit var btBadge: TextView
     private lateinit var btnPickTarget: TextView
@@ -150,7 +149,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val ssidSink: (String) -> Unit = { ssid ->
-        runOnUiThread { ssidInput.setText(ssid) }
+        runOnUiThread { renderSsid(ssid) }
     }
 
     private val permissionLauncher =
@@ -570,7 +569,8 @@ class MainActivity : AppCompatActivity() {
         ctaLabel = findViewById(R.id.ctaLabel)
         audioTag = findViewById(R.id.audioTag)
         readyCount = findViewById(R.id.readyCount)
-        ssidInput = findViewById(R.id.ssidInput)
+        ssidValue = findViewById(R.id.ssidValue)
+        renderSsid(SessionController.lastCarWifiSsid)
         btDesc = findViewById(R.id.btDesc)
         btBadge = findViewById(R.id.btBadge)
         btnPickTarget = findViewById(R.id.btnPickTarget)
@@ -818,7 +818,7 @@ class MainActivity : AppCompatActivity() {
 
         // ---- 连接准备 ----
         findViewById<TextView>(R.id.btnWifi).setOnClickListener {
-            val ssid = ssidInput.text.toString().trim()
+            val ssid = currentSsid()
             // 自动加入不可用时的手动兜底：密码先进剪贴板，系统 WLAN 页粘贴即可
             val psk = SessionController.lastWifiPsk
             if (psk != null) {
@@ -1105,16 +1105,31 @@ class MainActivity : AppCompatActivity() {
         ctaButton.isEnabled = true
     }
 
+    /**
+     * 车机热点 SSID 只读显示（2026-11-10 用户要求去掉输入框）：数据源 = 车机蓝牙
+     * 0x5703 下发（SessionController.lastCarWifiSsid / ssidSink 推送），本应用不做
+     * 手工输入。空态给指引文案（弱色），下发后换正常色。
+     */
+    private fun renderSsid(ssid: String?) {
+        val name = ssid?.trim().orEmpty()
+        if (name.isEmpty()) {
+            ssidValue.text = "等待车机下发（蓝牙连上后自动获取）"
+            ssidValue.setTextColor(0xFF5A6B7A.toInt())
+        } else {
+            ssidValue.text = name
+            ssidValue.setTextColor(0xFFC4D2D1.toInt())
+        }
+    }
+
+    /** 当前已知车机热点名（0x5703 下发；空 = 尚未获取）。 */
+    private fun currentSsid(): String = SessionController.lastCarWifiSsid?.trim().orEmpty()
+
     private fun updateConnectedSubline() {
         if (heroState != HeroState.CONNECTED) return
         val elapsed = SystemClock.elapsedRealtime() - connectedAt
         val mm = elapsed / 60_000
         val ss = elapsed % 60_000 / 1_000
-        val ssid =
-            ssidInput.text
-                .toString()
-                .trim()
-                .ifEmpty { "车机热点" }
+        val ssid = currentSsid().ifEmpty { "车机热点" }
         heroSubline.text = String.format(Locale.US, "已连接 · %s · %02d:%02d · 视频推流中", ssid, mm, ss)
     }
 
@@ -1144,11 +1159,7 @@ class MainActivity : AppCompatActivity() {
         val shizukuReady = shizukuState == ShizukuGate.State.READY
         if (shizukuReady) ready++
         updateShizukuRow(shizukuState)
-        if (ssidInput.text
-                .toString()
-                .trim()
-                .isNotEmpty()
-        ) {
+        if (currentSsid().isNotEmpty()) {
             ready++
         }
         val btGranted =
