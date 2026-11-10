@@ -131,22 +131,23 @@ class NativeTunnelIap2Link(
 
     /**
      * 车机字节入口：事件通道（onIapEventBytes）与隧道读取共用。
-     * **隧道激活时让路**（type-130 数据面的 iAP2 字节走
-     * nativeAirplayTunnelFeed，事件通道不再喂同一链）。
+     *
+     * **隧道激活后两路都喂同一端点**（2026-11-10 5 分钟断连定谳）：
+     * 台架/车机的隧道 duplex 桥是不对称的——台架侧 `AirPlayIapTunnelStream`
+     * 发向（DETECT/SYN/1D01）走**事件通道 iAPSendMessage**、收向只读隧道
+     * socket（IapTunnel）；我方应答经 Rust 蹦床进隧道 outbox → socket。
+     * 旧实现「隧道激活即忽略事件通道字节」= 台架链路帧喂地板 →
+     * awaitReady 300s 超时 → 台架整链拆除（每轮存活恰 5 分钟）。
+     * 隧道 socket 入站（真车形）由 AirPlayLink 泵线程喂，两路同链引擎
+     * 去重安全（重复帧再 ACK 不交付）。
+     *
      * **全部进原生链**（含 6B FF 55 marker——fw: ParseBuffer FF55 扫描器
      * 完成码分派 @0x10000d8f0-914：DETECT→0x13→FSM 0x17 SendDetect 全六态
      * 回显 + 协商域重置；RequestIdentify(…FE)→0x15→FSM 0x19 仅 ATTACHED
-     * SendRST——引擎 endpoint.rs 同径实现）。Kotlin 直答分支已删（A2 直切
-     * 定谳 2026-11-05）：它是引擎固件径的重复第二实现，且缺 SendDetect 的
-     * 协商域重置副作用；出站回显经 bt_write 槽 → routeOutbound → 事件通
-     * 道，feed 同步出站时序不变。
+     * SendRST——引擎 endpoint.rs 同径实现）。
      */
     fun onCarBytes(bytes: ByteArray) {
         if (handle == 0L) return
-        if (tunnelActive) {
-            log("IAPLINK: 隧道激活，事件通道 iAP 字节忽略 ${bytes.size}B")
-            return
-        }
         NativeBridge.nativeSessionFeed(handle, bytes)
     }
 
