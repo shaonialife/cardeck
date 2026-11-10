@@ -189,12 +189,14 @@ class GridActivity : AppCompatActivity() {
         }
     }
 
-    /** 音乐卡进度自刷新（1s；渲染尾部续调度，位置由锚点+速度推算）。 */
+    /** 音乐卡进度自刷新（1s；渲染尾部续调度，位置由锚点+速度推算）。
+     *  只做渲染、不自行续排——续排在 renderMediaCard 尾部按「播放中」门控
+     *  （2026-11-10 排查耗电：暂停/无会话不再每秒唤醒主线程；旧实现 tick 自己
+     *  postDelayed + renderMediaCard 尾部也 post，同一 Runnable 双重调度）。 */
     private val mediaTick =
         object : Runnable {
             override fun run() {
                 renderMediaCard()
-                tickHandler.postDelayed(this, 1_000)
             }
         }
 
@@ -313,9 +315,14 @@ class GridActivity : AppCompatActivity() {
                 cover.setOnClickListener(null)
             }
         }
-        // 进度显示需要持续走秒：渲染尾部续调度（防重：先移除）
-        tickHandler.removeCallbacks(mediaTick)
-        tickHandler.postDelayed(mediaTick, 1_000)
+        // 进度显示需要持续走秒：播放中才续排（防重：先移除）；暂停/无会话不排，
+        // 恢复播放由状态监听器触发 renderMediaCard 重新拉起（2026-11-10 排查耗电）
+        if (MediaSessionsState.nowPlaying?.playing == true) {
+            tickHandler.removeCallbacks(mediaTick)
+            tickHandler.postDelayed(mediaTick, 1_000)
+        } else {
+            tickHandler.removeCallbacks(mediaTick)
+        }
     }
 
     /** 仪表盘模式 → pager 位置同步（0=仪表盘，1+=桌面；已在目标位则不动）。 */

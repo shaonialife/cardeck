@@ -77,12 +77,25 @@ class MediaListenerService : NotificationListenerService() {
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
-    /** 兜底轮询：部分播放器不触发回调/回调丢失时保证卡片信息更新。 */
+    /**
+     * 兜底轮询：部分播放器不触发回调/回调丢失时保证卡片信息更新。
+     * 自适应间隔（2026-11-10 排查耗电）：会话活跃（车机媒体卡需要秒级进度）1s；
+     * 无会话 4s（只服务手机侧首页卡片，getActiveSessions 是 binder 调用，
+     * 服务连接期间永续轮询、与是否连接无关——按需降频省电）。
+     */
     private val periodicRefresh =
         object : Runnable {
             override fun run() {
                 refresh()
-                mainHandler.postDelayed(this, 1_000)
+                val interval =
+                    if (io.github.shaonialife.cardeck.SessionController.videoSender
+                            ?.isRunning == true
+                    ) {
+                        1_000L
+                    } else {
+                        4_000L
+                    }
+                mainHandler.postDelayed(this, interval)
             }
         }
 

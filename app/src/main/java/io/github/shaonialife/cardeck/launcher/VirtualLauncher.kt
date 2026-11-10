@@ -1603,16 +1603,24 @@ object VirtualLauncher {
     // ---- 冻结看门狗（固定应用屏 + 地图屏共用；只标记不自动拉回——拉回只在
     //      车机侧明确交互时发生：点卡片/tile、回仪表盘、点桌面图标）----
 
-    private const val DISPLAY_WATCHDOG_INTERVAL_MS = 5_000L
+    // 15s（2026-11-10 排查耗电：原 5s——每 tick 一次 Shizuku spawn + 全量
+    // dumpsys activity activities，是会话期最大的软件功耗项；冻结标记只是
+    // 触摸拦截的开关，15s 粒度足够，回仪表盘路径本就有新鲜 pullBack 对账）
+    private const val DISPLAY_WATCHDOG_INTERVAL_MS = 15_000L
 
     @Volatile
     private var displayWatchdogRunning = false
 
     private var displayWatchdogThread: Thread? = null
 
+    @Volatile
+    private var watchdogCachedMapPkg: String? = null
+
     private fun startDisplayWatchdog() {
         if (displayWatchdogRunning) return
         displayWatchdogRunning = true
+        // 默认地图包名一次解析（appContextRef 在 attach 里先于本调用赋值）
+        watchdogCachedMapPkg = appContextRef?.let { defaultMapComponent(it)?.packageName }
         displayWatchdogThread =
             Thread {
                 while (displayWatchdogRunning) {
@@ -1634,6 +1642,7 @@ object VirtualLauncher {
         displayWatchdogRunning = false
         displayWatchdogThread?.interrupt()
         displayWatchdogThread = null
+        watchdogCachedMapPkg = null
     }
 
     /**
@@ -1641,6 +1650,11 @@ object VirtualLauncher {
      * 固定应用屏与地图屏同一套判定（屏 id + 包名 → dumpsys 任务快照）。
      */
     private fun updateFrozenStates() {
+        // 轻量门闸（2026-11-10 排查耗电）：冻结标记只在卡片/tile 触摸面可见时被
+        // 消费（触摸拦截/回仪表盘拉回）——普通应用全屏/桌面时标记无人读，
+        // 跳过整轮 dumpsys（spawn + 重型调用零成本）。重新进入消费场景后的
+        // 首窗标记最多 15s 旧值：回仪表盘路径本就有新鲜 pullBack 对账兜底。
+        if (!dashboardMode && !mapFullscreen && !pinnedFullscreen) return
         val pinnedPkg = pinnedComponent?.packageName
         if (pinnedPkg != null && pinnedDisplayId >= 0) {
             val frozen = tasksOf(taskIdsByDisplayPkg(), pinnedPkg, pinnedDisplayId).isEmpty()
@@ -1656,8 +1670,10 @@ object VirtualLauncher {
                 )
             }
         }
-        val ctx = appContextRef
-        val mapPkg = ctx?.let { defaultMapComponent(it)?.packageName }
+        // 地图组件缓存（2026-11-10 排查耗电）：defaultMapComponent 每次 = 两次
+        // PackageManager binder（getLaunchIntentForPackage + resolveActivity），
+        // 会话期间默认地图极少变化——watchdog 启动时解析一次即够。
+        val mapPkg = watchdogCachedMapPkg
         if (mapPkg != null && mapDisplayId >= 0) {
             val frozen = tasksOf(taskIdsByDisplayPkg(), mapPkg, mapDisplayId).isEmpty()
             if (frozen != mapFrozen) {
@@ -2009,7 +2025,14 @@ object VirtualLauncher {
      * 的 shell 命令）——统一从这里取快照复用。
      */
     private fun taskIdsByDisplayPkg(): Map<Int, Map<String, List<String>>> {
-        val dump = Shell.exec("dumpsys activity activities", timeoutMs = 4000).output
+        // 服务端 grep（2026-11-10 排查耗电）：全量输出数百 KB 走 Shizuku binder
+        // 回传再被正则丢弃——只保留解析需要的两类行，传输量降两个数量级
+        val dump =
+            Shell
+                .exec(
+                    "dumpsys activity activities | grep -e 'Display: mDisplayId=' -e 'Task{'",
+                    timeoutMs = 4000,
+                ).output
         var current = -1
         val out = HashMap<Int, HashMap<String, MutableList<String>>>()
         for (line in dump.lineSequence()) {
