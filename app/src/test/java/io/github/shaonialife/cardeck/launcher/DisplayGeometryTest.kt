@@ -48,14 +48,15 @@ class DisplayGeometryTest {
     }
 
     @Test
-    fun `map display scales canvas area by phone density over legacy 200`() {
-        // dp = 应用区@200dpi 不变；px = dp×560/160 = 应用区×2.8
+    fun `map display scales canvas area by phone density over shared baseline`() {
+        // 2026-11-10 基准统一（遗留 200 → DENSITY_BASELINE=160）：px = 应用区×560/160 = 应用区×3.5
         val g = VirtualLauncher.mapDisplayGeometry(1152, 648, phoneDensityDpi = phoneDensity)
         assertEquals(phoneDensity, g.densityDpi)
-        assertEquals(Math.round(1152 * 2.8f), g.widthPx)
-        assertEquals(Math.round(648 * 2.8f), g.heightPx)
-        // dp 与旧密度下的窗口一致
-        assertEquals(921.6f, g.dpWidth, 0.5f)
+        assertEquals(Math.round(1152 * 3.5f), g.widthPx)
+        assertEquals(Math.round(648 * 3.5f), g.heightPx)
+        // dp 窗口 = px×160/560 = 画布应用区原值（@160 基准的定义使然）
+        assertEquals(1152f, g.dpWidth, 0.5f)
+        assertEquals(648f, g.dpHeight, 0.5f)
     }
 
     @Test
@@ -66,15 +67,15 @@ class DisplayGeometryTest {
 
     @Test
     fun `pinned card display reuses map formula at phone density`() {
-        // 固定应用卡片（仪表盘右侧）：屏几何 = 卡片矩形（画布域）× 手机密度/200，
+        // 固定应用卡片（仪表盘右侧）：屏几何 = 卡片矩形（画布域）× 手机密度/基准(160)，
         // 密度=手机侧（与地图屏同一换算——固定应用字号与手机一致）。
-        // 500x570 卡片矩形 @560dpi：px = 矩形 × 2.8
+        // 500x570 卡片矩形 @560dpi：px = 矩形 × 3.5
         val g = VirtualLauncher.mapDisplayGeometry(500, 570, phoneDensityDpi = phoneDensity)
         assertEquals(phoneDensity, g.densityDpi)
-        assertEquals(Math.round(500 * 2.8f), g.widthPx)
-        assertEquals(Math.round(570 * 2.8f), g.heightPx)
-        // dp 窗口 = 卡片矩形 @200dpi（500/1.25、570/1.25）
-        assertEquals(400f, g.dpWidth, 0.5f)
-        assertEquals(456f, g.dpHeight, 0.5f)
+        assertEquals(Math.round(500 * 3.5f), g.widthPx)
+        assertEquals(Math.round(570 * 3.5f), g.heightPx)
+        // dp 窗口 = 卡片矩形原值（px×160/560 还原画布数值）
+        assertEquals(500f, g.dpWidth, 0.5f)
+        assertEquals(570f, g.dpHeight, 0.5f)
     }
 }

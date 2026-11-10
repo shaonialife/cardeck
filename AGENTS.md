@@ -215,13 +215,14 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
   （`context.resources.displayMetrics.densityDpi`，不 coerce——一致性是本特性核心）**，
   px = dp 窗口 × 手机密度/160，合成器 GL 缩小回画布应用区（缩放比 ≈0.43，天然高倍率
   超采样）。dp 窗口：横屏高 = LETTERBOX_TARGET_DP×LETTERBOX_ASPECT_RATIO（410×1.05），
-  竖屏宽 = 410dp，其余维度按画布应用区纵横比；地图 dp = 旧应用区@200dpi 不变（高德
+  竖屏宽 = 410dp，其余维度按画布应用区纵横比；地图/固定屏 px = 画布区域 × 手机密度/
+  DENSITY_BASELINE（2026-11-10 起基准统一为 Android dp 基准常量，原遗留 200 已退役；
   车机布局不变、标注变清晰）。px 最长边 ≤4096（GL 纹理安全，仅极端机型让密度略降）。
   **appHi 超采样屏已移除**（手机密度天然高于旧 1.5× 超采样倍率），gridDisplayId=应用屏，
   `composer.start` hi 两参传 0（`hasHiInput=false` 是既有降级路径）；`gridScale()/
   activeAppScale()` = 应用屏 px/画布应用区 px（**触摸坐标换算与 GridActivity 把手布局
   都依赖它，改密度公式必须同步检查**）；`resizeMapDisplay` 的 resize 目标 = 画布 tile
-  尺寸 × `mapDisplayDensity/200`（显示 px 域），密度参数同步传手机值。回退路径（无
+  尺寸 × `mapDisplayDensity/DENSITY_BASELINE`（显示 px 域），密度参数同步传手机值。回退路径（无
   Shizuku 应用侧屏）同样密度。旧 APP_SUPERSAMPLE/SUPERSAMPLE_MAX_HEIGHT 常量退役。
 - **竖屏桌面网格行数自适应**（2026-10-17 修复「竖屏单元格占用范围过大」：用户开
   「显示布局边界」截图暴露——固定 3 行把格子拉成 ~1:2.5 瘦高条，图标只占三成、
@@ -916,7 +917,7 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
   四方一致性），改分屏相关代码勿在四处重新裸算。
 - **仪表盘右侧卡片 = 固定应用虚拟屏（2026-11-07 落地，0.1.28.63）**：设置→「仪表盘」
   （原「默认地图」改名）可把右侧音乐卡替换为「固定应用」——独立虚拟屏
-  **CarPlayPinned**（密度=手机侧，px=卡片矩形×手机密度/200，复用
+  **CarPlayPinned**（密度=手机侧，px=卡片矩形×手机密度/DENSITY_BASELINE，复用
   `mapDisplayGeometry` 换算），GL 合成进原音乐卡区域，音乐卡 View 隐藏
   （GridActivity `pinnedCardActive` 闸）。跨会话结论：
   ① **卡片矩形三方一致契约**：`VirtualLauncher.pinnedCardRect` 纯函数（应用区坐标
