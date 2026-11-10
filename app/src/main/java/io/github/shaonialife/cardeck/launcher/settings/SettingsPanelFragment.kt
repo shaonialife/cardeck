@@ -33,7 +33,9 @@ abstract class SettingsPanelFragment : Fragment() {
             return
         }
         Bg.run("apps-scan") {
-            val scanned = VirtualLauncher.launchableApps(appContext)
+            // cachedApps（带扫描锁）而非 launchableApps（裸扫）：连接起步的预热扫描
+            // 可能正在进行——等它合并结果，绝不并发再扫一遍（2026-11-09）
+            val scanned = VirtualLauncher.cachedApps(appContext)
             VirtualLauncher.adoptAppsCache(scanned)
             requireActivity().runOnUiThread {
                 if (!isAdded || isDetached) return@runOnUiThread

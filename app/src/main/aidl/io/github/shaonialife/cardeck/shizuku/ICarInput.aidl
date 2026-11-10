@@ -31,6 +31,11 @@ interface ICarInput {
     // 应用自行 relayout——地图屏「分屏 ⇄ 全屏」切换即用此能力（任务不动，状态不丢）。
     boolean resizeDisplay(int displayId, int width, int height, int dpi);
 
+    // 把已存在的虚拟屏换到新 Surface（创建者才可调）：意外断开保留屏后，新会话的
+    // 编码器 Surface 经此接回旧屏——屏与屏上的任务/Activity 全程不动，应用状态连续。
+    // displayId 不在本进程 map（屏已被系统回收/非本进程创建）→ false，调用方回退新建。
+    boolean setDisplaySurface(int displayId, in Surface surface);
+
     // VirtualDeviceManager 路线（Android 14+ 官方 API）：以 shell 包名与车机 BT MAC 建
     // COMPANION_DEVICE_APP_STREAMING 伴侣关联 +
     // LOCK_STATE_UNLOCKED 虚拟设备，建在其上的屏整台无视主机锁屏/休眠。

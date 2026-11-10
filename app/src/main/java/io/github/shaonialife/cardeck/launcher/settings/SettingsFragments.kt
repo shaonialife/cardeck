@@ -897,6 +897,78 @@ class DisplayPanelFragment : SettingsPanelFragment() {
             },
         )
 
+        // 断开保留虚拟屏（2026-11-10）：意外断开保屏复用 + N 个 60s 重试窗口后销毁；
+        // 手动断开始终立即销毁（文案写明）。开关关时重试次数置灰。
+        val keepOn = view.findViewById<TextView>(R.id.btnKeepDisplaysOn)
+        val keepOff = view.findViewById<TextView>(R.id.btnKeepDisplaysOff)
+        val retriesLabel = view.findViewById<TextView>(R.id.retentionRetriesLabel)
+        val retriesSeek = view.findViewById<SeekBar>(R.id.retentionRetriesSeek)
+        val retriesValue = view.findViewById<TextView>(R.id.retentionRetriesValue)
+        val retentionNote = view.findViewById<TextView>(R.id.retentionNote)
+
+        fun refreshKeepDisplays(enabled: Boolean) {
+            keepOn.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            keepOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+            keepOff.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            keepOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
+            retriesLabel.alpha = if (enabled) 1f else 0.35f
+            retriesSeek.alpha = if (enabled) 1f else 0.35f
+            retriesValue.alpha = if (enabled) 1f else 0.35f
+            retentionNote.text =
+                if (enabled) {
+                    "意外断开（车机拆链/WiFi 断/熄火）后保留虚拟屏与运行中的应用，自动重连成功即恢复；" +
+                        "每 60s 一个重试窗口，连续 N 窗未恢复则销毁。手动断开始终立即销毁。"
+                } else {
+                    "已关闭：任何断开（含意外断开）都立即销毁虚拟屏，重连后全新重建。"
+                }
+        }
+
+        val savedKeep = DisplayPrefs.keepDisplaysOnUnexpectedDisconnect(ctx)
+        val savedRetries = DisplayPrefs.displayRetentionRetries(ctx)
+        refreshKeepDisplays(savedKeep)
+        retriesSeek.progress = savedRetries - DisplayPrefs.RETENTION_RETRIES_MIN
+        retriesValue.text = "$savedRetries 窗"
+
+        fun applyKeep(enabled: Boolean) {
+            if (enabled == DisplayPrefs.keepDisplaysOnUnexpectedDisconnect(ctx)) return
+            DisplayPrefs.setKeepDisplaysOnUnexpectedDisconnect(ctx, enabled)
+            refreshKeepDisplays(enabled)
+            hostToast(
+                if (enabled) {
+                    "已开启：意外断开保留虚拟屏（手动断开仍立即销毁）"
+                } else {
+                    "已关闭：断开立即销毁虚拟屏"
+                },
+            )
+        }
+        keepOn.setOnClickListener { applyKeep(true) }
+        keepOff.setOnClickListener { applyKeep(false) }
+        retriesSeek.setOnSeekBarChangeListener(
+            object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(
+                    seekBar: SeekBar?,
+                    progress: Int,
+                    fromUser: Boolean,
+                ) {
+                    if (!fromUser) return
+                    val retries = progress + DisplayPrefs.RETENTION_RETRIES_MIN
+                    retriesValue.text = "$retries 窗"
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    val retries = retriesSeek.progress + DisplayPrefs.RETENTION_RETRIES_MIN
+                    DisplayPrefs.setDisplayRetentionRetries(ctx, retries)
+                    hostToast("保留期重试窗口：$retries（约 $retries 分钟）")
+                }
+            },
+        )
+
         // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
         view.findViewById<TextView>(R.id.btnWallpaperPick).setOnClickListener {
             wallpaperPicker.launch(

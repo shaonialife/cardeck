@@ -966,6 +966,38 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
   「映射分叉」类 bug 根除）。坑：主题改继承不透明的 `Theme.CarPlaySender`——原
   Launcher 派生透明窗口在手机侧会透出桌面；窄屏返回语义分形态（详情=回列表，
   列表=关页）；narrow 用 onSaveInstanceState 保形态与详情态。
+- **意外断开保留虚拟屏 + 重连复用（2026-11-10 落地，0.1.28.91）**：意外断开
+  （车机软件拆链/WiFi 断 = onEnded；熄火/出范围 = AUTO_STOP 即
+  `disconnect(userInitiated=false)`）→ 虚拟屏不动进保留态，自动重连成功后
+  **复用**（新编码 surface 经新 AIDL `setDisplaySurface` 接回旧屏——屏与屏上任务/
+  Activity 全程不动，应用/导航状态连续）；每 60s 一个重试窗口，连续 N 窗（设置→显示
+  「断开保留虚拟屏」，默认 3）未恢复即销毁。跨会话结论：
+  ① **关键事实：onEnded 路径本来就不 detach**（VirtualLauncher/composer/屏全活着，
+  composer 继续心跳合成写失效编码 surface 静默失败）——「断开即毁」的只有 AUTO_STOP
+  与回连瞬间 `onCarPlayEndpoint` 起步的 `retireSession()`。改造点集中在后者
+  （`retireSession(keepDisplays)`）与 attach 复用分支，不是断开瞬间。
+  ② **复用技术底座**：屏实例存 UserService `virtualDisplays` map（VDM/legacy 两路线
+  统一，按 displayId 反查调 `VirtualDisplay.setSurface`）；per-display 保活锁保留不动；
+  composer 必须每轮新建（编码 surface 每轮新建）——复用时先停旧 composer（GL 线程
+  退出才释放旧输入 surface）再建新的，然后逐屏 `obtain()`：保留 id 的 setDisplaySurface
+  成功=复用，失败（屏被系统回收）=回退新建自愈。回退形态（应用侧屏）同样
+  `VirtualDisplay.setSurface` 复用。
+  ③ **复用前置判定 = 流画布几何完全一致**（attach 参数 totalW/H == markRetained 时
+  的基线）：用户改了流分辨率偏好 → 放弃复用正常重建（保守正确）。**跳过项**：stale
+  同名屏清理（那是「按名无差别击杀」，会杀掉保留屏）、applyIgnoreOrientationRequest
+  重发（策略还挂着，省 8 次 shell 往返）、`resetAllAsync`（am compat disable 杀名单内
+  应用——保留的意义就是恢复状态，杀了等于白留）。**保留分支补做收口**：audioSender
+  （submix 挂着=手机媒体持续静音）与 currentClient（keepAlive socket 已死）。
+  ④ **startOn dock/grid 在复用路径照常执行**（幂等自愈：任务在=带回前台；系统内存
+  压力杀了 Activity 也能借这次拉起）；固定应用**不** launchPinnedAppFresh（MULTIPLE_TASK
+  会叠实例）——查任务在才 `am start` 带回前台，不在才新建。
+  ⑤ **三条销毁语义**：手动断开/取消连接=立即销毁（不进保留态）；保留期 N×60s 超时
+  =销毁（时间窗计数，用户选定——必然推进，无「永不销毁」悬空态）；几何不一致=放弃
+  复用销毁重建。防重：onEnded 与 AUTO_STOP 对同一会话双触发——enterDisplayRetention
+  用 CAS 幂等（已在保留态返回 true，disconnect 据此不再销毁）。
+  ⑥ **已知边界**：app 进程死亡保留态丢失 → 下次启动走既有残留清理兜底；复用时
+  composer 输入 buffer 尺寸必须=屏实际分辨率（attach 几何一致判定天然保证）。
+  RetentionCounterTest 钉计数判定。
 - **BT 断链僵尸轮次 + specifier 永久挂起（2026-10-22 奥迪 3315 真机定谳）**：车机 15s
   AirPlay 看门狗（15.07s 实测，与 sysdiagnose 互证）拆链后**立即回连重发端点**，而我们的
   「sessionStarting 互斥」只认标志不认轮次存活性——WiFi 加入卡死（120s 窗）的僵尸轮次把

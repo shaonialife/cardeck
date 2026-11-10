@@ -468,12 +468,16 @@ object VirtualLauncher {
         if (mapFullscreen) return if (dockAtBottom) y < appHeightPx else x >= dockWidthPx
         if (!dashboardMode || tileSlideFraction > 0.01f) return false
         return if (dockAtBottom) {
-            y >= CARD_MARGIN_PX && y < CARD_MARGIN_PX + mapTileHeight &&
-                x >= CARD_MARGIN_PX && x < appAreaWidth - CARD_MARGIN_PX
+            y >= CARD_MARGIN_PX &&
+                y < CARD_MARGIN_PX + mapTileHeight &&
+                x >= CARD_MARGIN_PX &&
+                x < appAreaWidth - CARD_MARGIN_PX
         } else {
             val tileX = x - dockWidthPx
-            tileX >= CARD_MARGIN_PX && tileX < CARD_MARGIN_PX + mapTileWidth &&
-                y >= CARD_MARGIN_PX && y < appAreaHeight - CARD_MARGIN_PX
+            tileX >= CARD_MARGIN_PX &&
+                tileX < CARD_MARGIN_PX + mapTileWidth &&
+                y >= CARD_MARGIN_PX &&
+                y < appAreaHeight - CARD_MARGIN_PX
         }
     }
 
@@ -691,7 +695,26 @@ object VirtualLauncher {
         densityDpi: Int,
         log: (String) -> Unit,
     ): Boolean {
-        detach()
+        // 保留态复用判定（2026-11-10 意外断开保留虚拟屏）：屏只有在「流画布几何
+        // 完全一致」时才复用——用户改了流分辨率偏好 → 几何不一致 → 放弃复用走
+        // 正常销毁重建（保守正确：复用屏的尺寸与新 composer 输入必须逐像素匹配）
+        val reuse =
+            sessionRetained &&
+                totalWidth == retainedStreamW &&
+                totalHeight == retainedStreamH &&
+                dockDisplayId >= 0 &&
+                appDisplayId >= 0
+        if (reuse) {
+            // 保留期间旧 composer 仍在以 33ms 心跳合成（写向已失效的编码 surface
+            // 静默失败）：先停掉释放旧输入 surface，新 composer 建好后经
+            // svc.setDisplaySurface 把新 surface 接回旧屏（窗口期几百 ms）
+            log("LAUNCHER: 保留虚拟屏复用（几何一致 ${totalWidth}x$totalHeight）——跳过销毁重建")
+            runCatching { composer?.stop() }
+            composer = null
+        } else {
+            sessionRetained = false
+            detach()
+        }
         // 新会话：「本次会话不再提示」等用户级决定作废
         LetterboxHintController.resetSession()
         // 「强制应用横屏」覆盖**必须先于任何应用启动**写入（2026-10-23 奥迪 3315 真机
@@ -801,6 +824,10 @@ object VirtualLauncher {
         }
         val useTrusted = svc != null
         log("LAUNCHER: 虚拟屏模式=${if (useTrusted) "受信屏(shell)" else "应用屏(回退)"}")
+        // 复用快照：onSurfacesReady 闭包里按这套 id 把新 surface 接回旧屏（逐屏回退新建）。
+        // 走到这里 sessionRetained==true 即复用（attach 头部已把放弃复用的分支 detach 清零）
+        val reuseRetained = sessionRetained
+        val retainedIds = intArrayOf(dockDisplayId, appDisplayId, mapDisplayId, pinnedDisplayId)
 
         val composer = DualDisplayComposer(encoderSurface, totalWidth, totalHeight, dockAtBottom)
         composer.targetFps =
@@ -818,64 +845,59 @@ object VirtualLauncher {
                     // 无既选目标，实际对端是唯一可信来源）。空 = VDM 关闭，全部走 legacy。
                     svc!!.setCompanionDevice(BtSessionGate.lastPeerAddress ?: "")
                     // 残留清理：进程重启/上轮会话遗留的同名虚拟屏不释放会一直占位
-                    // （新宽度/新 surface 不生效——2026-10-11 dock 改宽后视觉无变化的根因）
-                    val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-                    dm.displays
-                        .filter {
-                            it.name == "CarPlayDock" ||
-                                it.name == "CarPlayApp" ||
-                                it.name == "CarPlayAppHi" ||
-                                it.name == "CarPlayMap" ||
-                                it.name == "CarPlayPinned"
-                        }.forEach { stale ->
-                            runCatching { svc!!.releaseDisplay(stale.displayId) }
-                                .onSuccess { log("LAUNCHER: 已释放残留虚拟屏 ${stale.name}#${stale.displayId}") }
+                    // （新宽度/新 surface 不生效——2026-10-11 dock 改宽后视觉无变化的根因）。
+                    // **复用保留屏时整段跳过**：dm 里的同名屏就是要保留的屏（意外断开
+                    // 后系统侧一直没销毁），release 掉复用就无从谈起。
+                    if (!reuseRetained) {
+                        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                        dm.displays
+                            .filter {
+                                it.name == "CarPlayDock" ||
+                                    it.name == "CarPlayApp" ||
+                                    it.name == "CarPlayAppHi" ||
+                                    it.name == "CarPlayMap" ||
+                                    it.name == "CarPlayPinned"
+                            }.forEach { stale ->
+                                runCatching { svc!!.releaseDisplay(stale.displayId) }
+                                    .onSuccess { log("LAUNCHER: 已释放残留虚拟屏 ${stale.name}#${stale.displayId}") }
+                            }
+                        Thread.sleep(150) // 等系统完成注销
+                    }
+
+                    // 逐屏获得（复用优先）：保留 id 的 setDisplaySurface 成功 = 屏还在系统侧、
+                    // 新 surface 接回即恢复；失败（屏已被回收/非本进程持有）→ 回退新建自愈。
+                    fun obtain(
+                        slot: Int,
+                        name: String,
+                        w: Int,
+                        h: Int,
+                        dpi: Int,
+                        surface: Surface,
+                        trusted: Boolean,
+                    ): Int {
+                        val retainedId = retainedIds[slot]
+                        if (reuseRetained && retainedId >= 0 && svc!!.setDisplaySurface(retainedId, surface)) {
+                            log("LAUNCHER: 复用保留屏 $name#$retainedId")
+                            return retainedId
                         }
-                    Thread.sleep(150) // 等系统完成注销
+                        return svc!!.createDisplay(name, w, h, dpi, surface, trusted)
+                    }
                     // dock 屏不声明受信：只承载自有 DockActivity，杜绝第三方任务逃逸上来
                     val dockId =
-                        svc!!.createDisplay(
-                            "CarPlayDock",
-                            dockWidthPx,
-                            dockHeightPx,
-                            dockDensityDpi,
-                            dockSurface,
-                            false,
-                        )
+                        obtain(0, "CarPlayDock", dockWidthPx, dockHeightPx, dockDensityDpi, dockSurface, false)
                     val appId =
-                        svc!!.createDisplay(
-                            "CarPlayApp",
-                            appGeom.widthPx,
-                            appGeom.heightPx,
-                            appGeom.densityDpi,
-                            appSurface,
-                            true,
-                        )
+                        obtain(1, "CarPlayApp", appGeom.widthPx, appGeom.heightPx, appGeom.densityDpi, appSurface, true)
                     // 地图屏（横竖屏都创建；高分辨率 = 旧 dp 窗口 × 手机密度，分屏/全屏间动态 resize）
                     val mapId =
                         if (mapSurface != null) {
-                            svc!!.createDisplay(
-                                "CarPlayMap",
-                                mapGeom.widthPx,
-                                mapGeom.heightPx,
-                                mapGeom.densityDpi,
-                                mapSurface,
-                                true,
-                            )
+                            obtain(2, "CarPlayMap", mapGeom.widthPx, mapGeom.heightPx, mapGeom.densityDpi, mapSurface, true)
                         } else {
                             -1
                         }
                     // 固定应用屏（右侧卡片=指定应用时才建；Surface 恒有——composer 预建输入）
                     val pinnedId =
                         if (pinnedSurface != null && pinnedComponent != null) {
-                            svc!!.createDisplay(
-                                "CarPlayPinned",
-                                pinnedGeom.widthPx,
-                                pinnedGeom.heightPx,
-                                pinnedGeom.densityDpi,
-                                pinnedSurface,
-                                true,
-                            )
+                            obtain(3, "CarPlayPinned", pinnedGeom.widthPx, pinnedGeom.heightPx, pinnedGeom.densityDpi, pinnedSurface, true)
                         } else {
                             -1
                         }
@@ -944,35 +966,65 @@ object VirtualLauncher {
             } else {
                 // 回退：应用侧 PUBLIC 屏（应用内跳转任务会逃逸到手机主屏，尽量可用的降级形态）
                 val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-                dockDisplay =
-                    dm.createVirtualDisplay(
-                        "CarPlayDock",
-                        dockWidthPx,
-                        dockHeightPx,
-                        dockDensityDpi,
-                        dockSurface,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
-                        null,
-                        null,
-                    )
-                appDisplay =
-                    dm.createVirtualDisplay(
-                        "CarPlayApp",
-                        appGeom.widthPx,
-                        appGeom.heightPx,
-                        appGeom.densityDpi,
-                        appSurface,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
-                        null,
-                        null,
-                    )
+
+                // 复用优先：保留态下应用侧 VirtualDisplay 引用未清（不走 detach）——
+                // setSurface 接回新 surface 即恢复；引用缺失（上轮就没建）才新建。
+                fun fallbackSet(
+                    slot: Int,
+                    surface: Surface,
+                ): Boolean {
+                    if (!reuseRetained) return false
+                    val vd =
+                        when (slot) {
+                            0 -> dockDisplay
+                            1 -> appDisplay
+                            2 -> mapDisplay
+                            else -> pinnedDisplay
+                        } ?: return false
+                    return try {
+                        vd.setSurface(surface)
+                        true
+                    } catch (_: Throwable) {
+                        false
+                    }
+                }
+                if (!fallbackSet(0, dockSurface)) {
+                    dockDisplay =
+                        dm.createVirtualDisplay(
+                            "CarPlayDock",
+                            dockWidthPx,
+                            dockHeightPx,
+                            dockDensityDpi,
+                            dockSurface,
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+                            null,
+                            null,
+                        )
+                } else {
+                    log("LAUNCHER: 复用保留屏 CarPlayDock#$dockDisplayId（回退形态）")
+                }
+                if (!fallbackSet(1, appSurface)) {
+                    appDisplay =
+                        dm.createVirtualDisplay(
+                            "CarPlayApp",
+                            appGeom.widthPx,
+                            appGeom.heightPx,
+                            appGeom.densityDpi,
+                            appSurface,
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+                            null,
+                            null,
+                        )
+                } else {
+                    log("LAUNCHER: 复用保留屏 CarPlayApp#$appDisplayId（回退形态）")
+                }
                 // 地图屏同样建（应用侧 PUBLIC）：地图启动走 shell `am start --display`，
                 // 不需要受信；resize 用应用侧公开 API（见 resizeMapDisplay）。
                 // 回退形态曾完全不建地图屏——受信创建在 EMUI12 上静默失败后，仪表盘
                 // 就永远没有地图 tile（2026-10-20 华为 Mate30Pro 实测）。
-                if (mapSurface != null) {
+                if (mapSurface != null && !fallbackSet(2, mapSurface)) {
                     mapDisplay =
                         dm.createVirtualDisplay(
                             "CarPlayMap",
@@ -995,7 +1047,7 @@ object VirtualLauncher {
                     }
                 }
                 // 固定应用屏同样建（应用侧 PUBLIC）：右侧卡片=指定应用时仪表盘才有固定应用画面
-                if (pinnedSurface != null && pinnedComponent != null) {
+                if (pinnedSurface != null && pinnedComponent != null && !fallbackSet(3, pinnedSurface)) {
                     pinnedDisplay =
                         dm.createVirtualDisplay(
                             "CarPlayPinned",
@@ -1060,7 +1112,11 @@ object VirtualLauncher {
             // 而合成器按整幅映射、触摸按未旋转坐标换算 —— 表现为「分辨率变了 +
             // 点击漂移、点不到目标」，退回桌面也仍是旋转态（2026-10-18 实测）。
             // 缩在 letterbox 里（见下方 aspectRatio）才是车机该有的形态。
-            applyIgnoreOrientationRequest(appDisplayId, appHiDisplayId, mapDisplayId, pinnedDisplayId)
+            // 复用路径跳过：保留屏的策略还挂着（没走过 detach 清理），重发是
+            // 8 次 shell 往返的白花（复用要抢的就是重连速度）。
+            if (!reuse) {
+                applyIgnoreOrientationRequest(appDisplayId, appHiDisplayId, mapDisplayId, pinnedDisplayId)
+            }
             // 放宽竖屏应用的 letterbox 窗口（默认窄条 → 手机宽度）；断开时还原（detach）
             Shell.exec("cmd window set-letterbox-style --aspectRatio $LETTERBOX_ASPECT_RATIO")
             log(
@@ -1072,6 +1128,8 @@ object VirtualLauncher {
             // `pkg/.launcher.DockActivity` 会指向不存在的类、纯类名直接被拒
             // （Bad component name），两种写法都让 dock/grid 启动失败、车机黑屏
             // 0fps（2026-10-21 .rd 包实测）。绝对类名取自 Class 引用，随重构自动跟随。
+            // 复用路径照常 startOn（幂等自愈：任务在=带回前台；系统内存压力杀了
+            // Activity 也能借这次拉起自愈）。
             val selfPkg = context.packageName
             val dockOk = startOn(dockDisplayId, "$selfPkg/${DockActivity::class.java.name}")
             gridDisplayId = if (appHiDisplayId >= 0) appHiDisplayId else appDisplayId
@@ -1080,9 +1138,26 @@ object VirtualLauncher {
             log("LAUNCHER: dock=$dockOk grid=$gridOk gridDisplay=$gridDisplayId")
             // 固定应用启动到固定屏（新屏无既有任务：MULTIPLE_TASK 直接新建实例）。
             // 应用侧会话启动放 display 创建成功之后（awaitPending 已在 attach 开头排空）。
+            // 复用路径先查任务：任务还在屏上（常态）→ am start 带回前台即可，
+            // MULTIPLE_TASK 会叠出第二个实例。
             if (pinnedDisplayId >= 0 && pinnedComponent != null) {
                 composer.pinnedCardVisible = true
-                launchPinnedAppFresh(pinnedComponent!!, pinnedDisplayId)
+                val pinnedTaskAlive =
+                    reuse &&
+                        tasksOf(
+                            taskIdsByDisplayPkg(),
+                            pinnedComponent!!.packageName,
+                            pinnedDisplayId,
+                        ).isNotEmpty()
+                if (pinnedTaskAlive) {
+                    Shell.exec(
+                        "am start -n ${pinnedComponent!!.flattenToShortString()} --display $pinnedDisplayId",
+                        timeoutMs = 8000,
+                    )
+                    log("LAUNCHER: 复用固定应用任务（带回前台，不叠实例）")
+                } else {
+                    launchPinnedAppFresh(pinnedComponent!!, pinnedDisplayId)
+                }
             }
             // 冻结看门狗无条件启动：固定应用屏与地图屏共用（回仪表盘/触摸拉回依赖标记）
             startDisplayWatchdog()
@@ -1092,6 +1167,8 @@ object VirtualLauncher {
             // 暗幕组件就绪（常亮+暗幕功能；主界面开关控制启停）
             ScreenDimmer
                 .attach(context)
+            // attach 全流程成功：保留态已消费（复用或全新建立；异常路径由 detach 清）
+            sessionRetained = false
             dockOk && gridOk
         } catch (error: IllegalStateException) {
             log("LAUNCHER: GL 合成器启动失败 - ${error.message}")
@@ -1103,6 +1180,31 @@ object VirtualLauncher {
     /** 受信屏标记：true 时虚拟屏由 shell UserService 持有，须经服务释放。 */
     @Volatile
     private var displaysViaService = false
+
+    /**
+     * 保留态（2026-11-10 意外断开保留虚拟屏）：true = 上轮会话意外断开时屏未销毁，
+     * 下轮 attach 走复用分支（setDisplaySurface 接回新 surface，屏上任务/Activity
+     * 不动）。由 SessionController 在意外断开路径调用 [markRetained] 置位；detach
+     * 清零（手动断开/保留期超时销毁/复用放弃都汇到这里）。
+     */
+    @Volatile
+    var sessionRetained: Boolean = false
+        private set
+
+    /** 保留时的流画布尺寸（复用一致性判定：attach 参数与之不等 = 放弃复用）。 */
+    @Volatile
+    private var retainedStreamW = 0
+
+    @Volatile
+    private var retainedStreamH = 0
+
+    /** 进入保留态：记录几何基线（attach 复用一致性判定用）。 */
+    fun markRetained() {
+        sessionRetained = true
+        retainedStreamW = streamWidthPx
+        retainedStreamH = streamHeightPx
+        logSink?.invoke("LAUNCHER: 虚拟屏进入保留态（${streamWidthPx}x$streamHeightPx，等待重连复用）")
+    }
 
     fun detach() {
         ScreenDimmer
@@ -1175,6 +1277,9 @@ object VirtualLauncher {
         pinnedComponent = null
         pinnedCardActive = false
         mapFrozen = false
+        sessionRetained = false
+        retainedStreamW = 0
+        retainedStreamH = 0
         mapTileWidth = 0
         mapTileHeight = 0
         dashSplitPos = -1f
@@ -2082,6 +2187,26 @@ object VirtualLauncher {
      */
     fun peekCachedApps(): List<AppEntry>? = appsCache
 
+    /**
+     * 应用清单预热（连接起步时调用，2026-11-09「连上车机后桌面 app 慢半拍」）。
+     *
+     * 语义即需求三条：已扫过 → 直接返回（volatile 读，零开销）；没扫过 → 后台
+     * 扫一次；之前的扫描还在进行 → [cachedApps] 内部 `appsScanLock` 双检锁合并，
+     * 本调用等的就是那次扫描的结果，不会扫第二遍。车机侧 GridActivity 绑定时
+     * 缓存已就绪（配对空窗几十秒 ≫ 全量扫描 2.7s），图标即出。
+     */
+    fun warmUpAppsCache(context: Context) {
+        if (appsCache != null) return
+        Bg.run("apps-warmup") {
+            val apps = cachedApps(context.applicationContext)
+            // dock 运行图标缓存同步填充：GridActivity 的热缓存路径不会再走它的冷
+            // 扫描分支（那里才填 iconCache），首次连接全靠这里。volatile 整表换新，
+            // dock 主线程并发读到的旧表/新表都完整自洽（iconCacheRef 注释同款推理）
+            replaceIconCache(apps.associate { it.component to it.icon })
+            logSink?.invoke("LAUNCHER: 应用清单预热完成 ${apps.size} 个应用（连接起步异步扫描）")
+        }
+    }
+
     /** 把外部线程扫描的结果纳入共享缓存（桌面扫描后设置页即可秒开）。 */
     fun adoptAppsCache(apps: List<AppEntry>) {
         if (appsCache == null) appsCache = apps
@@ -2090,8 +2215,6 @@ object VirtualLauncher {
     fun invalidateAppsCache() {
         appsCache = null
     }
-
-    fun launchableApps(context: Context): List<AppEntry> = scanLaunchableApps(context)
 
     /**
      * 扫描所有可启动应用（桌面网格与设置页共用）。

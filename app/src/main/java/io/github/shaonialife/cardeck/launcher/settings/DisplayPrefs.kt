@@ -39,6 +39,17 @@ object DisplayPrefs {
     /** 音频路由自愈默认值：默认开（断开的是会话期间抢走媒体输出的蓝牙设备）。 */
     const val AUDIO_ROUTE_RECLAIM_DEFAULT = true
 
+    /**
+     * 意外断开保留虚拟屏（2026-11-10）：默认开——车机软件拆链/WiFi 断/熄火后保留
+     * 虚拟屏与屏上应用，自动重连成功即复用（应用状态连续）。手动断开始终立即销毁。
+     */
+    const val KEEP_DISPLAYS_DEFAULT = true
+
+    /** 保留期重试窗口数（每窗 60s）：连续 N 窗未恢复即销毁虚拟屏。 */
+    const val RETENTION_RETRIES_DEFAULT = 3
+    const val RETENTION_RETRIES_MIN = 1
+    const val RETENTION_RETRIES_MAX = 10
+
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_FPS = "display_fps"
@@ -47,6 +58,8 @@ object DisplayPrefs {
     private const val KEY_HID_RAW_LOG = "hid_raw_log"
     private const val KEY_TOUCH_FULL_LOG = "touch_full_log"
     private const val KEY_AUDIO_ROUTE_RECLAIM = "audio_route_reclaim"
+    private const val KEY_KEEP_DISPLAYS = "keep_displays_on_disconnect"
+    private const val KEY_RETENTION_RETRIES = "display_retention_retries"
 
     /**
      * 完整触摸日志（杂项设置开关，默认关）：开=逐条打印触点坐标与注入结果
@@ -88,6 +101,45 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_AUDIO_ROUTE_RECLAIM, enabled)
+            .apply()
+    }
+
+    /**
+     * 意外断开保留虚拟屏（默认开）：车机软件拆链/WiFi 断/熄火（AUTO_STOP）后保留
+     * 虚拟屏与屏上应用，自动重连成功即复用；连续 [displayRetentionRetries] 个
+     * 60s 窗口未恢复则销毁。手动断开/取消连接不受本键影响，始终立即销毁。
+     */
+    fun keepDisplaysOnUnexpectedDisconnect(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_KEEP_DISPLAYS, KEEP_DISPLAYS_DEFAULT)
+
+    fun setKeepDisplaysOnUnexpectedDisconnect(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_KEEP_DISPLAYS, enabled)
+            .apply()
+    }
+
+    /** 保留期重试窗口数（1–10，默认 3；每窗 60s）。 */
+    fun displayRetentionRetries(context: Context): Int =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_RETENTION_RETRIES, RETENTION_RETRIES_DEFAULT)
+            .coerceIn(RETENTION_RETRIES_MIN, RETENTION_RETRIES_MAX)
+
+    fun setDisplayRetentionRetries(
+        context: Context,
+        retries: Int,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_RETENTION_RETRIES, retries.coerceIn(RETENTION_RETRIES_MIN, RETENTION_RETRIES_MAX))
             .apply()
     }
 

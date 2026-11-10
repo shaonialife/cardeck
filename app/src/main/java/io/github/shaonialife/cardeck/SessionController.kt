@@ -3,6 +3,8 @@ package io.github.shaonialife.cardeck
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Network
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.KeyEvent
 import io.github.shaonialife.cardeck.airplay.AirPlayLink
@@ -550,6 +552,11 @@ object SessionController {
         }
         CarPlayService
             .start(context)
+        // 应用清单预热（2026-11-09「连上车机后桌面 app 慢半拍」）：全部连接路径
+        // （手动/上车自动/回连）都经这里——配对空窗几十秒足够冷缓存的 PackageManager
+        // 全量扫描（荣耀 132 应用实测 2.7s）自然完成，车机侧 GridActivity 绑定时
+        // 缓存已就绪、图标即出。已扫过/扫描进行中 → 本调用零开销或等既有扫描合并。
+        VirtualLauncher.warmUpAppsCache(context.applicationContext)
         // 能力发布先于连接（catplay 的做法：CarPlayCtrlServer 在会话一开始就常驻广播
         // `_carplay-ctrl._tcp`，之后每 1s force_announce，收到车机邀请才建 AirPlay）。
         // 我们此前要等 0x5703 才注册，导致「车机发现手机」这一步总落在热点绑定之后，
@@ -587,7 +594,11 @@ object SessionController {
             autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
             appendLog("SESSION: 手动断开——自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟（ACL 抖动不再自动拉起）")
         }
-        retireSession()
+        // 熄火/出范围（AUTO_STOP，userInitiated=false）= 意外断开：进保留态保屏，
+        // 下次上车 ACL 拉起连接后复用。手动断开（userInitiated=true）始终销毁。
+        // 已在保留态（onEnded 先触发过）→ 幂等返回 true，不再重复进。
+        val keepDisplaysOnAutoStop = !userInitiated && enterDisplayRetention()
+        retireSession(keepDisplays = keepDisplaysOnAutoStop)
         // BT 控制会话只在这里（用户终态）退役，socket close 让保活读循环立刻退出：
         // 否则它阻塞到对端超时（实测 ~24s）才结束，用户取消后英雄卡持续转圈。
         // 配对中绝不能断——DiPlay 在隧道 iAP2 就绪前看到 RFCOMM 断开即判
@@ -726,8 +737,94 @@ object SessionController {
         }
     }
 
-    /** 会话结束/新周期开始前彻底退役上一代会话（旧管线泄漏会累积编码器/虚拟显示器，最终 dequeueBuffer -19）。 */
-    fun retireSession() {
+    /** 保留期时间窗（60s）：每窗算一次「重试」，连续 N 窗未恢复即销毁保留虚拟屏。 */
+    private const val RETENTION_TICK_MS = 60_000L
+
+    /** 保留期计数纯函数：第 failures 个窗口 ≥ maxRetries → 销毁（单测 RetentionCounterTest）。 */
+    internal fun retentionShouldDestroy(
+        failures: Int,
+        maxRetries: Int,
+    ): Boolean = failures >= maxRetries.coerceAtLeast(1)
+
+    // ---- 意外断开保留虚拟屏（2026-11-10）----
+    // 语义：车机软件拆链/WiFi 断（onEnded）与熄火 AUTO_STOP（disconnect(userInitiated=false)）
+    // → 虚拟屏不动，进入保留态等自动重连复用；每 60s 一个重试窗口，连续 N 窗
+    // （设置→显示）未恢复即销毁。手动断开/取消连接不进保留态，始终立即销毁。
+
+    private val displayRetentionActive = AtomicBoolean(false)
+
+    @Volatile
+    private var retentionFailures = 0
+
+    private val retentionHandler = Handler(Looper.getMainLooper())
+
+    private var retentionTick: Runnable? = null
+
+    /**
+     * 进入保留态（幂等——onEnded 与 AUTO_STOP 可能对同一会话双触发）：屏在 +
+     * 偏好开才进入；返回 true = 当前处于保留态（调用方据此跳过虚拟屏销毁）。
+     */
+    private fun enterDisplayRetention(): Boolean {
+        val ctx = appContext ?: return false
+        if (!DisplayPrefs.keepDisplaysOnUnexpectedDisconnect(ctx)) return false
+        if (VirtualLauncher.dockDisplayId < 0 || VirtualLauncher.appDisplayId < 0) return false
+        if (!displayRetentionActive.compareAndSet(false, true)) return true // 已在保留态
+        retentionFailures = 0
+        VirtualLauncher.markRetained()
+        appendLog(
+            "SESSION: 意外断开——虚拟屏进入保留态（等待自动重连复用；" +
+                "${DisplayPrefs.displayRetentionRetries(ctx)} 个重试窗口未恢复则销毁）",
+        )
+        startRetentionTimer()
+        return true
+    }
+
+    /** 复用完成/新会话建立：退出保留态（清计时器与计数）。 */
+    private fun exitDisplayRetention() {
+        cancelRetentionTimer()
+        if (displayRetentionActive.compareAndSet(true, false)) {
+            retentionFailures = 0
+            appendLog("SESSION: 保留虚拟屏已复用——退出保留态")
+        }
+    }
+
+    private fun startRetentionTimer() {
+        cancelRetentionTimer()
+        val tick =
+            object : Runnable {
+                override fun run() {
+                    if (!displayRetentionActive.get()) return
+                    val ctx = appContext
+                    if (ctx == null) {
+                        displayRetentionActive.set(false)
+                        return
+                    }
+                    retentionFailures++
+                    val max = DisplayPrefs.displayRetentionRetries(ctx)
+                    if (retentionShouldDestroy(retentionFailures, max)) {
+                        displayRetentionActive.set(false)
+                        appendLog("SESSION: 保留期结束（连续 $max 个窗口未恢复）——销毁保留虚拟屏")
+                        Bg.run("retention-destroy") { VirtualLauncher.detach() }
+                        return
+                    }
+                    appendLog("SESSION: 保留期重试窗口 $retentionFailures/$max 未恢复，继续等待")
+                    retentionHandler.postDelayed(this, RETENTION_TICK_MS)
+                }
+            }
+        retentionTick = tick
+        retentionHandler.postDelayed(tick, RETENTION_TICK_MS)
+    }
+
+    private fun cancelRetentionTimer() {
+        retentionTick?.let { retentionHandler.removeCallbacks(it) }
+        retentionTick = null
+    }
+
+    /** 会话结束/新周期开始前彻底退役上一代会话（旧管线泄漏会累积编码器/虚拟显示器，最终 dequeueBuffer -19）。
+     *  [keepDisplays]=保留虚拟屏（意外断开的保留态）：跳过 [VirtualLauncher.detach]——
+     *  屏与屏上任务原样挂着，下轮 attach 走复用分支（setDisplaySurface 接回新编码
+     *  surface）；其余管线（编码器/音频/控制通道）照常收口。 */
+    fun retireSession(keepDisplays: Boolean = false) {
         videoSender?.stop()
         videoSender = null
         // 暗幕/常亮随会话收掉（本方法在每轮配对起步也会执行，新一轮推流起来后会重新置位）
@@ -738,7 +835,11 @@ object SessionController {
         audioSender = null
         currentSharedSecret = null
         currentAudioHost = null
-        currentHiddenSource?.release()
+        if (keepDisplays) {
+            appendLog("SESSION: 保留虚拟屏（意外断开）——跳过销毁，等待重连复用")
+        } else {
+            currentHiddenSource?.release()
+        }
         currentHiddenSource = null
         TouchRouter
             .reset()
@@ -2166,7 +2267,9 @@ object SessionController {
                     // ~10s 拆链预算（keepAlive 帧自 attach 返回后才起发，2026-10-23 定谳）。
                     orientationRestorePending.set(true)
                     appContext?.let { ctx -> AppOrientationCompat.applyAllAsync(ctx, ::appendLog) }
-                    retireSession()
+                    // 保留态回连：上一轮意外断开的屏还在——retireSession 跳过销毁，
+                    // attach 复用分支会把新编码 surface 接回旧屏（应用状态连续）
+                    retireSession(keepDisplays = displayRetentionActive.get())
                     // 会话静默降噪（2026-10-10）：从交接点起暂停其它接收端的出站连接探测
                     // （典型：连着 DiPlay 测试台时不再噪音式探测 Audi）。会话结束/断开时解除。
                     BtSessionGate.sessionActive = true
@@ -2486,9 +2589,24 @@ object SessionController {
                                             // 车机侧断开：人在车外，让手机直接休眠（面板保持黑），
                                             // 而不是先点亮再等 60s 超时
                                             restorePhoneScreen(sleepIfCarSide = true)
-                                            // 同样复原横屏覆盖。这里跑在推流收尾线程，不是连接
-                                            // 关键路径，但统一走异步口以保持「串行、不重入」的语义。
-                                            if (orientationRestorePending.compareAndSet(true, false)) {
+                                            // 保留态判定（2026-11-10）：屏在 + 偏好开 → 虚拟屏不动，
+                                            // 等自动重连后 attach 复用（屏上应用/导航状态连续）。
+                                            val keepDisplays = enterDisplayRetention()
+                                            if (keepDisplays) {
+                                                // 保留分支补做 retireSession 才会做的两件收口
+                                                // （复用路径回连后 retireSession(keep=true) 不碰屏）：
+                                                // ① 停音频采集——submix 挂着 = 手机媒体持续静音；
+                                                // ② 关控制通道——keepAlive/事件 socket 已死，挂着无意义。
+                                                audioSender?.stop()
+                                                audioSender = null
+                                                currentClient?.cancelled = true
+                                                currentClient?.close()
+                                                currentClient = null
+                                                appendLog("SESSION: 保留分支收口音频/控制通道（虚拟屏不动）")
+                                                // ⚠ 跳过横屏复原 resetAllAsync：am compat disable 会
+                                                // 杀名单内应用——保留的意义就是恢复应用状态，杀了等于
+                                                // 白留（下轮 applyAll 与旧覆盖幂等，无需先复原）。
+                                            } else if (orientationRestorePending.compareAndSet(true, false)) {
                                                 appContext?.let { ctx ->
                                                     AppOrientationCompat.resetAllAsync(ctx, ::appendLog)
                                                 }
@@ -2535,6 +2653,8 @@ object SessionController {
                                     // 暗幕/常亮只在真正开始投屏后生效（见 ScreenDimmer.sessionActive）：
                                     // 应用启动时只挂触摸探针，避免「会话早断了、手机过一会儿还是变暗」。
                                     if (ok) {
+                                        // 保留屏复用完成（或全新建立）——退出保留态（清计时器）
+                                        exitDisplayRetention()
                                         ScreenDimmer.setSessionActive(true)
                                         // 视频起流（虚拟屏已就绪）——实验模式下重申的触发源
                                         client.onStreamingStarted?.invoke()

@@ -1580,6 +1580,21 @@ class CarInputServiceImpl(
         }
     }
 
+    override fun setDisplaySurface(
+        displayId: Int,
+        surface: Surface,
+    ): Boolean {
+        val vd = synchronized(virtualDisplays) { virtualDisplays[displayId] } ?: return false
+        return try {
+            vd.setSurface(surface)
+            Log.i(TAG, "setDisplaySurface id=$displayId")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "setDisplaySurface $displayId failed: $t")
+            false
+        }
+    }
+
     override fun releaseDisplay(displayId: Int): Boolean {
         val vd = synchronized(virtualDisplays) { virtualDisplays.remove(displayId) }
         if (vd == null) {
