@@ -490,19 +490,27 @@ class AirPlayLink(
     // 行为见 [pumpPairingSession] / [handleEvent]。
 
     /**
-     * KeepAlive UDP 心跳（对照 catplay KeepAliveClient）：向车机 keepAlivePort 发 4 字节
-     * 随机 UDP；协议无应答。**缺失时车机 10s 看门狗拆整轮会话**。
+     * KeepAlive UDP 心跳（'kplv' 流，fw: ensureLowPowerKeepAliveStreamSetup
+     * @0x22784de34 → APTransportConnectionUDPCreate——UDP 到 control-setup
+     * 应答的 keepAlivePort）：载荷 = 固件帧 `nativeAirplayKplvPingFrame(4)`
+     * （4B {0,4,0,0}，fw: APTPackageLowPowerKeepAliveCreateWithBBuf
+     * @0x243d442e8；keepAliveType=4=LowPowerOnIdle 真机日志实证）。
+     * **缺失时车机 10s 看门狗拆整轮会话**（2026-10-19 奥迪 3315 实证 =
+     * kplv 真车必需性已证）。
      *
      * 间隔取 **5s** 而不是 catplay 的 10s：10s 与车机看门狗等长，`Thread.sleep` 的
      * 毫秒级抖动会让每次心跳都晚到 deadline 之后 1ms（2026-10-19 奥迪 3315 两轮实测：
      * ping #2 距 #1 恰好 10.001s，随后 213~247ms 内整轮被 reset，RECORD 后 10.2s）。
      * catplay 的 10s 只适用于它自家接收端；对真车必须留出至少一半的余量。
+     * （固件周期 = 系统卸载运行时配置 udpconnection_setupKeepAliveOffload
+     * @0x243d2ae6c，无编译常量 → 5s = 平台策略域，C3/D9 同域。）
      */
     fun startKeepAlive(
         host: String,
         port: Int,
     ) {
         if (port <= 0) return
+        val payload = NativeBridge.nativeAirplayKplvPingFrame(4)
         Thread({
             var udp: java.net.DatagramSocket? = null
             try {
@@ -514,7 +522,6 @@ class AirPlayLink(
                     val now = SystemClock.uptimeMillis()
                     val gap = if (lastSentAt == 0L) 0L else now - lastSentAt
                     lastSentAt = now
-                    val payload = ByteArray(4).also(java.security.SecureRandom()::nextBytes)
                     udp.send(java.net.DatagramPacket(payload, payload.size, address, port))
                     sent++
                     if (sent <= 3 || sent % 60 == 0) {

@@ -113,6 +113,18 @@ object NativeBridge {
     /** 拆隧道态（socket 关闭/会话销毁时；传输槽蹦床随之空操作）。 */
     external fun nativeAirplayTunnelDetach(iap2Handle: Long)
 
+    /**
+     * 低功耗 keepAlive ping 帧（'kplv' 流载荷，UDP 发往 control-setup 应答的
+     * keepAlivePort）。fw: APTPackageLowPowerKeepAliveCreateWithBBuf
+     * (@0x243d442e8) 无体径 4B {0, type, 0, 0}；LowPowerOnIdle type=4。
+     * 周期/开关 = 平台策略域（fw: 系统卸载运行时配置，无编译常量）——
+     * 真车判形前不接线。
+     */
+    external fun nativeAirplayKplvPingFrame(keepAliveType: Int): ByteArray
+
+    /** kplv 带体帧校验（fw: len4 / b[1]==4 / b[0]&0xdf==0）。 */
+    external fun nativeAirplayKplvValidate(frame: ByteArray): Boolean
+
     /** 仅音频的 endpoint plan（动态补启音频）。 */
     external fun nativeAirplayAudioPlanFromInfo(
         handle: Long,
