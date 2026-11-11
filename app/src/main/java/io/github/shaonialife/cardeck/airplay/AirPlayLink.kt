@@ -1942,8 +1942,6 @@ class AirPlayLink(
             "iOS".toByteArray(),
             (Build.VERSION.RELEASE ?: "").toByteArray(),
         )
-        val featuresJson = CONTROLLER_FEATURES.joinToString(",", "[", "]") { "\"" + it + "\"" }
-        NativeBridge.nativeAirplaySetFeatures(handle, featuresJson.toByteArray())
         val stored = storedReceiverIdentity ?: loadReceiverIdentity().also { storedReceiverIdentity = it }
         stored?.publicKey?.takeIf { it.size == 32 }?.let {
             NativeBridge.nativeAirplaySetPeerPublicKey(handle, it)
@@ -2128,27 +2126,3 @@ data class ControllerIdentity(
 
 /** fw: session+0x64 发送端主形态（createAirPlayPairingSession @0x2277AD69C）。 */
 const val FLAGS_AIRPLAY_SENDER: Int = 0xC
-
-/**
- * 'stup' 的 features 能力提议（**数据初值**：旧 Kotlin CONTROLLER_FEATURES，
- * catplay/奥迪真车验证；不是固件表）。接收端按「车机支持 ∩ 提议」算
- * enabledFeatures——缺 videoPlayback/viewAreas 时奥迪直接对屏幕流 SETUP 回 400。
- * 由 Rust appendControlSetupRequest 在 session_type==5 时原样写入。
- */
-private val CONTROLLER_FEATURES =
-    listOf(
-        "uiContext",
-        "viewAreas",
-        "cornerMasks",
-        "focusTransfer",
-        "h.264Level5.1",
-        "mainBuffered",
-        "altScreen",
-        "enhancedSiri",
-        "hevc",
-        "sessionManagement",
-        "logTransfer",
-        "iAPChannel",
-        "vehicleStateProtocol",
-        "videoPlayback",
-    )

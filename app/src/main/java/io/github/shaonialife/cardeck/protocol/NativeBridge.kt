@@ -423,13 +423,6 @@ object NativeBridge {
         pubkey: ByteArray,
     )
 
-    /** 注入 'stup' features 能力数组（JSON 字符串数组；fw:
-     *  appendControlSetupRequest param_3——接收端按交集算 enabledFeatures）。 */
-    external fun nativeAirplaySetFeatures(
-        handle: Long,
-        featuresJson: ByteArray,
-    )
-
     /** 会话收尾 TEARDOWN（fw: sendTeardownWithStreamDescArray；连接级空体）。 */
     external fun nativeAirplayTeardown(handle: Long): String?
 
