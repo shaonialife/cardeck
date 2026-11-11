@@ -50,6 +50,81 @@ object DisplayPrefs {
     const val RETENTION_RETRIES_MIN = 1
     const val RETENTION_RETRIES_MAX = 10
 
+    // ---- 虚拟屏密度基准 4 档（2026-11-11）：px = dp × 手机密度 / 档位值 ----
+    // 档位=Android 标准密度桶；分母越大屏 px 越小、应用在同密度下窗口越窄。
+
+    const val DENSITY_MDPI = 160
+    const val DENSITY_HDPI = 240
+    const val DENSITY_XHDPI = 320
+    const val DENSITY_XXHDPI = 480
+
+    /** 密度基准档位表（UI 分段与写入清洗共用）。 */
+    val BASELINE_TIERS = intArrayOf(DENSITY_MDPI, DENSITY_HDPI, DENSITY_XHDPI, DENSITY_XXHDPI)
+
+    private const val KEY_BASELINE_APP = "baseline_app"
+    private const val KEY_BASELINE_MAP = "baseline_map"
+    private const val KEY_BASELINE_PINNED = "baseline_pinned"
+
+    /** 档位清洗：非法值吸附到最近档（设置入口只有 4 档，防御性兜底）。 */
+    fun normalizeBaseline(value: Int): Int = BASELINE_TIERS.minByOrNull { kotlin.math.abs(it - value) } ?: DENSITY_MDPI
+
+    /** 应用屏（CarPlayApp）密度基准，默认 mdpi=160（=VirtualLauncher.DENSITY_BASELINE）。 */
+    fun appDisplayBaseline(context: Context): Int =
+        normalizeBaseline(
+            context
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_BASELINE_APP, DENSITY_MDPI),
+        )
+
+    fun setAppDisplayBaseline(
+        context: Context,
+        value: Int,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_BASELINE_APP, normalizeBaseline(value))
+            .apply()
+    }
+
+    /** 地图屏（CarPlayMap）密度基准，默认 mdpi=160。 */
+    fun mapDisplayBaseline(context: Context): Int =
+        normalizeBaseline(
+            context
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_BASELINE_MAP, DENSITY_MDPI),
+        )
+
+    fun setMapDisplayBaseline(
+        context: Context,
+        value: Int,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_BASELINE_MAP, normalizeBaseline(value))
+            .apply()
+    }
+
+    /** 固定应用屏（CarPlayPinned）密度基准，默认 mdpi=160。 */
+    fun pinnedDisplayBaseline(context: Context): Int =
+        normalizeBaseline(
+            context
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_BASELINE_PINNED, DENSITY_MDPI),
+        )
+
+    fun setPinnedDisplayBaseline(
+        context: Context,
+        value: Int,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_BASELINE_PINNED, normalizeBaseline(value))
+            .apply()
+    }
+
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_FPS = "display_fps"

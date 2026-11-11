@@ -96,15 +96,16 @@ object VirtualLauncher {
         appAreaH: Int,
         dockAtBottom: Boolean,
         phoneDensityDpi: Int,
+        baseline: Int = DENSITY_BASELINE,
     ): DisplayGeometry {
         val landscape = appAreaW > appAreaH && !dockAtBottom
         val wF: Float
         val hF: Float
         if (landscape) {
-            hF = LETTERBOX_TARGET_DP * LETTERBOX_ASPECT_RATIO * phoneDensityDpi / DENSITY_BASELINE
+            hF = LETTERBOX_TARGET_DP * LETTERBOX_ASPECT_RATIO * phoneDensityDpi / baseline
             wF = hF * appAreaW / appAreaH.toFloat()
         } else {
-            wF = LETTERBOX_TARGET_DP * phoneDensityDpi / DENSITY_BASELINE
+            wF = LETTERBOX_TARGET_DP * phoneDensityDpi / baseline
             hF = wF * appAreaH / appAreaW.toFloat()
         }
         val scale = minOf(1f, MAX_DISPLAY_PX.toFloat() / maxOf(wF, hF))
@@ -114,13 +115,13 @@ object VirtualLauncher {
             w,
             h,
             phoneDensityDpi,
-            w * DENSITY_BASELINE.toFloat() / phoneDensityDpi,
-            h * DENSITY_BASELINE.toFloat() / phoneDensityDpi,
+            w * baseline.toFloat() / phoneDensityDpi,
+            h * baseline.toFloat() / phoneDensityDpi,
         )
     }
 
     /**
-     * 地图屏几何：px = 画布应用区 × 手机密度 / [DENSITY_BASELINE]（2026-11-10 基准
+     * 地图屏几何：px = 画布应用区 × 手机密度 / [baseline]（2026-11-10 基准
      * 从遗留 200 统一到 Android dp 基准——密度本就是手机侧，基准一致后换算公式
      * 与应用屏完全同构）。效果：同密度下地图应用的 dp 窗口 = 画布应用区 ×
      * 160/手机密度，标注/字号与手机侧一致（16sp 文字 = 16×手机密度/160 px）。
@@ -129,9 +130,10 @@ object VirtualLauncher {
         appAreaW: Int,
         appAreaH: Int,
         phoneDensityDpi: Int,
+        baseline: Int = DENSITY_BASELINE,
     ): DisplayGeometry {
-        val wF = appAreaW * (phoneDensityDpi / DENSITY_BASELINE.toFloat())
-        val hF = appAreaH * (phoneDensityDpi / DENSITY_BASELINE.toFloat())
+        val wF = appAreaW * (phoneDensityDpi / baseline.toFloat())
+        val hF = appAreaH * (phoneDensityDpi / baseline.toFloat())
         val scale = minOf(1f, MAX_DISPLAY_PX.toFloat() / maxOf(wF, hF))
         val w = Math.round(wF * scale)
         val h = Math.round(hF * scale)
@@ -139,8 +141,8 @@ object VirtualLauncher {
             w,
             h,
             phoneDensityDpi,
-            w * DENSITY_BASELINE.toFloat() / phoneDensityDpi,
-            h * DENSITY_BASELINE.toFloat() / phoneDensityDpi,
+            w * baseline.toFloat() / phoneDensityDpi,
+            h * baseline.toFloat() / phoneDensityDpi,
         )
     }
 
@@ -284,7 +286,7 @@ object VirtualLauncher {
     }
 
     /** 固定应用屏相对画布卡片的缩放（显示 px/画布 px；密度=手机侧，语义同 [mapDisplayScale]）。 */
-    fun pinnedDisplayScale(): Float = pinnedDisplayDensity / DENSITY_BASELINE.toFloat()
+    fun pinnedDisplayScale(): Float = pinnedDisplayDensity / pinnedDisplayBaseline.toFloat()
 
     val runningApps = LinkedHashSet<ComponentName>()
 
@@ -513,6 +515,10 @@ object VirtualLauncher {
     @Volatile
     private var mapDisplayDensity = DENSITY_BASELINE
 
+    /** 地图屏密度基准（attach 从偏好读取；resize/触摸 scale 换算用，2026-11-11）。 */
+    @Volatile
+    private var mapDisplayBaseline = DENSITY_BASELINE
+
     /** 仪表盘（分屏）模式是否激活。 */
     @Volatile
     var dashboardMode: Boolean = false
@@ -577,6 +583,10 @@ object VirtualLauncher {
     /** 固定应用屏密度（= 手机侧，attach 时赋值；resize 恒定，同地图屏语义）。 */
     @Volatile
     private var pinnedDisplayDensity = DENSITY_BASELINE
+
+    /** 固定应用屏密度基准（attach 从偏好读取；resize/触摸 scale 换算用，2026-11-11）。 */
+    @Volatile
+    private var pinnedDisplayBaseline = DENSITY_BASELINE
 
     /** 固定应用屏全屏形态（桌面点被固定应用图标进入；⌂ 退出回仪表盘）。 */
     @Volatile
@@ -643,7 +653,7 @@ object VirtualLauncher {
      * 地图屏相对画布 tile 的缩放（显示 px/画布 px；密度=手机侧，典型 ~2.8）。
      * 触摸坐标换算用：地图触摸命中画布 tile 后乘此倍率得到屏内坐标。
      */
-    fun mapDisplayScale(): Float = mapDisplayDensity / DENSITY_BASELINE.toFloat()
+    fun mapDisplayScale(): Float = mapDisplayDensity / mapDisplayBaseline.toFloat()
 
     private var dockDisplay: VirtualDisplay? = null
     private var appDisplay: VirtualDisplay? = null
@@ -774,9 +784,16 @@ object VirtualLauncher {
         // px = dp 窗口 × 手机密度/160，合成器 GL 缩小回画布应用区（天然高倍率超采样，
         // 取代原 appHi 超采样屏——手机密度本就高于旧超采样倍率）。
         val phoneDensityDpi = context.resources.displayMetrics.densityDpi
-        val appGeom = appDisplayGeometry(appWidth, appHeightPx, dockAtBottom, phoneDensityDpi)
-        val mapGeom = mapDisplayGeometry(appWidth, appHeightPx, phoneDensityDpi)
+        // 虚拟屏密度基准（2026-11-11）：三屏各自一档（设置→显示，mdpi~xxhdpi），
+        // 下次连接生效——attach 读偏好并记住用于 resize/触摸的 scale 换算。
+        val appBaseline = DisplayPrefs.appDisplayBaseline(context)
+        val mapBaseline = DisplayPrefs.mapDisplayBaseline(context)
+        val pinnedBaseline = DisplayPrefs.pinnedDisplayBaseline(context)
+        val appGeom = appDisplayGeometry(appWidth, appHeightPx, dockAtBottom, phoneDensityDpi, appBaseline)
+        val mapGeom = mapDisplayGeometry(appWidth, appHeightPx, phoneDensityDpi, mapBaseline)
         mapDisplayDensity = mapGeom.densityDpi
+        mapDisplayBaseline = mapBaseline
+        pinnedDisplayBaseline = pinnedBaseline
         appDisplayScale = appGeom.widthPx / appWidth.toFloat()
         // 地图屏：按应用区全尺寸创建（此处为画布域的 resize 基线），分屏/全屏间动态
         // resize（见 resizeMapDisplay）。tile 尺寸 = SPLIT 绘制矩形，边距统一用契约值
@@ -788,7 +805,7 @@ object VirtualLauncher {
                 .getFloat(PREF_KEY_DASH_SPLIT, DASH_SPLIT_DEFAULT_FRACTION)
                 .let(::clampDashSplitFraction)
         // 固定应用卡片（右侧卡片=指定应用时）：卡片矩形 = 音乐卡区域（随分屏比例），
-        // 屏几何 = 卡片矩形 × 手机密度/DENSITY_BASELINE（同地图屏换算——密度=手机侧）。
+        // 屏几何 = 卡片矩形 × 手机密度/各自基准（同地图屏换算——密度=手机侧）。
         // 所选应用已卸载时 resolve=null → 音乐卡片回退（DashCardPrefs）。
         // composer 输入恒按卡片尺寸创建（音乐模式也传，Surface 常在供会话中切换），
         // 此处仅决定建不建虚拟屏。
@@ -803,7 +820,7 @@ object VirtualLauncher {
                 dashSplitFraction,
                 dockAtBottom,
             )
-        val pinnedGeom = mapDisplayGeometry(pinnedCard.width, pinnedCard.height, phoneDensityDpi)
+        val pinnedGeom = mapDisplayGeometry(pinnedCard.width, pinnedCard.height, phoneDensityDpi, pinnedBaseline)
         pinnedDisplayDensity = pinnedGeom.densityDpi
         if (dockAtBottom) {
             val geom = dashSplitGeom(appHeightPx, dashSplitFraction)
@@ -1478,7 +1495,7 @@ object VirtualLauncher {
     private fun resizePinnedDisplay(fullscreen: Boolean) {
         val id = pinnedDisplayId
         if (id < 0) return
-        val scale = pinnedDisplayDensity / DENSITY_BASELINE.toFloat()
+        val scale = pinnedDisplayDensity / pinnedDisplayBaseline.toFloat()
         val w: Int
         val h: Int
         if (fullscreen) {
@@ -1923,7 +1940,7 @@ object VirtualLauncher {
         val id = mapDisplayId
         if (id < 0) return
         // resize 目标 = 画布域 tile/应用区尺寸 × 地图屏缩放（显示 px 域；密度=手机侧）
-        val mapScale = mapDisplayDensity / DENSITY_BASELINE.toFloat()
+        val mapScale = mapDisplayDensity / mapDisplayBaseline.toFloat()
         val w = ((if (fullscreen) appAreaWidth else mapTileWidth) * mapScale).toInt()
         val h = ((if (fullscreen) appAreaHeight else mapTileHeight) * mapScale).toInt()
         if (w <= 0 || h <= 0 || (w == mapDisplayW && h == mapDisplayH)) return

@@ -211,86 +211,24 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="断开保留虚拟屏"
+            android:text="虚拟屏密度基准"
             android:textColor="#FFF5F5F7"
             android:textSize="14sp" />
 
+        <!-- 三行×4 档由代码构建（DisplayPanelFragment）：应用屏/地图屏/固定应用屏
+             各自独立一档（mdpi/hdpi/xhdpi/xxhdpi），下次连接生效 -->
         <LinearLayout
-            android:layout_width="wrap_content"
+            android:id="@+id/baselineSection"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:orientation="horizontal">
-
-            <LinearLayout
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:background="@drawable/bg_segment"
-                android:orientation="horizontal"
-                android:padding="3dp">
-
-                <TextView
-                    android:id="@+id/btnKeepDisplaysOn"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:background="@drawable/bg_segment_sel"
-                    android:paddingLeft="18dp"
-                    android:paddingTop="6dp"
-                    android:paddingRight="18dp"
-                    android:paddingBottom="6dp"
-                    android:text="开"
-                    android:textColor="#FFFFFFFF"
-                    android:textSize="13sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/btnKeepDisplaysOff"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginLeft="2dp"
-                    android:paddingLeft="18dp"
-                    android:paddingTop="6dp"
-                    android:paddingRight="18dp"
-                    android:paddingBottom="6dp"
-                    android:text="关"
-                    android:textColor="#FF8E8E93"
-                    android:textSize="13sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <TextView
-                android:id="@+id/retentionRetriesLabel"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center_vertical"
-                android:layout_marginLeft="14dp"
-                android:text="重试窗口"
-                android:textColor="#FF8E8E93"
-                android:textSize="12sp" />
-
-            <SeekBar
-                android:id="@+id/retentionRetriesSeek"
-                android:layout_width="120dp"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center_vertical"
-                android:layout_marginLeft="6dp"
-                android:max="9" />
-
-            <TextView
-                android:id="@+id/retentionRetriesValue"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center_vertical"
-                android:layout_marginLeft="6dp"
-                android:textColor="#FF8E8E93"
-                android:textSize="12sp" />
-        </LinearLayout>
+            android:orientation="vertical" />
 
         <TextView
-            android:id="@+id/retentionNote"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="意外断开（车机拆链/WiFi 断/熄火）后保留虚拟屏与运行中的应用，自动重连成功即恢复；每 60s 一个重试窗口，连续 N 窗未恢复则销毁。手动断开始终立即销毁。"
+            android:text="档位=dp→px 换算分母：越大屏 px 越小、应用窗口越窄（内容相对更挤）；下次连接生效"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 

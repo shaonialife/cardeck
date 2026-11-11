@@ -1,5 +1,6 @@
 package io.github.shaonialife.cardeck.launcher.settings
 
+import android.content.Context
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -897,79 +898,115 @@ class DisplayPanelFragment : SettingsPanelFragment() {
             },
         )
 
-        // 断开保留虚拟屏（2026-11-10）：意外断开保屏复用 + N 个 60s 重试窗口后销毁；
-        // 手动断开始终立即销毁（文案写明）。开关关时重试次数置灰。
-        val keepOn = view.findViewById<TextView>(R.id.btnKeepDisplaysOn)
-        val keepOff = view.findViewById<TextView>(R.id.btnKeepDisplaysOff)
-        val retriesLabel = view.findViewById<TextView>(R.id.retentionRetriesLabel)
-        val retriesSeek = view.findViewById<SeekBar>(R.id.retentionRetriesSeek)
-        val retriesValue = view.findViewById<TextView>(R.id.retentionRetriesValue)
-        val retentionNote = view.findViewById<TextView>(R.id.retentionNote)
+        // 虚拟屏密度基准（2026-11-11）：应用/地图/固定屏各自 4 档（mdpi~xxhdpi），
+        // 下次连接生效（attach 读偏好）。程序化构建：3 行 × 4 分段，省 12 个 XML id。
+        val baselineSection = view.findViewById<LinearLayout>(R.id.baselineSection)
+        val density = resources.displayMetrics.density
+        val baselineRefreshers = mutableListOf<() -> Unit>()
 
-        fun refreshKeepDisplays(enabled: Boolean) {
-            keepOn.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
-            )
-            keepOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
-            keepOff.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
-            )
-            keepOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
-            retriesLabel.alpha = if (enabled) 1f else 0.35f
-            retriesSeek.alpha = if (enabled) 1f else 0.35f
-            retriesValue.alpha = if (enabled) 1f else 0.35f
-            retentionNote.text =
-                if (enabled) {
-                    "意外断开（车机拆链/WiFi 断/熄火）后保留虚拟屏与运行中的应用，自动重连成功即恢复；" +
-                        "每 60s 一个重试窗口，连续 N 窗未恢复则销毁。手动断开始终立即销毁。"
-                } else {
-                    "已关闭：任何断开（含意外断开）都立即销毁虚拟屏，重连后全新重建。"
-                }
+        fun refreshBaselineRows() {
+            baselineRefreshers.forEach { runCatching { it() } }
         }
 
-        val savedKeep = DisplayPrefs.keepDisplaysOnUnexpectedDisconnect(ctx)
-        val savedRetries = DisplayPrefs.displayRetentionRetries(ctx)
-        refreshKeepDisplays(savedKeep)
-        retriesSeek.progress = savedRetries - DisplayPrefs.RETENTION_RETRIES_MIN
-        retriesValue.text = "$savedRetries 窗"
-
-        fun applyKeep(enabled: Boolean) {
-            if (enabled == DisplayPrefs.keepDisplaysOnUnexpectedDisconnect(ctx)) return
-            DisplayPrefs.setKeepDisplaysOnUnexpectedDisconnect(ctx, enabled)
-            refreshKeepDisplays(enabled)
-            hostToast(
-                if (enabled) {
-                    "已开启：意外断开保留虚拟屏（手动断开仍立即销毁）"
-                } else {
-                    "已关闭：断开立即销毁虚拟屏"
+        data class BaselineRow(
+            val label: String,
+            val getter: (Context) -> Int,
+            val setter: (Context, Int) -> Unit,
+        )
+        val rows =
+            listOf(
+                BaselineRow("应用屏", DisplayPrefs::appDisplayBaseline, DisplayPrefs::setAppDisplayBaseline),
+                BaselineRow("地图屏", DisplayPrefs::mapDisplayBaseline, DisplayPrefs::setMapDisplayBaseline),
+                BaselineRow("固定应用屏", DisplayPrefs::pinnedDisplayBaseline, DisplayPrefs::setPinnedDisplayBaseline),
+            )
+        val tierLabels = listOf("mdpi", "hdpi", "xhdpi", "xxhdpi")
+        rows.forEach { rowDef ->
+            val row =
+                LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    // 显式 LayoutParams（首版用默认 LP：segmentsBox 横向占满、label 被压
+                    // 成 0 宽、spacer 顶走其余档位——只有第一档可见，2026-11-11 截图实测）
+                    layoutParams =
+                        LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                        )
+                    setPadding(0, (4 * density).toInt(), 0, (4 * density).toInt())
+                }
+            row.addView(
+                TextView(ctx).apply {
+                    text = rowDef.label
+                    setTextColor(0xFFF5F5F7.toInt())
+                    textSize = 13f
+                    layoutParams =
+                        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 },
             )
+            val segmentsBox =
+                LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    background = ctx.getDrawable(R.drawable.bg_segment)
+                    setPadding(
+                        (3 * density).toInt(),
+                        (3 * density).toInt(),
+                        (3 * density).toInt(),
+                        (3 * density).toInt(),
+                    )
+                    layoutParams =
+                        LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                        )
+                }
+            val buttons = mutableListOf<Pair<Int, TextView>>()
+            DisplayPrefs.BASELINE_TIERS.forEachIndexed { index, tier ->
+                val seg =
+                    TextView(ctx).apply {
+                        text = tierLabels[index]
+                        textSize = 12f
+                        setPadding(
+                            (10 * density).toInt(),
+                            (5 * density).toInt(),
+                            (10 * density).toInt(),
+                            (5 * density).toInt(),
+                        )
+                        layoutParams =
+                            LinearLayout
+                                .LayoutParams(
+                                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                                ).apply {
+                                    if (index > 0) leftMargin = (2 * density).toInt()
+                                }
+                    }
+                buttons.add(tier to seg)
+                segmentsBox.addView(seg)
+                seg.setOnClickListener {
+                    rowDef.setter(ctx, tier)
+                    refreshBaselineRows()
+                    hostToast("${rowDef.label}密度基准：${tierLabels[index]}（下次连接生效）")
+                }
+            }
+            row.addView(segmentsBox)
+            baselineSection.addView(row)
+
+            val refreshRow = {
+                val current = rowDef.getter(ctx)
+                buttons.forEach { (tier, seg) ->
+                    val selected = tier == current
+                    seg.setBackgroundResource(
+                        if (selected) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+                    )
+                    seg.setTextColor(if (selected) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+                }
+            }
+            refreshRow()
+            baselineRefreshers.add(refreshRow)
         }
-        keepOn.setOnClickListener { applyKeep(true) }
-        keepOff.setOnClickListener { applyKeep(false) }
-        retriesSeek.setOnSeekBarChangeListener(
-            object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(
-                    seekBar: SeekBar?,
-                    progress: Int,
-                    fromUser: Boolean,
-                ) {
-                    if (!fromUser) return
-                    val retries = progress + DisplayPrefs.RETENTION_RETRIES_MIN
-                    retriesValue.text = "$retries 窗"
-                }
+        refreshBaselineRows()
 
-                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    val retries = retriesSeek.progress + DisplayPrefs.RETENTION_RETRIES_MIN
-                    DisplayPrefs.setDisplayRetentionRetries(ctx, retries)
-                    hostToast("保留期重试窗口：$retries（约 $retries 分钟）")
-                }
-            },
-        )
-
-        // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
         view.findViewById<TextView>(R.id.btnWallpaperPick).setOnClickListener {
             wallpaperPicker.launch(
                 androidx.activity.result.PickVisualMediaRequest(
