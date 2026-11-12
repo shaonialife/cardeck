@@ -433,8 +433,14 @@ class AudioSender(
                 {
                     var syncSequence = 0
                     var first = true
-                    try {
-                        while (running.get() && !client.isClosed) {
+                    // fw 对照（2026-11-12）：fw 同步锚 = SetTimeAnnounce 走 hose 适配器
+                    // 内部分发（必达）；UDP ECONNREFUSED = 平台 ICMP 伪影（真车奥迪
+                    // controlPort 绑定晚于首包——2026-11-12 实录：首包被拒→停发→
+                    // 无锚→车机照收音频不排播，正是 2026-10-20 记载的真车症状）。
+                    // 持续每秒重试 = 平台面等价，非协议发明。
+                    var refusedStreak = 0
+                    while (running.get() && !client.isClosed) {
+                        try {
                             val next = timestamp
                             val current = (next - samplesPerPacket).coerceAtLeast(0L)
                             val packet =
@@ -447,6 +453,7 @@ class AudioSender(
                                     epochNtpSecs = ntpEpochAnchorSecs.toInt(),
                                 ) ?: continue
                             client.send(DatagramPacket(packet, packet.size))
+                            refusedStreak = 0
                             syncSequence = (syncSequence + 1) and 0xFFFF
                             if (first) {
                                 first = false
@@ -455,10 +462,13 @@ class AudioSender(
                                         "车机若仍无声，说明它没在等这个锚点",
                                 )
                             }
-                            Thread.sleep(SYNC_INTERVAL_MILLIS)
+                        } catch (retryable: java.io.IOException) {
+                            refusedStreak++
+                            if (refusedStreak == 1 || refusedStreak % 10 == 0) {
+                                log("AUDIO: 同步包暂被拒（$refusedStreak 次，车机 controlPort 未绑定？持续重试）- ${retryable.message}")
+                            }
                         }
-                    } catch (error: Exception) {
-                        if (running.get()) log("AUDIO: 同步包发送停止 - ${error.message}")
+                        Thread.sleep(SYNC_INTERVAL_MILLIS)
                     }
                 },
                 "audio-sync",
