@@ -247,7 +247,13 @@ class AirPlayLink(
                             updateEndpoint(refreshed, "配对期间 mDNS 刷新")
                         }
                         flowConnectTick++
-                        if (flowConnectTick == 1 || flowConnectTick % RETRY_TICK_ATTEMPTS == 0) {
+                        // 403 连击期间每轮 tick（二轮修正：10 轮节拍在 7s/轮
+                        // 的 403 循环里 = ctrl 重公告 ~70s 一次，车机邀请来得
+                        // 太晚——连击期间每轮重公告/刷新端点，邀请早来）
+                        if (flowConnectTick == 1 ||
+                            forbiddenStreak > 0 ||
+                            flowConnectTick % RETRY_TICK_ATTEMPTS == 0
+                        ) {
                             runCatching { retryTick?.invoke(flowConnectTick) }
                         }
                         close()
@@ -487,7 +493,12 @@ class AirPlayLink(
                     return "{\"op\":\"pairDone\"}"
                 }
                 "error" -> {
-                    log("AIRPLAY: 会话事件错误 - ${json.optString("message")}")
+                    val message = json.optString("message")
+                    log("AIRPLAY: 会话事件错误 - $message")
+                    // 重连场景 403 走这里（pair-verify 泵）——每条 403 都发
+                    // 信号（宿主查当前 SSID，不符立即重加入，不等 10 轮节拍）
+                    noteForbiddenError(message)
+                    onForbiddenSignal?.invoke(message)
                     return "{\"op\":\"pairFail\"}"
                 }
             }
@@ -1175,20 +1186,12 @@ class AirPlayLink(
                     val message = json.optString("message")
                     log("AIRPLAY: 连接序错误 - $message")
                     // 家庭网段直连 403 偶现（2026-11-12 复测定性，AGENTS）：
-                    // DiPlay 双网时 4301 invite 给家庭地址，pair-verify M1 即拒
-                    // 403 循环——旧径 15 轮 ~30s 才由 ECONNREFUSED 兜底判网络
-                    // 不对。连续 403 达阈值 → 提前按「网络不对」处理（清记录 +
-                    // 走池重加入）。保守阈值 3：真配对失败一般 1-2 次即换形态/
-                    // flow abort；只匹配 403 不误伤 455/466（pairingRequired 族）
-                    if (message.contains("403")) {
-                        forbiddenStreak++
-                        if (forbiddenStreak == 3) {
-                            log("AIRPLAY: 连续 403 ×3——疑似网络不对（双网直连），提前触发重加入")
-                            onForbiddenStreak?.invoke()
-                        }
-                    } else {
-                        forbiddenStreak = 0
-                    }
+                    // 连续 403 达阈值 → 提前按「网络不对」处理；每条 403 同时
+                    // 发 onForbiddenSignal（宿主查当前 SSID，不符立即重加入）。
+                    // 保守阈值 3：真配对失败一般 1-2 次即换形态/flow abort；
+                    // 只匹配 403 不误伤 455/466（pairingRequired 族）
+                    noteForbiddenError(message)
+                    onForbiddenSignal?.invoke(message)
                     return "{\"op\":\"setupFail\"}"
                 }
             }
@@ -1329,8 +1332,27 @@ class AirPlayLink(
      *  失败径）。 */
     var onForbiddenStreak: (() -> Unit)? = null
 
+    /** 每条 403 错误事件的信号钩（2026-11-12 二轮：宿主查当前 SSID，
+     *  不符立即重加入——不等 10 轮 retryTick 节拍/3 连击阈值）。 */
+    var onForbiddenSignal: ((String) -> Unit)? = null
+
     /** 连续 403 计数（非 403 错误重置；runFlow 起点清零）。 */
     private var forbiddenStreak = 0
+
+    /** 每条错误事件的 403 连击记账（两个循环共用：setupRound 事件循环 +
+     *  pumpPairingSession 配对泵——重连场景 403 走配对泵，审查首轮挂钩
+     *  挂错循环的修正）。 */
+    private fun noteForbiddenError(message: String) {
+        if (message.contains("403")) {
+            forbiddenStreak++
+            if (forbiddenStreak == 3) {
+                log("AIRPLAY: 连续 403 ×3——疑似网络不对（双网直连），提前触发重加入")
+                onForbiddenStreak?.invoke()
+            }
+        } else {
+            forbiddenStreak = 0
+        }
+    }
 
     var onMediaKey: ((Int) -> Unit)? = null
 

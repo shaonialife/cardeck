@@ -2329,6 +2329,37 @@ object SessionController {
                             // DiPlay 双网时 invite 给家庭地址 → pair-verify M1
                             // 即拒 403 循环——同网络类失败径（清记录+池重加入），
                             // 省掉 30s 失败循环（阈值 3 在 AirPlayLink 侧）。
+                            // 每条 403 信号（审查二轮：重连场景 403 走配对泵，
+                            // 10 轮 retryTick 节拍太慢）——立即查当前 SSID，
+                            // 不符即重加入；与阈值钩/池闸共用一条重加入路。
+                            created.onForbiddenSignal = { message ->
+                                if (message.contains("403") && boundCarSsid != null) {
+                                    val current = shellWifiStatus().second
+                                    if (current != null && current != effective.ssid) {
+                                        appendLog(
+                                            "WIFI: 403 且当前网络不符（$current ≠ ${effective.ssid}）" +
+                                                "——清记录重新加入热点",
+                                        )
+                                        boundCarSsid = null
+                                        if (rejoinInFlight.compareAndSet(false, true)) {
+                                            wifiRejoinExecutor.execute {
+                                                try {
+                                                    joinCarWifiSpecifier(
+                                                        Iap2SenderSession.WifiConfiguration(
+                                                            effective.ssid,
+                                                            effective.passphrase,
+                                                            effective.channel,
+                                                            effective.securityType,
+                                                        ),
+                                                    )
+                                                } finally {
+                                                    rejoinInFlight.set(false)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             created.onForbiddenStreak = {
                                 appendLog("WIFI: 连续 403=疑似网络不对（双网直连）——清记录重新加入热点")
                                 boundCarSsid = null
