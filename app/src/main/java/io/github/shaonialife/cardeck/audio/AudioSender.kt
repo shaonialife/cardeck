@@ -132,6 +132,9 @@ class AudioSender(
 
     /** 首个音频包标记（打完就清）；AAC 自检只跑一次。 */
     private var markerPending = true
+
+    /** 距上次发包时刻毫秒钟（fw: sendOne 块流对象 +0x208 同构——每包更新）。 */
+    private var lastPacketAt = 0L
     private var selfChecked = false
 
     /** 每包/每帧对应的 PCM 字节数（PCM 通路=一包的负载；AAC 通路=一帧的输入）。 */
@@ -589,10 +592,23 @@ class AudioSender(
         }
     }
 
-    /** 封包 + 发送一包（同步更新 seq/ts/nonce 游标）。返回 false 表示链路已断。 */
+    /**
+     * 封包 + 发送一包（同步更新 seq/ts/nonce 游标）。返回 false 表示链路已断。
+     *
+     * RTP 打标触发序（fw: `carAudioStream_sendOneAudioDataMessage_block_
+     * invoke` @0x2276cbff0 直切，2026-11-12 审查 P1-4 兑现）：type1 =
+     * 首包（[markerPending]）；type2 = **发包间隙 >50ms**（0x32，
+     * @23276-23277；流对象 +0x208 每包无条件更新 @23280 = 包间隙检测，
+     * 旧注「距上次打标」系误读）——正常连续流（~21ms/帧）永不重标，
+     * 卡顿恢复首包打标（接收端 jitter 适配域）。判定发生在发送本包前
+     * （同固件 sendOne 时序）。
+     */
     private fun sendPayload(payload: ByteArray): Boolean {
-        val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
+        val now = android.os.SystemClock.uptimeMillis()
+        val gapBurst = !markerPending && lastPacketAt != 0L && now - lastPacketAt > 50
+        val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending || gapBurst)
         markerPending = false
+        lastPacketAt = now
         sequence = (sequence + 1) and 0xFFFF
         timestamp += samplesPerPacket
         nonceCounter++

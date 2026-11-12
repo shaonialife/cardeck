@@ -694,12 +694,19 @@ class AirPlayLink(
         }
     }
 
-    /** Rust 会话 feedback（'keep' POST /feedback——帧由 Rust 构建，1s 节奏）。 */
+    /**
+     * Rust 会话 feedback（'keep' POST /feedback——帧由 Rust 构建）。
+     * 周期 = **固件真值 2017ms**（2026-11-12 三重直切：StandardCreate
+     * `*(ctrl+0x24)=0x7e1` @APTransport_body.c:82296；Resume 武装
+     * CMTimeMake(+0x24,1000) @82598 + 日志 "interval %d ms" @82609；
+     * 发送门 = 距上次 ≥ +0x24 @13808）。旧 1s = catplay 值非固件形；
+     * 10s = 接收端 stall 判定阈值 @13823（容忍域上界，2017ms 深居其中）。
+     */
     fun startRustFeedbackLoop() {
         Thread({
             while (isSessionAlive() && sessionPumpHandle != 0L) {
                 NativeBridge.nativeAirplayKeepAlive(sessionPumpHandle)
-                Thread.sleep(1_000)
+                Thread.sleep(2_017)
             }
         }, "rust-feedback").apply {
             isDaemon = true
@@ -707,10 +714,7 @@ class AirPlayLink(
         }
     }
 
-    /**
-     * RTSP /feedback 心跳（对照 catplay FEEDBACK_INTERVAL=1000ms）：每秒 POST 空体
-     * /feedback——接收端的活动看门狗。RTSP 事务由 [rtspLock] 串行化。
-     */
+    /** RTSP /feedback 心跳入口（周期与锚见 [startRustFeedbackLoop]）。 */
     fun startFeedbackLoop() {
         // 'keep' 帧由 Rust 构建+泵排空（§10.57 控制通道单持有者——明文直写
         // 加密控制通道会 BAD_DECRYPT 断连，真机 21:58/22:04 实证）
