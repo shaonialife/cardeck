@@ -1129,6 +1129,24 @@ object VirtualLauncher {
             )
             // 分屏把手位置推给合成器（覆盖默认中线公式；拖动时 previewDashSplit 持续更新）
             composer.setTileEdgeOverride(dashSplitPos - DASH_GAP_PX / 2f)
+            // 恢复合成布局（2026-11-12 复用专属 bug）：composer 每轮新建、tileLayout
+            // 默认 HIDDEN，而保留屏的 UI 状态（正显示仪表盘页/全屏形态）在
+            // dashboardMode/mapFullscreen/pinnedFullscreen 里挂着且重连流程不会重发
+            // setTileLayout（dashboardMode 未变化）——不恢复的话仪表盘的地图 tile 与
+            // 固定应用卡都不画（切桌面再切回仪表盘触发 syncDashboard 才恢复，正是
+            // 用户实测的绕路修法）。全新会话 dashboardMode 必为 false，恒走 HIDDEN。
+            val restoredLayout =
+                when {
+                    pinnedFullscreen -> DualDisplayComposer.TileLayout.PINNED_FULLSCREEN
+                    mapFullscreen -> DualDisplayComposer.TileLayout.FULLSCREEN
+                    dashboardMode -> DualDisplayComposer.TileLayout.SPLIT
+                    else -> DualDisplayComposer.TileLayout.HIDDEN
+                }
+            composer.setTileLayout(restoredLayout)
+            logSink?.invoke(
+                "LAUNCHER: 合成布局恢复 → $restoredLayout" +
+                    "（dashboardMode=$dashboardMode mapFullscreen=$mapFullscreen pinnedFullscreen=$pinnedFullscreen）",
+            )
             if (!displaysCreated[0]) {
                 log("LAUNCHER: 虚拟屏创建失败")
                 detach()
@@ -1232,6 +1250,23 @@ object VirtualLauncher {
         retainedStreamW = streamWidthPx
         retainedStreamH = streamHeightPx
         logSink?.invoke("LAUNCHER: 虚拟屏进入保留态（${streamWidthPx}x$streamHeightPx，等待重连复用）")
+    }
+
+    /**
+     * 保留态 UI 复位到桌面（2026-11-12 用户要求）：意外断开即回桌面——重连复用后
+     * 车机先看到桌面，用户点回仪表盘时经 syncDashboard(true) 的既有对账把地图/
+     * 固定应用任务、卡片尺寸、合成布局全部恢复（那条路径本就逐项对账，比跨会话
+     * 恢复仪表盘状态简单且天然自洽）。
+     */
+    fun resetUiToDesktopForRetention() {
+        mapFullscreen = false
+        pinnedFullscreen = false
+        composer?.setTileLayout(DualDisplayComposer.TileLayout.HIDDEN)
+        if (dashboardMode) {
+            dashboardMode = false
+            notifyDashboard() // GridActivity 收到后 pager 切回桌面页
+        }
+        logSink?.invoke("LAUNCHER: 保留态复位到桌面（重连后点回仪表盘将自动对账恢复）")
     }
 
     fun detach() {
@@ -1580,6 +1615,16 @@ object VirtualLauncher {
             val ok = result.ok && result.output.contains("Starting:", ignoreCase = true)
             mapFrozen = false
             logSink?.invoke("MAP: 拉回启动 ${component.packageName} → 地图屏#$id ok=$ok out=${result.output.take(80)}")
+        } else {
+            // 任务在地图屏但**进程可能已被 applyAll 杀掉**（配对起步的 am compat
+            // 覆盖会杀名单内应用，重连轮次同样执行）——am start 带回前台会重启
+            // 死亡的活动（幂等：健康态=普通带回前台，同 ensureMapTask 语义）。
+            val result = startMapApp(component, id, forceNewTask = false)
+            mapFrozen = false
+            logSink?.invoke(
+                "MAP: 对账带回前台 ${component.packageName} → 地图屏#$id ok=" +
+                    (result.ok && result.output.contains("Starting:", ignoreCase = true)),
+            )
         }
     }
 

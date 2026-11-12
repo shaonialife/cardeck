@@ -999,6 +999,41 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
   ⑥ **已知边界**：app 进程死亡保留态丢失 → 下次启动走既有残留清理兜底；复用时
   composer 输入 buffer 尺寸必须=屏实际分辨率（attach 几何一致判定天然保证）。
   RetentionCounterTest 钉计数判定。
+  ⑦ **两个装机日志定谳的杀手（2026-11-12，0.1.28.100 修复）**：
+  ① **VideoSender.stop() 的拆卸也触发 onEnded**——手动断开会同步走
+     retireSession→stop→onEnded，onEnded 在 detach 清 id 前的窗口里跑进来就会
+     **误进保留态**（保留标记/计时器泄漏到下一轮：retireSession 误 keep=true +
+     计时器 detach 可能误杀活会话）。修复：suppressRetentionOnce 一次性旗标——
+     disconnect(userInitiated=true)/cancelConnecting 在 retireSession 前置位，
+     onEnded 消费后走非保留分支；手动断开同时清残留保留态/计时器；保留期 tick
+     加 `videoSender.isRunning` 兜底（绝不销毁活会话）。
+  ② **HiddenDisplaySource.attach 的前置 detach 是复用杀手**——复用判定在
+     VirtualLauncher.attach 头部，任何包装层抢先 detach 都会先清
+     sessionRetained/屏 id，复用永远走不到（真机日志定谳：重连全量重建）。
+     已删该行；**新增 attach 包装层时不得在 VirtualLauncher.attach 之前碰
+     VirtualLauncher 状态**。
+  ⑧ cancelConnecting 必须带 `userInitiated = true`（默认 false 是 AUTO_STOP
+  语义，会让保留特性在用户取消时误保屏）；冷却其自身已装填同值，重复无害。
+  ⑨ **复用后仪表盘卡片不渲染/地图黑（0.1.28.101~105 三刀修复）**：
+  第一刀：composer 每轮新建，`tileLayout` 默认 HIDDEN，而保留屏的 UI 状态（正显示
+  仪表盘页）挂在 dashboardMode 里、重连流程因 dashboardMode 未变化不会重发
+  setTileLayout——attach 尾部按 `pinnedFullscreen/mapFullscreen/dashboardMode`
+  恢复合成布局（全新会话 dashboardMode 必为 false，恒 HIDDEN 不受影响）。
+  第二刀：**配对起步的 applyAllAsync（am compat）会杀名单内应用**——保留屏上的
+  地图/固定应用任务可能已死或逃逸到手机侧，而重连流程（dashboardMode 未变化）
+  不会触发 syncDashboard 的对账。修复两层：①复用路径幂等对账——地图
+  `pullBackMapApp()`（任务在屏=am start 带回前台重启死亡活动；逃逸=清他屏任务+
+  地图屏重建）、固定应用 pinnedTaskAlive 检查分支；②**强制横屏写入改为按需**
+  （0.1.28.109）：applyAll 先查 `systemEnabled()`（一次 dumpsys），系统侧已生效的
+  应用跳过写入——`am compat enable` 对已生效覆盖同样杀进程，保留重连轮次上
+  名单应用正带着覆盖运行。半残状态（只开其一）同样跳过（与面板「取或」清理
+  语义一致）。曾加过「保留屏重绘微抖」——resize 抖动逼静止应用出帧，0.1.28.102
+  实测引入「地图发暗冻结」副作用（±2px 两次重排打断地图过渡帧）且被对账机制
+  覆盖，0.1.28.106 移除。
+  **真机端到端（荣耀+DiPlay 台，0.1.28.102 验证）**：意外断开（杀接收端，仪表盘态）→
+  保留态 + 四屏保留 → 重启接收端 → 四屏原 id 复用 + 合成布局恢复 SPLIT + 重绘微抖 →
+  **地图 tile 与固定应用卡自动渲染**（无手动页面切换）；手动断开 → 立即销毁且零
+  保留日志。
 - **BT 断链僵尸轮次 + specifier 永久挂起（2026-10-22 奥迪 3315 真机定谳）**：车机 15s
   AirPlay 看门狗（15.07s 实测，与 sysdiagnose 互证）拆链后**立即回连重发端点**，而我们的
   「sessionStarting 互斥」只认标志不认轮次存活性——WiFi 加入卡死（120s 窗）的僵尸轮次把

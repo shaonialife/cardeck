@@ -30,7 +30,10 @@ class HiddenDisplaySource(
         height: Int,
         densityDpi: Int,
     ): Boolean {
-        detach()
+        // ⚠️ 不要在这里 detach：保留虚拟屏复用（2026-11-10）的判定在
+        // VirtualLauncher.attach 头部——它复用时只停旧 composer（屏与屏上任务不动），
+        // 非复用分支自己会 detach。这里抢先 detach 会把 sessionRetained/屏 id 全部
+        // 清零，复用永远走不到（2026-11-12 真机日志定谳：重连全量重建的根因）。
         // 逐状态诊断：Shizuku「开着」≠ 已授权本应用（服务端授权必须弹窗点一次）
         when (val gate = ShizukuGate.state(context)) {
             ShizukuGate.State.READY -> Unit

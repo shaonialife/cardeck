@@ -365,7 +365,10 @@ object SessionController {
         connectCancelled = true
         autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
         appendLog("SESSION: 用户取消连接——正在停止蓝牙/WiFi 链路（自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟）")
-        disconnect(context)
+        // 用户取消 = 用户终态：必须带 userInitiated=true（默认 false 是 AUTO_STOP
+        // 语义，会让保留特性误进保留态保屏——2026-11-12 保留特性接线时定谳）；
+        // 冷却上面已自行装填同值，重复装填无害。
+        disconnect(context, userInitiated = true)
         // 强制释放互斥：配对流程线程可能阻塞在不可中断的连接/mDNS 等待上（如手机
         // 不在热点网段时连热点 IP），finally 遥遥无期——用户显式取消即强制解锁，
         // 否则英雄卡永久「正在连接」（旧流程产出已被 retireSession 清理，无冲突）
@@ -593,6 +596,13 @@ object SessionController {
         if (userInitiated) {
             autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
             appendLog("SESSION: 手动断开——自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟（ACL 抖动不再自动拉起）")
+            // 手动终态：抑制 stop 拆卸触发的 onEnded 误进保留态（见 suppressRetentionOnce
+            // 注释），并清掉可能残留的保留态/计时器（此前意外断开保了屏、用户又手动断开的
+            // 场景——destroy 照旧执行，保留态必须一起收掉，否则泄漏到下一轮）
+            suppressRetentionOnce.set(true)
+            cancelRetentionTimer()
+            displayRetentionActive.set(false)
+            retentionFailures = 0
         }
         // 熄火/出范围（AUTO_STOP，userInitiated=false）= 意外断开：进保留态保屏，
         // 下次上车 ACL 拉起连接后复用。手动断开（userInitiated=true）始终销毁。
@@ -615,9 +625,10 @@ object SessionController {
         boundCarSsid = null
         // 「强制应用横屏」覆盖的用户终态复原（原先在 retireSession 里——那里每轮
         // 配对起步也执行，会杀掉新一轮刚拉起的应用，2026-10-23 移出到真实终态）。
-        if (orientationRestorePending.compareAndSet(true, false)) {
-            appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
-        }
+        // **无条件执行**：复用重连轮次跳过了 applyAll（保屏语义），pending 未置位——
+        // 若仍按 CAS 门控，手动断开后覆盖会泄漏在系统里（2026-11-12）。同轮 onEnded
+        // 已被 suppress 消费走非保留分支，其自身 CAS 不会重复执行。
+        appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
         // shell 兜底存下的系统网络（connect-network）自动 forget 还原：无互联网热点
         // 被系统当默认网会挤掉移动数据。失败只记日志（用户可到 WLAN 手动删）。
         cleanupShellFallbackNetwork()
@@ -753,6 +764,18 @@ object SessionController {
 
     private val displayRetentionActive = AtomicBoolean(false)
 
+    /**
+     * 用户主动终态（手动断开/取消连接）对 onEnded 的一次性保留抑制。
+     *
+     * **VideoSender.stop() 的拆卸也会触发 onEnded**（2026-11-12 日志定谳：手动断开
+     * → retireSession 先 stop 视频 → onEnded 在 detach 清 id 前的窗口里跑进来，
+     * 看到屏 id ≥0 就误进保留态——保留标记/计时器泄漏到下一轮：
+     * `retireSession(keep=true)` 误保 + attach 因 sessionRetained 已被 detach 清掉
+     * 而重建，正好是用户报的两个症状）。disconnect(userInitiated=true) 与
+     * cancelConnecting 在 retireSession 之前置位，onEnded 消费后走非保留分支。
+     */
+    private val suppressRetentionOnce = AtomicBoolean(false)
+
     @Volatile
     private var retentionFailures = 0
 
@@ -771,6 +794,10 @@ object SessionController {
         if (!displayRetentionActive.compareAndSet(false, true)) return true // 已在保留态
         retentionFailures = 0
         VirtualLauncher.markRetained()
+        // 断开即回桌面（2026-11-12 用户要求）：重连复用后车机先显示桌面，用户点回
+        // 仪表盘时走 syncDashboard(true) 的完整对账（地图/固定应用拉回、卡片尺寸、
+        // 合成布局逐项恢复）
+        VirtualLauncher.resetUiToDesktopForRetention()
         appendLog(
             "SESSION: 意外断开——虚拟屏进入保留态（等待自动重连复用；" +
                 "${DisplayPrefs.displayRetentionRetries(ctx)} 个重试窗口未恢复则销毁）",
@@ -794,6 +821,12 @@ object SessionController {
             object : Runnable {
                 override fun run() {
                     if (!displayRetentionActive.get()) return
+                    // 兜底防御：会话又活了（推流成功处已有 exitDisplayRetention，此为
+                    // 双保险）——绝不能让保留期销毁打到活会话的虚拟屏上
+                    if (videoSender?.isRunning == true) {
+                        exitDisplayRetention()
+                        return
+                    }
                     val ctx = appContext
                     if (ctx == null) {
                         displayRetentionActive.set(false)
@@ -2274,6 +2307,9 @@ object SessionController {
                     // 空窗，写入在此期间自然排空，attach 只需 drain（~0ms）——原先在 attach
                     // 里同步跑（1.6s，串行时 3.2s）会侵占「RECORD→屏幕口 keepAlive」的
                     // ~10s 拆链预算（keepAlive 帧自 attach 返回后才起发，2026-10-23 定谳）。
+                    // 强制横屏覆盖为**按需写入**（AppOrientationCompat.applyAll 内跳过
+                    // 系统侧已生效的应用，不杀运行中进程）——保留重连轮次上名单应用
+                    // 已带覆盖运行，本批全部跳过、零杀进程
                     orientationRestorePending.set(true)
                     appContext?.let { ctx -> AppOrientationCompat.applyAllAsync(ctx, ::appendLog) }
                     // 保留态回连：上一轮意外断开的屏还在——retireSession 跳过销毁，
@@ -2600,7 +2636,12 @@ object SessionController {
                                             restorePhoneScreen(sleepIfCarSide = true)
                                             // 保留态判定（2026-11-10）：屏在 + 偏好开 → 虚拟屏不动，
                                             // 等自动重连后 attach 复用（屏上应用/导航状态连续）。
-                                            val keepDisplays = enterDisplayRetention()
+                                            // 用户主动终态（手动断开/取消）先消费抑制旗标：
+                                            // stop 的拆卸也走本回调，误进保留态会把标记/计时器
+                                            // 泄漏到下一轮（2026-11-12 日志定谳，见
+                                            // suppressRetentionOnce 注释）。
+                                            val userTornDown = suppressRetentionOnce.compareAndSet(true, false)
+                                            val keepDisplays = !userTornDown && enterDisplayRetention()
                                             if (keepDisplays) {
                                                 // 保留分支补做 retireSession 才会做的两件收口
                                                 // （复用路径回连后 retireSession(keep=true) 不碰屏）：

@@ -281,8 +281,23 @@ object AppOrientationCompat {
             )
             return 0
         }
+        // 按需写入（2026-11-12）：系统侧已开着覆盖的应用**跳过**——am compat enable
+        // 对已生效的覆盖同样会杀掉目标应用进程；保留重连轮次上名单应用正带着覆盖
+        // 运行（保留路径刻意不复原），逐个重写=杀掉要保状态的应用（复用后地图/
+        // 固定应用卡黑屏的根因）。一次 systemEnabled() 查询（~30ms dumpsys）即可判定。
+        // 半残状态（只开其一，写入失败的罕见残留）同样跳过：与面板「取或」清理语义
+        // 一致，避免为罕见残留杀一次运行中的应用；可在横屏面板开关一次补齐。
+        val alreadyEnabled = systemEnabled()
+        val todo = pkgs.filter { it !in alreadyEnabled }
+        if (todo.size < pkgs.size) {
+            diagSink?.invoke(
+                "ORIENTATION: ${pkgs.size - todo.size}/${pkgs.size} 个应用覆盖已生效——跳过写入" +
+                    "（不杀运行中应用）${if (todo.isEmpty()) "，本次无需写入" else ""}",
+            )
+        }
+        if (todo.isEmpty()) return 0
         var count = 0
-        for (pkg in pkgs) {
+        for (pkg in todo) {
             val first = Shell.exec("am compat enable $CHANGE_UNDEFINED_TO_NOSENSOR $pkg", timeoutMs = 4000)
             if (!first.ok) {
                 // ChangeId 已注册仍被拒 → user build 不允许改非 debuggable 应用；
