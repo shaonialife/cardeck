@@ -214,6 +214,7 @@ class AirPlayLink(
         lastKeys = null
         pendingSetupInfo = null
         flowConnectTick = 0
+        forbiddenStreak = 0
         val identity = loadOrCreateIdentity()
         log("AIRPLAY: 控制器身份 pairingId=${identity.pairingId}")
         // 会话墙钟锚（fw: NTPClockSetEpoch @0x19293f7a0 锚定语义——时钟
@@ -1171,7 +1172,23 @@ class AirPlayLink(
                     return "{\"op\":\"setupOk\"}"
                 }
                 "error" -> {
-                    log("AIRPLAY: 连接序错误 - ${json.optString("message")}")
+                    val message = json.optString("message")
+                    log("AIRPLAY: 连接序错误 - $message")
+                    // 家庭网段直连 403 偶现（2026-11-12 复测定性，AGENTS）：
+                    // DiPlay 双网时 4301 invite 给家庭地址，pair-verify M1 即拒
+                    // 403 循环——旧径 15 轮 ~30s 才由 ECONNREFUSED 兜底判网络
+                    // 不对。连续 403 达阈值 → 提前按「网络不对」处理（清记录 +
+                    // 走池重加入）。保守阈值 3：真配对失败一般 1-2 次即换形态/
+                    // flow abort；只匹配 403 不误伤 455/466（pairingRequired 族）
+                    if (message.contains("403")) {
+                        forbiddenStreak++
+                        if (forbiddenStreak == 3) {
+                            log("AIRPLAY: 连续 403 ×3——疑似网络不对（双网直连），提前触发重加入")
+                            onForbiddenStreak?.invoke()
+                        }
+                    } else {
+                        forbiddenStreak = 0
+                    }
                     return "{\"op\":\"setupFail\"}"
                 }
             }
@@ -1306,6 +1323,14 @@ class AirPlayLink(
      *  2026-11-04 ENONET 案：热点无上行被系统秒级切回家庭 WiFi，
      *  网络对象存活类校验（capabilities）查不出，socket 失败才查得出。 */
     var onConnectFailed: ((failures: List<String>) -> Unit)? = null
+
+    /** 连续 403 达阈值的平台钩（审查家庭网段 403 偶现改进，2026-11-12）：
+     *  宿主清记录 + 走 wifi-rejoin 池重加入（同 onConnectFailed 网络类
+     *  失败径）。 */
+    var onForbiddenStreak: (() -> Unit)? = null
+
+    /** 连续 403 计数（非 403 错误重置；runFlow 起点清零）。 */
+    private var forbiddenStreak = 0
 
     var onMediaKey: ((Int) -> Unit)? = null
 

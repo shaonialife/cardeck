@@ -2312,6 +2312,30 @@ object SessionController {
                                     }
                                 }
                             }
+                            // 连续 403 钩（审查家庭网段 403 偶现改进）：
+                            // DiPlay 双网时 invite 给家庭地址 → pair-verify M1
+                            // 即拒 403 循环——同网络类失败径（清记录+池重加入），
+                            // 省掉 30s 失败循环（阈值 3 在 AirPlayLink 侧）。
+                            created.onForbiddenStreak = {
+                                appendLog("WIFI: 连续 403=疑似网络不对（双网直连）——清记录重新加入热点")
+                                boundCarSsid = null
+                                if (rejoinInFlight.compareAndSet(false, true)) {
+                                    wifiRejoinExecutor.execute {
+                                        try {
+                                            joinCarWifiSpecifier(
+                                                Iap2SenderSession.WifiConfiguration(
+                                                    effective.ssid,
+                                                    effective.passphrase,
+                                                    effective.channel,
+                                                    effective.securityType,
+                                                ),
+                                            )
+                                        } finally {
+                                            rejoinInFlight.set(false)
+                                        }
+                                    }
+                                }
+                            }
                             // 车机媒体键（iAP2 0x6802 通路）：方向盘/面板的上一曲、下一曲。
                             // 放在这里而不是调用点，保证重连重建 client 时也挂得上。
                             created.onMediaKey = { keyCode ->
