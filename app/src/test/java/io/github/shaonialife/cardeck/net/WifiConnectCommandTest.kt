@@ -37,6 +37,17 @@ class WifiConnectCommandTest {
     }
 
     @Test
+    fun securityTypeZeroWithPassphraseKeepsCredentials() {
+        // 凭据自洽优先（2026-11-12 审查钉）：车机 5703 误报 security=0（open）
+        // 而热点实为 WPA2（2026-11-04 K40 病发形态 [0005][0004] 00）——
+        // 密码非空一律带上走 wpa2，丢密码 = 关联必败
+        assertEquals(
+            "cmd wifi connect-network 'DIRECT-BMW' wpa2 'secret123'",
+            WifiConnectCommand.build("DIRECT-BMW", "secret123", 0),
+        )
+    }
+
+    @Test
     fun emptyPassphraseFallsBackToOpen() {
         // 参数自相矛盾（给了 WPA2 却没密码）时不生成半条命令，按开放热点试
         assertEquals(

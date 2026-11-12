@@ -5,6 +5,12 @@
 车机触摸经 Shizuku（shell 权限）回注虚拟屏。协议链路：蓝牙 iAP2 → 车机热点 → mDNS →
 AirPlay（配对/控制/事件/流）→ 视频 + 音频推流。
 
+**装机设备映射**（序列号不猜，2026-11-12 前缀形态猜错一次；协议仓
+AGENTS.md「命令」节同表）：
+- **荣耀 Magic7 Pro**（装 app 主力机）= `AN6B025115008468`；USB 掉线用无线号
+  `adb-AN6B025115008468-rD6LCD._adb-tls-connect._tcp`
+- **REDMI K40**（DiPlay/xcertplay 测试台）= `a95a3b66`
+
 ## 常用命令
 
 ```bash

@@ -21,14 +21,19 @@ object WifiConnectCommand {
     fun quote(raw: String): String = "'" + raw.replace("'", "'\\''") + "'"
 
     /**
-     * 完整命令行。`passphrase` 为空（或 [securityType] 为 0=NONE）时按开放热点处理。
+     * 完整命令行。`passphrase` 为空时按开放热点处理。
+     *
+     * **凭据自洽优先**（与 specifier 路径同规，2026-11-04 K40 病根 2026-11-12
+     * 审查补齐兜底侧）：车机 5703 曾显式报 security=0（open）而热点实为 WPA2
+     * ——若因此丢弃密码走 open，关联必败（系统「该应用已取消」）。
+     * [securityType] 只在密码非空时参与 wpa2/wpa3 选型，不再一票否决。
      */
     fun build(
         ssid: String,
         passphrase: String,
         securityType: Int,
     ): String {
-        val open = passphrase.isEmpty() || securityType == 0
+        val open = passphrase.isEmpty()
         val security =
             when {
                 open -> "open"

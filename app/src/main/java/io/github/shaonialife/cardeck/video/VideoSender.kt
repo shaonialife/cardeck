@@ -290,7 +290,7 @@ class VideoSender(
         keepAliveCount++
         val frame =
             NativeBridge.nativeAirplayScreenKeepAliveFrame(
-                keepAliveWithStats,
+                if (keepAliveWithStats) 1 else 0,
                 frames,
                 bytesPerSecond,
                 framesPerSecond,

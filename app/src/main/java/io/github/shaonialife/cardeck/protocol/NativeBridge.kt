@@ -545,19 +545,21 @@ object NativeBridge {
     external fun nativeAirplayRequestCarUi(handle: Long): String?
 
     /** D7 音频候选（从会话 'info' 存档选择——fw::airplay::session
-     *  InfoReply::audio_candidates）。返回 JSON 数组，空 = 基线回退。 */
+     *  InfoReply::audio_candidates）。返回 JSON 数组，空 = 基线回退。
+     *  **Int 约定（jboolean ABI 加固）**：0/1 显式传值。 */
     external fun nativeAirplayAudioCandidates(
         handle: Long,
-        preferCompat: Boolean,
+        preferCompat: Int,
     ): String?
 
     /** 取走事件通道出站（应答/命令帧；null = 无）。 */
     external fun nativeAirplayEventTakeOutbound(handle: Long): ByteArray?
 
     /** 屏幕流 keepAlive **整帧**（128B 头 + 可选统计体；A5 下沉——fw:
-     *  @0x2276b6964 分派 + params[14]@124 统计体长 f32）。明文。纯函数。 */
+     *  @0x2276b6964 分派 + params[14]@124 统计体长 f32）。明文。纯函数。
+     *  **Int 约定（jboolean ABI 加固）**：0/1 显式传值。 */
     external fun nativeAirplayScreenKeepAliveFrame(
-        withStats: Boolean,
+        withStats: Int,
         frames: Int,
         bytesPerSecond: Double,
         fps: Int,
@@ -736,9 +738,10 @@ object NativeBridge {
 
     /** timing 客户端态请求构造（轮询车机 timingPeerInfo 端口——fw:
      *  _NTPClockClientSendRequest @0x19293fe94 模板直切）。
-     *  [rtcp] = true → 32B RTCP 变体，false → 48B 经典 NTP。 */
+     *  [rtcp] = 1 → 32B RTCP 变体，0 → 48B 经典 NTP。
+     *  **Int 约定（jboolean ABI 加固）**：0/1 显式传值。 */
     external fun nativeAirplayTimingRequest(
-        rtcp: Boolean,
+        rtcp: Int,
         nowNanos: Long,
         epochSecsUnix: Long,
     ): ByteArray

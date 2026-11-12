@@ -152,7 +152,7 @@ class TimingServer(
         while (clientRunning) {
             val epoch = System.currentTimeMillis() / 1000L
             val request =
-                NativeBridge.nativeAirplayTimingRequest(false, System.nanoTime(), epoch)
+                NativeBridge.nativeAirplayTimingRequest(0, System.nanoTime(), epoch)
                     ?: break
             try {
                 s.send(DatagramPacket(request, request.size, addr, port))

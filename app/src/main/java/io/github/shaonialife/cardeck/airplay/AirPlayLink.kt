@@ -726,6 +726,11 @@ class AirPlayLink(
         timingServer.stop()
         runCatching { socket?.close() }
         socket = null
+        // 事件通道 socket 也要关（2026-11-12 审查：此前全生命周期无 close，
+        // 每轮会话泄漏一个 FD + 半开 TCP 连接）；关闭唤醒 event-reader 走
+        // IOException 拆链路径（stopTunnelDataPlane/iapLink.close 均幂等）。
+        runCatching { eventCommandSocket?.close() }
+        eventCommandSocket = null
         activeHost = null
         activeAddress = null
         iapLink?.close()
@@ -1525,7 +1530,7 @@ class AirPlayLink(
         if (h == 0L) return baseline
         val json =
             runCatching {
-                NativeBridge.nativeAirplayAudioCandidates(h, preferCompat)
+                NativeBridge.nativeAirplayAudioCandidates(h, if (preferCompat) 1 else 0)
             }.getOrNull()
         if (json.isNullOrEmpty() || json == "[]") {
             log("AIRPLAY: D7 候选不可用（info 未取得/声明为空）→ 按协议基线尝试")
@@ -1778,8 +1783,11 @@ class AirPlayLink(
                                 continue
                             }
                         if (count < 0) {
-                            log("EVENT: 通道关闭（EOF）")
-                            break
+                            // EOF 与 IOException 同径拆链（2026-11-12 审查补）：
+                            // 此前 break 正常退出 try 块，catch 不执行 →
+                            // 隧道泵/虚拟链路多活到会话收尾才被 close 兜住
+                            log("EVENT: 通道关闭（EOF）→ 拆链")
+                            throw IOException("EOF")
                         }
                         // 原始字节 → Rust 泵（解密+RTSP 重组+plist 解析+自动应答）→ 事件 JSON
                         val eventsJson =
