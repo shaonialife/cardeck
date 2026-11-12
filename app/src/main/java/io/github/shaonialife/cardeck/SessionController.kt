@@ -63,6 +63,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 object SessionController {
     // ---- 日志缓冲（进程级；Activity 订阅渲染）----
 
+    /** WiFi 重加入专用单线程池（审查 P1-15 后续，用户令线程池化）：join 窗
+     *  5s+8s+9s 不得占 retryTick/flow 线程；命名线程便于 logcat 诊断；
+     *  daemon 不阻进程退出。两处提交点（retryTick 活性失效 / onConnectFailed
+     *  网络类失败）共用此池 + rejoinInFlight CAS 闸（≤1 个在途/排队任务）。 */
+    private val wifiRejoinExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "wifi-rejoin").apply { isDaemon = true }
+        }
+
     private val logLock = Any()
     private val logBuilder = StringBuilder()
     private val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
@@ -2228,7 +2237,7 @@ object SessionController {
                                     // in-flight 闸（本 tick 立即返回，下一 tick 见
                                     // in-flight 跳过——防 10s 重试节拍叠加并发 join）
                                     if (rejoinInFlight.compareAndSet(false, true)) {
-                                        Thread {
+                                        wifiRejoinExecutor.execute {
                                             try {
                                                 joinCarWifiSpecifier(
                                                     Iap2SenderSession.WifiConfiguration(
@@ -2241,7 +2250,7 @@ object SessionController {
                                             } finally {
                                                 rejoinInFlight.set(false)
                                             }
-                                        }.start()
+                                        }
                                     }
                                 }
                                 // 配对重试期间车机仍可能没探测到 ctrl（Bonjour 漏掉首次公告）：
@@ -2282,14 +2291,25 @@ object SessionController {
                                     lastRejoinAt = now
                                     appendLog("WIFI: 连接失败=网络不对（系统可能已切回其它 WiFi）——清记录重新加入热点")
                                     boundCarSsid = null
-                                    joinCarWifiSpecifier(
-                                        Iap2SenderSession.WifiConfiguration(
-                                            effective.ssid,
-                                            effective.passphrase,
-                                            effective.channel,
-                                            effective.securityType,
-                                        ),
-                                    )
+                                    // 同走线程池 + CAS 闸（审查 P1-15 后续）：失败
+                                    // 收尾径也不同步跑 join 窗，与 retryTick 提交点
+                                    // 共池串行、互不叠加
+                                    if (rejoinInFlight.compareAndSet(false, true)) {
+                                        wifiRejoinExecutor.execute {
+                                            try {
+                                                joinCarWifiSpecifier(
+                                                    Iap2SenderSession.WifiConfiguration(
+                                                        effective.ssid,
+                                                        effective.passphrase,
+                                                        effective.channel,
+                                                        effective.securityType,
+                                                    ),
+                                                )
+                                            } finally {
+                                                rejoinInFlight.set(false)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             // 车机媒体键（iAP2 0x6802 通路）：方向盘/面板的上一曲、下一曲。
