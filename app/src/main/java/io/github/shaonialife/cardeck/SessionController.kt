@@ -612,6 +612,10 @@ object SessionController {
             cancelRetentionTimer()
             displayRetentionActive.set(false)
             retentionFailures = 0
+            // 清复原挂起标记：下方已无条件复原一次，retireSession→stop 触发的
+            // onEnded（非保留分支）再走 CAS 复原就是重复执行（2026-11-12 用户
+            // 实测「已复原 x 个应用」出现两次的根因）
+            orientationRestorePending.set(false)
         }
         // 熄火/出范围（AUTO_STOP，userInitiated=false）= 意外断开：进保留态保屏，
         // 下次上车 ACL 拉起连接后复用。手动断开（userInitiated=true）始终销毁。
@@ -634,10 +638,13 @@ object SessionController {
         boundCarSsid = null
         // 「强制应用横屏」覆盖的用户终态复原（原先在 retireSession 里——那里每轮
         // 配对起步也执行，会杀掉新一轮刚拉起的应用，2026-10-23 移出到真实终态）。
-        // **无条件执行**：复用重连轮次跳过了 applyAll（保屏语义），pending 未置位——
-        // 若仍按 CAS 门控，手动断开后覆盖会泄漏在系统里（2026-11-12）。同轮 onEnded
-        // 已被 suppress 消费走非保留分支，其自身 CAS 不会重复执行。
-        appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
+        // **仅手动断开执行**：复用重连轮次跳过了 applyAll（保屏语义），pending 未
+        // 置位——无条件执行曾让每轮断连复原两次（2026-11-12 用户实测）；AUTO_STOP
+        // /保留态不复原（覆盖要留着供重连复用）。pending 已在上方清零，同轮
+        // onEnded 的 CAS 复原落空、不会重复。
+        if (userInitiated) {
+            appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
+        }
         // shell 兜底存下的系统网络（connect-network）自动 forget 还原：无互联网热点
         // 被系统当默认网会挤掉移动数据。失败只记日志（用户可到 WLAN 手动删）。
         cleanupShellFallbackNetwork()
