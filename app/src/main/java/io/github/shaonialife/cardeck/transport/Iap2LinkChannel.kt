@@ -38,16 +38,29 @@ class Iap2LinkChannel(
     )
 
     /** 启动原生 Phase-1 编排线程（识别→MFi→问候→WiFi→端点，全固件真身）。
-     *  平台值直传（JNI 注入面接线——0x4E 通知波身份域，Rust 侧不落缺省）。 */
+     *  平台值直传（JNI 注入面接线——0x4E 通知波身份域，Rust 侧不落缺省）。
+     *  wirelessAllowed/carplayPaired = 平台真值（fw: 0x100152b64/70 注入口，
+     *  4E0D 值/4E0E 门/4300 组1——Int 0/1 约定，审查 P1-10/11 收口）。 */
     fun startFlow(
         deviceName: ByteArray,
         bluetoothMac: ByteArray,
         language: ByteArray,
         tzOffsetMinutes: Int,
         dst: Int,
+        wirelessAllowed: Int,
+        carplayPaired: Int,
     ) {
         check(handle != 0L) { "flow start on dead channel" }
-        NativeBridge.nativeSessionFlowStart(handle, deviceName, bluetoothMac, language, tzOffsetMinutes, dst)
+        NativeBridge.nativeSessionFlowStart(
+            handle,
+            deviceName,
+            bluetoothMac,
+            language,
+            tzOffsetMinutes,
+            dst,
+            wirelessAllowed,
+            carplayPaired,
+        )
     }
 
     /** 取下一个编排事件；超时返回 null。 */

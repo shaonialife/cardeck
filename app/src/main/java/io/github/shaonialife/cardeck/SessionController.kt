@@ -2198,6 +2198,12 @@ object SessionController {
                         return@run
                     }
 
+                    // 后台重加入 in-flight 闸（审查 P1-15：join 窗 5s+8s+9s
+                    // 不得在 retryTick 内同步跑；防 10s 重试节拍叠加并发 join）
+                    val rejoinInFlight =
+                        java.util.concurrent.atomic
+                            .AtomicBoolean(false)
+
                     fun newClient() =
                         AirPlayLink(
                             effective,
@@ -2216,14 +2222,27 @@ object SessionController {
                                 ) {
                                     appendLog("WIFI: 检测到车机热点网络已失效（系统切回其它网络）——重试回路内重新加入")
                                     boundCarSsid = null
-                                    joinCarWifiSpecifier(
-                                        Iap2SenderSession.WifiConfiguration(
-                                            effective.ssid,
-                                            effective.passphrase,
-                                            effective.channel,
-                                            effective.securityType,
-                                        ),
-                                    )
+                                    // 审查 P1-15：join 窗（5s+8s+9s）不得在 retryTick
+                                    // 内同步跑——阻塞 flow 决策机最长 ~22s（违反
+                                    // 「retryTick 必须非阻塞」契约）。改后台执行 +
+                                    // in-flight 闸（本 tick 立即返回，下一 tick 见
+                                    // in-flight 跳过——防 10s 重试节拍叠加并发 join）
+                                    if (rejoinInFlight.compareAndSet(false, true)) {
+                                        Thread {
+                                            try {
+                                                joinCarWifiSpecifier(
+                                                    Iap2SenderSession.WifiConfiguration(
+                                                        effective.ssid,
+                                                        effective.passphrase,
+                                                        effective.channel,
+                                                        effective.securityType,
+                                                    ),
+                                                )
+                                            } finally {
+                                                rejoinInFlight.set(false)
+                                            }
+                                        }.start()
+                                    }
                                 }
                                 // 配对重试期间车机仍可能没探测到 ctrl（Bonjour 漏掉首次公告）：
                                 // 周期性强制重播一次，并把 mDNS 现状写进日志——否则排查时

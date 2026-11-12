@@ -41,7 +41,13 @@ object TouchRouter {
         logSink?.invoke("TOUCH: $message")
     }
 
+    @Volatile
+    // 可见性（审查 P2）：retireSession 线程 reset() 与事件线程 onContact
+    // 并发——@Volatile 保 reset 及时可见；多字段手势态的撕裂窗仍窄（单次
+    // 误路由），不加热路径锁（注入路径 Shell.exec 至多 3s 会卡 retire）。
     private var pressed = false
+
+    @Volatile
     private var pressedDisplay = -1
     private var failStreak = 0
 
@@ -56,9 +62,11 @@ object TouchRouter {
     private var injectSummaryAt = 0L
 
     /** 叠加卡片手势状态（卡片命中后独占触摸，不再注入应用）。 */
+    @Volatile
     private var overlayPressed = false
 
     /** 分屏把手粘性路由状态（命中把手条后整条触摸流固定路由应用屏）。 */
+    @Volatile
     private var splitHandlePressed = false
 
     /**
@@ -66,9 +74,11 @@ object TouchRouter {
      * 触摸流（不注入），改为触发 [VirtualLauncher.pullBackPinnedApp]。模式同
      * overlay 卡手势独占——只有「按下那一刻在卡片上」的整条手势才被消费。
      */
+    @Volatile
     private var pinnedPullPressed = false
 
     /** 地图卡/全屏地图冻结拉回手势状态（与 [pinnedPullPressed] 完全同构，目标屏不同）。 */
+    @Volatile
     private var mapPullPressed = false
 
     /**

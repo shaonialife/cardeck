@@ -369,6 +369,10 @@ class AirPlayLink(
         // M1（真机 2026-11-02：车机对 /pair-pin-start 5ms 内回 200 空体；
         // 重连反而丢配对上下文）。
         var awaitingPin = false
+
+        /** PIN 等待起点（审查 P2：等码分支原无限轮询——runFlow 连接窗只在
+         *  动作间检查，本分支内部可无限超窗；120s 对齐连接窗）。 */
+        var pinWaitSince = 0L
         var pinWaitLogged = false
         // §10.50（2026-11-02）：PIN 流 dormant——iPhone 真机 sysdiagnose 实证
         // DiPlay 走 type 0 常量码流（见 cardeck-protocol §10.50），本等待分支
@@ -398,6 +402,10 @@ class AirPlayLink(
                             if (!pinWaitLogged) {
                                 log("AIRPLAY: ⌨ /pair-pin-start 已受理（车机 200）——等待配对码注入（files/pair_pin.txt）")
                                 pinWaitLogged = true
+                            }
+                            if (android.os.SystemClock.uptimeMillis() - pinWaitSince > 120_000L) {
+                                log("AIRPLAY: ⌨ 配对码等待超时（120s）——按配对失败收")
+                                return "{\"op\":\"pairFail\"}"
                             }
                         }
                         continue
@@ -436,6 +444,7 @@ class AirPlayLink(
                         val startEv = NativeBridge.nativeAirplayStartPairing(handle)
                         if (startEv?.contains("pinRequired") == true) {
                             awaitingPin = true
+                            pinWaitSince = android.os.SystemClock.uptimeMillis()
                             log("AIRPLAY: ⌨ PIN 流启动——等待车机屏配对码 / pair_pin.txt 注入")
                         }
                         drainAndWrite()
@@ -615,20 +624,6 @@ class AirPlayLink(
                 output.flush()
             }
         }
-    }
-
-    /** Rust 流级 SETUP（屏 110 / 隧道 130），同步等待 streamSetup 回执事件。 */
-    fun rustStreamSetupWait(
-        json: String,
-        timeoutMs: Long = 8_000,
-    ): org.json.JSONObject? {
-        val handle = sessionPumpHandle
-        if (handle == 0L || controlSessionHandle != handle) return null
-        controlEventQueue.clear()
-        NativeBridge.nativeAirplayStreamSetup(handle, json.toByteArray())
-        val socket = socket ?: return null
-        drainRustOutbound(handle, socket.getOutputStream())
-        return controlEventQueue.poll(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
     /** 取初始音量（GET_PARAMETER volume；应答经泵 on_bytes 事件回）。 */
@@ -1368,6 +1363,8 @@ class AirPlayLink(
                 .platformTzOffsetMinutes(),
             io.github.shaonialife.cardeck.bt
                 .platformDstFlag(),
+            wirelessAllowed = 1, // 宿主无线形态（fw 0x100152b64 平台钩真值）
+            carplayPaired = if (hasAnySavedReceiverIdentity()) 1 else 0,
         )
         log("IAPLINK: 隧道链编排已布防（flow_start，等车机 SYN）")
     }
@@ -1645,6 +1642,7 @@ class AirPlayLink(
     }
 
     /** 固件式 SetupPlan：control→info 已完成，modes 已发；本方法推进 流→RECORD。 */
+    @Synchronized
     fun runFirmwareSetupPlan(
         planJson: String,
         timeoutMs: Long = 8_000,
@@ -1652,6 +1650,9 @@ class AirPlayLink(
         val h = sessionPumpHandle
         val sock = socket ?: return null
         if (h == 0L) return null
+        // 入口清队列（审查 P2 竞态修复：@Synchronized 串行化两个调用方——
+        // 主连接 plan 轮询中途到站的动态音频 plan 不再清掉主 plan 的在途
+        // 事件，改为排队等前一个 plan 收尾；无锁环：两调用方无反向锁）
         controlEventQueue.clear()
         NativeBridge.nativeAirplaySetupPlan(h, planJson.toByteArray(), 1)
         drainRustOutbound(h, sock.getOutputStream())
@@ -2043,6 +2044,16 @@ class AirPlayLink(
     }
 
     /** 配对库键：按车机区分（多台车不能共用一把对端公钥）。 */
+
+    /** 4E0E pairing 运输标识闸的平台判定（审查 P1-11 收口）：存在任一已
+     *  保存车机配对记录 = 已配对（全局弱化——隧道链阶段无 endpoint 键）。 */
+    fun hasAnySavedReceiverIdentity(): Boolean {
+        val prefs =
+            context?.getSharedPreferences("airplay_identity", Context.MODE_PRIVATE)
+                ?: return false
+        return prefs.all.keys.any { it.startsWith("receiverPub:") }
+    }
+
     private fun receiverKey(): String {
         val e = endpoint
         val id = e.deviceIdentifier?.trim().orEmpty()

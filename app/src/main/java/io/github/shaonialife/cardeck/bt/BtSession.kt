@@ -21,15 +21,17 @@ internal fun Iap2LinkChannel.runSenderSession(
     // （无 Kotlin 超时——协议推进由 Rust 编排泵驱动，活性由链路状态机管）
     val session =
         Iap2SenderSession(
-            this,
-            { line -> log(line) },
-            resolveBluetoothMac(context, log),
-            DeviceIdentity.deviceName(context),
-            platformLanguage(),
-            platformTzOffsetMinutes(),
-            platformDstFlag(),
-            onWifiCredentials,
-            onEndpoint,
+            channel = this,
+            log = { line -> log(line) },
+            bluetoothMac = resolveBluetoothMac(context, log),
+            deviceName = DeviceIdentity.deviceName(context),
+            language = platformLanguage(),
+            tzOffsetMinutes = platformTzOffsetMinutes(),
+            dst = platformDstFlag(),
+            onWifiCredentials = onWifiCredentials,
+            onEndpoint = onEndpoint,
+            wirelessAllowed = 1, // 宿主无线形态（fw 0x100152b64 平台钩真值）
+            carplayPaired = if (platformCarplayPaired(context)) 1 else 0,
         )
     session.run()
     onLinkClosed()
@@ -84,3 +86,14 @@ internal fun resolveBluetoothMac(
     }
     return mac
 }
+
+/** 4E0E pairing 运输标识闸的平台判定（审查 P1-11 收口）：airplay_identity
+ *  prefs 存在任一已保存车机配对记录（receiverPub: 键——pair-verify M6
+ *  SavePeer 落盘）= 已配对。全局弱化（BT 链阶段 endpoint 未到无法
+ *  per-car 取键），语义见 Iap2SenderSession.carplayPaired 注释。 */
+internal fun platformCarplayPaired(context: Context): Boolean =
+    context
+        .getSharedPreferences("airplay_identity", Context.MODE_PRIVATE)
+        .all
+        .keys
+        .any { it.startsWith("receiverPub:") }

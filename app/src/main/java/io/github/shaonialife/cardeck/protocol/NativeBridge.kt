@@ -183,6 +183,12 @@ object NativeBridge {
      * 平台值注入（JNI 注入面接线 2026-11-03）：设备名→0x4E09、语言→0x4E0A、
      * 时区（分钟，含夏令时偏移）+夏令时标志→0x4E0B；字符串走 ByteArray
      * （桥面 bytes 传输约定——荣耀 ROM GetStringUTFChars 越界前科）。
+     * **Int 约定（jboolean ABI 加固）**：[wirelessAllowed]（fw:
+     * _platform_CarPlay_isWirelessCarPlayAllowedForCertSerial
+     * @0x100152b64——4E0D 值/4E0E 无线径门/4300 组1 三处同源）、
+     * [carplayPaired]（fw: isCarPlayPairedWithCertSerial @0x100152b70
+     * ——4E0E pairing 运输标识闸）0/1 显式传值（2026-11-12 审查
+     * P1-10/11 收口）。
      */
     external fun nativeSessionFlowStart(
         handle: Long,
@@ -191,6 +197,8 @@ object NativeBridge {
         language: ByteArray,
         tzOffsetMinutes: Int,
         dst: Int,
+        wirelessAllowed: Int,
+        carplayPaired: Int,
     )
 
     /** 裸 CSM 分发（DiPlay type-130 隧道：入站即完整会话消息，无链路封装）。 */

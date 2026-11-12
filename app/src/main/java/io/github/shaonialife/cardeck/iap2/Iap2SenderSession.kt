@@ -34,6 +34,15 @@ class Iap2SenderSession(
     private val tzOffsetMinutes: Int = 480,
     /** 本端夏令时标志（0x4E0B 参数 2 u8；1 = 夏令时生效）。 */
     private val dst: Int = 0,
+    /** 无线 CarPlay 允许位（fw: _platform_CarPlay_isWirelessCarPlayAllowed
+     *  ForCertSerial @0x100152b64——4E0D 值/4E0E 无线径门/4300 组1 同源；
+     *  宿主无线形态恒 1。Int 0/1 约定，审查 P1-10 收口）。 */
+    private val wirelessAllowed: Int = 1,
+    /** 4E0E pairing 运输标识闸（fw: isCarPlayPairedWithCertSerial
+     *  @0x100152b70；宿主判定源 = airplay_identity prefs 存在已保存车机
+     *  配对记录（全局弱化——BT 链阶段 endpoint 未到无法 per-car 取键）。
+     *  Int 0/1 约定，审查 P1-11 收口）。 */
+    private val carplayPaired: Int = 1,
     /** 收到 EV_WIFI（0x5703 消化产物）时回调——主控立即绑 WiFi + 广播 _carplay-ctrl。 */
     private val onWifiCredentials: ((WifiConfiguration) -> Unit)? = null,
     /** 收到 EV_ENDPOINT（0x4301 消化产物，含 wifi 域）时回调——主控直接走 AirPlay 连接。 */
@@ -83,6 +92,8 @@ class Iap2SenderSession(
             language.toByteArray(),
             tzOffsetMinutes,
             dst,
+            wirelessAllowed,
+            carplayPaired,
         )
 
         while (channel.isAlive) {
@@ -175,7 +186,7 @@ class Iap2SenderSession(
         val channel = b.getOrNull(off)?.toInt()?.and(0xFF) ?: 0
         val security = b.getOrNull(off + 1)?.toInt()?.and(0xFF) ?: 0
         // 4301 参数 6/7/8 尾块（Rust endpoint.rs 2026-11-07+）：
-        // [mutualAuth u8][sdkVersion u32 BE][asset ]；旧载荷无此块时取默认。
+        // [mutualAuth u8][sdkVersion u32 BE][asset<NUL>]；旧载荷无此块时取默认。
         val mutualAuth = b.getOrNull(off + 2)?.toInt()?.and(0xFF) ?: 0
         var sdkVersion = 0L
         var asset: String? = null
@@ -186,7 +197,7 @@ class Iap2SenderSession(
                 ((b[off + 5].toInt() and 0xFF).toLong() shl 8) or
                 (b[off + 6].toInt() and 0xFF).toLong()
             if (b.size > off + 7) {
-                asset = String(b, off + 7, b.size - off - 7).trimEnd(' ').takeIf { it.isNotEmpty() }
+                asset = String(b, off + 7, b.size - off - 7).trimEnd('\u0000').takeIf { it.isNotEmpty() }
             }
         }
         return CarPlayEndpoint(

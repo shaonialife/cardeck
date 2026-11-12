@@ -62,9 +62,20 @@ class NativeTunnelIap2Link(
         language: ByteArray,
         tzOffsetMinutes: Int,
         dst: Int,
+        wirelessAllowed: Int,
+        carplayPaired: Int,
     ) {
         check(handle != 0L) { "flow start on dead tunnel link" }
-        NativeBridge.nativeSessionFlowStart(handle, deviceName, bluetoothMac, language, tzOffsetMinutes, dst)
+        NativeBridge.nativeSessionFlowStart(
+            handle,
+            deviceName,
+            bluetoothMac,
+            language,
+            tzOffsetMinutes,
+            dst,
+            wirelessAllowed,
+            carplayPaired,
+        )
     }
 
     init {
