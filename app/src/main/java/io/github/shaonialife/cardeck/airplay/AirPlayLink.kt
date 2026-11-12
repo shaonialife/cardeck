@@ -584,6 +584,18 @@ class AirPlayLink(
                             "AIRPLAY: SDP 端口 server=${json.optInt("serverPort")} " +
                                 "control=${json.optInt("controlPort")}",
                         )
+                    } else if (json != null && t == "volume") {
+                        // 音量域（fw: _APSenderSessionUtilityFetchInitialVolume 应答
+                        // 交付；-1000.0 = 接收端未报初始音量的 unset 哨兵）。
+                        val db = json.optDouble("db")
+                        if (db <= -100.0) {
+                            log("VOLUME: 车机未报初始音量（unset 哨兵）——按 0.1.10 形态设 -25dB")
+                            NativeBridge.nativeAirplayApplyVolume(handle, -2500)
+                        } else {
+                            log("VOLUME: 车机初始音量=${"%.1f".format(db)}dB——回写激活（fw: pending set-volume）")
+                            NativeBridge.nativeAirplayApplyVolume(handle, (db * 100).toInt())
+                        }
+                        drainRustOutbound(handle, output)
                     }
                 }
             }
@@ -617,6 +629,69 @@ class AirPlayLink(
         val socket = socket ?: return null
         drainRustOutbound(handle, socket.getOutputStream())
         return controlEventQueue.poll(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    /** 取初始音量（GET_PARAMETER volume；应答经泵 on_bytes 事件回）。 */
+    fun fetchVolume() {
+        val h = sessionPumpHandle
+        if (h == 0L) return
+        NativeBridge.nativeAirplayFetchVolume(h)
+        socket?.let { drainRustOutbound(h, it.getOutputStream()) }
+    }
+
+    /**
+     * 6011 监听探针（2026-11-12 真车诊断）：S4.4 直切 = 请求 controlPort 会被
+     * 接收端写进 config「RTCPPortRemote」= 手机 RTCP 收包口——车机往里发、
+     * 我们监听（旧「发同步包到 car:6011」方向在真车永不绑定，ECONNREFUSED
+     * 实录）。绑上后记录一切入站包，验证/证伪车机 RTCP 方向。
+     */
+    fun startControlPortProbe(port: Int) {
+        if (port <= 0) return
+        Thread {
+            val s =
+                runCatching {
+                    java.net.DatagramSocket(null).apply {
+                        reuseAddress = true
+                        bind(java.net.InetSocketAddress(port))
+                        soTimeout = 5_000
+                    }
+                }.getOrNull()
+            if (s == null) {
+                log("CPROBE: 绑 $port 失败——可能被占")
+                return@Thread
+            }
+            log("CPROBE: 已监听 :$port（等车机 RTCP——诊断探针）")
+            val buf = ByteArray(2048)
+            var n = 0
+            try {
+                while (isSessionAlive() && sessionPumpHandle != 0L) {
+                    val p = java.net.DatagramPacket(buf, buf.size)
+                    try {
+                        s.receive(p)
+                    } catch (timeout: java.net.SocketTimeoutException) {
+                        continue
+                    } catch (_: java.io.IOException) {
+                        break
+                    }
+                    n++
+                    if (n <= 3 || n % 20 == 0) {
+                        val headLen = if (p.length < 16) p.length else 16
+                        val head = buf.take(headLen).joinToString(" ") { "%02x".format(it) }
+                        log(
+                            "CPROBE: 收 #$n 来自 ${p.address.hostAddress}:${p.port} " +
+                                "len=${p.length} head=$head",
+                        )
+                    }
+                }
+            } finally {
+                s.close()
+                log("CPROBE: 退出（共收 $n 包）")
+            }
+        }.apply {
+            isDaemon = true
+            name = "cprobe-$port"
+            start()
+        }
     }
 
     /** Rust 会话 feedback（'keep' POST /feedback——帧由 Rust 构建，1s 节奏）。 */

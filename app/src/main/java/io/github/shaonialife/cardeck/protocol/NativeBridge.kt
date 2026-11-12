@@ -506,6 +506,15 @@ object NativeBridge {
     /** 发 keep-alive（'keep' 空体 POST /feedback；宿主按 10s 泵）。 */
     external fun nativeAirplayKeepAlive(handle: Long): String?
 
+    /** 取初始音量（GET_PARAMETER volume；应答走 on_bytes 事件 {"type":"volume","db"}）。 */
+    external fun nativeAirplayFetchVolume(handle: Long): String?
+
+    /** 设音量（SET_PARAMETER volume；dbX100 = dB×100，-2500 = -25.00dB）。 */
+    external fun nativeAirplayApplyVolume(
+        handle: Long,
+        dbX100: Int,
+    ): String?
+
     /** 创建事件通道（Events 双钥；两数组空 = 明文形态）。 */
     external fun nativeAirplayEventCreate(
         handle: Long,

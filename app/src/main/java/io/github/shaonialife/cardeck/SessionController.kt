@@ -1935,6 +1935,15 @@ object SessionController {
                     controlPort = audio.controlPort,
                 )
             audioSender = sender
+            // 6011 监听探针（2026-11-12 真车诊断：controlPort 语义 = 手机 RTCP
+            // 收包口——绑上等车机发，替代旧「发同步包到 car:6011」死方向）
+            if (audio.controlPort > 0) {
+                client.startControlPortProbe(audio.controlPort)
+                // 音量域（fw: 取初始音量→RECORD→set-volume 回写激活；
+                // 0.1.10 probeAndFixVolume 同源——车机 AirPlay 混音器条目
+                // 静音位 ≠ 用户手调的总音量）
+                client.fetchVolume()
+            }
             // 音频路由抢占自愈（2026-10-26 荣耀实测：耳机 X7e 抢占 A2DP 后，
             // 采集全零、推给车机的是静音流——用户视角「车机没声音了」）
             sender.onRouteHijackSuspect = { maybeReclaimAudioRoute() }
