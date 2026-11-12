@@ -2225,11 +2225,24 @@ object SessionController {
                                 // 后续重试注定全败——检测到即重走加入流程，下一轮
                                 // 重试用新网络
                                 val connectorNow = wifiConnector
+                                // 当前 SSID 校验（2026-11-12 手动断开→重连偶现）：
+                                // 网络对象 capabilities 可能还在（skip 闸被陈旧
+                                // 记录骗过）但手机默认网已回家庭——shell 查实际
+                                // SSID 不符即触发重加入（用户建议）。
+                                val ssidMismatch =
+                                    connectorNow != null &&
+                                        boundCarSsid != null &&
+                                        shellWifiStatus().second.let { it != null && it != effective.ssid }
                                 if (connectorNow != null &&
                                     boundCarSsid != null &&
-                                    !connectorNow.isBoundNetworkAlive()
+                                    (!connectorNow.isBoundNetworkAlive() || ssidMismatch)
                                 ) {
-                                    appendLog("WIFI: 检测到车机热点网络已失效（系统切回其它网络）——重试回路内重新加入")
+                                    appendLog(
+                                        "WIFI: 检测到网络失效/不符（绑定网络存活=" +
+                                            (connectorNow?.isBoundNetworkAlive() ?: false) +
+                                            " 当前 SSID=" + (shellWifiStatus().second ?: "null") +
+                                            " 目标=" + effective.ssid + "）——重试回路内重新加入",
+                                    )
                                     boundCarSsid = null
                                     // 审查 P1-15：join 窗（5s+8s+9s）不得在 retryTick
                                     // 内同步跑——阻塞 flow 决策机最长 ~22s（违反
@@ -2832,10 +2845,24 @@ object SessionController {
                 effective.channel,
                 effective.securityType,
             )
-        if (boundCarSsid == effective.ssid && wifiConnector?.currentNetwork != null) {
-            appendLog(">>> [$source] 已绑定车机热点 ${effective.ssid}，跳过重复绑定")
+        // 跳过闸必须过「当前实际连接的 SSID」校验（2026-11-12 手动断开→
+        // 重连偶现：ROM 在会话结束后回收应用专属网络，手机回家庭 WiFi，
+        // 但 boundCarSsid 记录还在 → 旧判「已绑定跳过」= 不触发加入，
+        // 靠 4 轮 ECONNREFUSED 才自愈——用户建议拿当前网络校验）。
+        val currentSsidAtInvite = shellWifiStatus().second
+        if (boundCarSsid == effective.ssid &&
+            wifiConnector?.currentNetwork != null &&
+            currentSsidAtInvite == effective.ssid
+        ) {
+            appendLog(">>> [$source] 已绑定车机热点 ${effective.ssid}（当前 SSID 校验一致），跳过重复绑定")
             continueWithNetwork(true)
         } else {
+            if (boundCarSsid == effective.ssid && currentSsidAtInvite != effective.ssid) {
+                appendLog(
+                    ">>> [$source] 绑定记录与当前网络不符（记录=${effective.ssid} 当前=" +
+                        "$currentSsidAtInvite）——不走跳过，直接加入",
+                )
+            }
             // 端点先于 0x5703 到达（或上一轮换网失败）：同样的入口——静默路径优先，
             // 失败再退回应用专属网络。不要按 TRANSPORT_WIFI 盲绑当前任意 WiFi：
             // 切网途中会绑到旧网络，AirPlay 必然连不上。
