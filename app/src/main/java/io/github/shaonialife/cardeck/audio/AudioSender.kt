@@ -655,8 +655,15 @@ class AudioSender(
         }
     }
 
-    /** 组一个 RTP 包（A1/A8 下沉：头/密封/大端换序全在 Rust——fw: cryptor
-     *  mode 1 @0x227969f68；本壳只泵游标）。（internal：测试直测） */
+    /** 组一个 RTP 包（A1/A8 下沉：头/密封/换序全在 Rust——fw: cryptor
+     *  mode 1 @0x227969f68；本壳只泵游标）。（internal：测试直测）
+     *
+     *  pcmSwapBe=1（2026-11-13 深挖三轮终审）：固件流描述 ASBD 对 lpcm
+     *  **显式置 IsBigEndian**——repackage @0x2277d492c 对 ToASBD(0x0C)
+     *  输出 ORR 0x2，该描述 = 音频管线契约 → RTP 载荷 = BE；Info+0x38
+     *  HAL 描述 &= ~2 = LE（固件双 ASBD：流面 BE / 本地面 LE）。DiPlay
+     *  台架收 BE 出声互证；catplay LE = 其自身选择（真车音频面未听验）。
+     *  Android 采集原生小端 → 换序 BE 上 wire。 */
     internal fun sealPacket(
         pcm: ByteArray,
         sequence: Int,

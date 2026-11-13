@@ -85,11 +85,14 @@ object NativeBridge {
     external fun nativeSessionStartIdentification(handle: Long): Int
 
     /** 由 Rust 的 /info 存档构造 EndpointStreamSet JSON（屏 + D7 首条音频；
-     *  withTunnel != 0 时首条 = iAP2 隧道流 130（真车序：隧道先于屏/音频）。 */
+     *  withTunnel != 0 时首条 = iAP2 隧道流 130（真车序：隧道先于屏/音频）。
+     *  controlPort > 0 = 本端 RTCP 控制口（SETUP caller dict controlPort 键，
+     *  fw: 接收端 → RTCPPortRemote，0xD6 重传请求发往此口；宿主须先 bind）。 */
     external fun nativeAirplayPlanFromInfo(
         handle: Long,
         preferCompat: Int,
         withTunnel: Int,
+        controlPort: Int,
     ): String
 
     /** iAP2 数据隧道（stream 130）编解码接管：以 130 应答暂存 seed+共享密钥
@@ -125,10 +128,12 @@ object NativeBridge {
     /** kplv 带体帧校验（fw: len4 / b[1]==4 / b[0]&0xdf==0）。 */
     external fun nativeAirplayKplvValidate(frame: ByteArray): Boolean
 
-    /** 仅音频的 endpoint plan（动态补启音频）。 */
+    /** 仅音频的 endpoint plan（动态补启音频）。controlPort > 0 = 本端 RTCP
+     *  控制口（同 [nativeAirplayPlanFromInfo] 注）。 */
     external fun nativeAirplayAudioPlanFromInfo(
         handle: Long,
         preferCompat: Int,
+        controlPort: Int,
     ): String
 
     /** 固件式 SetupPlan：streamsJson=[{streamType,...}]；control→info→modes 回执→流→RECORD。 */
@@ -597,8 +602,10 @@ object NativeBridge {
     ): ByteArray?
 
     /** 音频 RTP 密封整包（A1 下沉——fw: cryptor mode 1 @0x227969f68：
-     *  nonce=8B LE 计数入包尾、AAD=头[4..12]；PCM 大端换序包内完成）。
-     *  纯函数。 */
+     *  nonce=8B LE 计数入包尾、AAD=头[4..12]）。**pcmSwapBe = 固件线面恒 0**
+     *  （PCM = 小端直传：AirPlaySupport ASBD lpcm formatFlags=0x0C 无 BE 位
+     *  @0x2279cb1ac 静态表 + 双镜像零样本交换代码 + catplay LE 真车工作，
+     *  2026-11-13 翻案；参数保留 = 测试/兼容域）。纯函数。 */
     external fun nativeAirplayAudioSealPacket(
         key: ByteArray,
         seq: Int,

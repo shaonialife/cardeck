@@ -934,7 +934,8 @@ object SessionController {
         if (audioSender?.isRunning == true) return
         appendLog("MODE: 会话进行中，动态补启音频通道…")
         val profile = client.audioCandidates().firstOrNull()
-        val planJson = client.endpointAudioPlanJsonFromInfo()
+        val audioControlPort = client.ensureAudioControlSocket()
+        val planJson = client.endpointAudioPlanJsonFromInfo(controlPort = audioControlPort)
         if (profile == null || planJson == null) {
             appendLog("AUDIO: 动态音频 plan 不可用——跳过（不再走旧 SETUP 编排）")
             return
@@ -2641,11 +2642,20 @@ object SessionController {
                             "TUNNEL: 接收端 enabledFeatures=${setup.enabledFeatures}",
                         )
                         val audioProfile = if (audioEnabledForSession) client.audioCandidates().firstOrNull() else null
+                        // 本端音频 RTCP 控制口（fw: SETUP caller dict controlPort——
+                        // 接收端 → RTCPPortRemote，0xD6 重传请求/CPROBE 发往此口；
+                        // 2026-11-13 深挖二轮出土）。SETUP 前 bind + 接收线程。
+                        val audioControlPort = client.ensureAudioControlSocket()
+                        if (audioControlPort > 0) {
+                            client.onAudioControlPacket = { n, bytes, from ->
+                                appendLog("AUDIO-CTRL: 车机→控制口 #$n ${bytes}B from $from")
+                            }
+                        }
                         // 真车序（2026-11-08 固件直切 + iPhone transcript）：隧道
                         // 130 → 屏 110 → 音频；DiPlay/xcertplay 接收端支持 130。
                         // 车机拒隧道（200 无 dataPort）时事件通道 fallback 自动保持。
                         val planJson =
-                            client.endpointPlanJsonFromInfo(withTunnel = true)
+                            client.endpointPlanJsonFromInfo(withTunnel = true, controlPort = audioControlPort)
                                 ?: client.setupPlanJson(setup.displayUuid, audioProfile)
                         val plan = client.runFirmwareSetupPlan(planJson)
                         val screen = plan?.streams?.get(110)?.let { client.screenStreamInfoFromEvent(it) }

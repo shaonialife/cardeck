@@ -63,6 +63,17 @@ class AirPlayLink(
 
     private var socket: Socket? = null
 
+    /** 本端音频 RTCP 控制口（SETUP caller dict `controlPort` 键——fw: 发送端
+     *  carAudioStream_resume @0x2276c83f0-410 写本端控制口；接收端 GeneralAudioSetup
+     *  → config RTCPPortRemote@0x285407328，0xD6 重传请求/CPROBE 发往此口）。
+     *  SETUP 前 bind（[ensureAudioControlSocket]），close 释放。 */
+    @Volatile
+    private var audioControlSocket: java.net.DatagramSocket? = null
+
+    /** 车机→本控制口到达回调（诊断面；SessionController 接 appendLog）。 */
+    @Volatile
+    var onAudioControlPacket: ((count: Int, bytes: Int, from: String) -> Unit)? = null
+
     /**
      * 最近一次成功连上接收端时使用的地址（字符串形式，IPv6 链路本地地址带 `%<iface>`）。
      *
@@ -731,6 +742,41 @@ class AirPlayLink(
     /** 心跳线程的存活判据：RTSP socket 仍连着。 */
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
 
+    /** SETUP 前绑定本端音频 RTCP 控制口（幂等）并启动接收线程。返回端口；失败 0。
+     *  fw: caller dict controlPort 键 = 本端控制口声明（缺席 = 车机反馈面聋——
+     *  0xD6 重传请求无处可发，丢失帧不可恢复；CPROBE 不可达）。 */
+    @Synchronized
+    fun ensureAudioControlSocket(): Int {
+        audioControlSocket?.takeIf { !it.isClosed }?.let { return it.localPort }
+        val s = runCatching { java.net.DatagramSocket(0) }.getOrNull() ?: return 0
+        runCatching { s.reuseAddress = true }
+        audioControlSocket = s
+        val port = s.localPort
+        Thread(
+            {
+                val buf = ByteArray(2048)
+                var n = 0
+                while (!s.isClosed) {
+                    try {
+                        val p = java.net.DatagramPacket(buf, buf.size)
+                        s.receive(p)
+                        n++
+                        if (n == 1 || n % 50 == 0) {
+                            onAudioControlPacket?.invoke(n, p.length, "${p.address?.hostAddress}:${p.port}")
+                        }
+                    } catch (e: Exception) {
+                        break
+                    }
+                }
+            },
+            "audio-ctrl-rtcp",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+        return port
+    }
+
     fun close() {
         stopTunnelDataPlane()
         teardownSession()
@@ -742,6 +788,8 @@ class AirPlayLink(
         // IOException 拆链路径（stopTunnelDataPlane/iapLink.close 均幂等）。
         runCatching { eventCommandSocket?.close() }
         eventCommandSocket = null
+        runCatching { audioControlSocket?.close() }
+        audioControlSocket = null
         activeHost = null
         activeAddress = null
         iapLink?.close()
@@ -1669,22 +1717,34 @@ class AirPlayLink(
     }
 
     /** Rust 侧 /info 构造的 endpoint 集合 JSON；空 = /info 未取得。
-     *  withTunnel = true 时首条为 iAP2 隧道流 130（真车序，隧道数据面待接）。 */
+     *  withTunnel = true 时首条为 iAP2 隧道流 130（真车序，隧道数据面待接）。
+     *  controlPort > 0 = 本端 RTCP 控制口（SETUP caller dict controlPort 键——
+     *  fw: 接收端 → RTCPPortRemote，0xD6 重传请求/CPROBE 发往此口）。 */
     fun endpointPlanJsonFromInfo(
         preferCompat: Boolean = false,
         withTunnel: Boolean = false,
+        controlPort: Int = 0,
     ): String? {
         val h = sessionPumpHandle
         if (h == 0L) return null
-        val json = NativeBridge.nativeAirplayPlanFromInfo(h, if (preferCompat) 1 else 0, if (withTunnel) 1 else 0)
+        val json =
+            NativeBridge.nativeAirplayPlanFromInfo(
+                h,
+                if (preferCompat) 1 else 0,
+                if (withTunnel) 1 else 0,
+                controlPort,
+            )
         return json.takeIf { it.isNotEmpty() && it != "[]" }
     }
 
     /** Rust /info 生成的仅音频 plan；空 = /info 未取得。 */
-    fun endpointAudioPlanJsonFromInfo(preferCompat: Boolean = false): String? {
+    fun endpointAudioPlanJsonFromInfo(
+        preferCompat: Boolean = false,
+        controlPort: Int = 0,
+    ): String? {
         val h = sessionPumpHandle
         if (h == 0L) return null
-        val json = NativeBridge.nativeAirplayAudioPlanFromInfo(h, if (preferCompat) 1 else 0)
+        val json = NativeBridge.nativeAirplayAudioPlanFromInfo(h, if (preferCompat) 1 else 0, controlPort)
         return json.takeIf { it.isNotEmpty() && it != "[]" }
     }
 
