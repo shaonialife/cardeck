@@ -1748,6 +1748,15 @@ class AirPlayLink(
         return json.takeIf { it.isNotEmpty() && it != "[]" }
     }
 
+    /** 车机相位锚定的当前 RTP 时基（样本数；0 = 无锚）。音频包 ts 锚定源——
+     *  fw: feedback 200 体 streams[] 相位读回（updateZeroTimeFromPhaseValues
+     *  @0x22775b46c），RTP ts 必须落在车机相位帧，否则车机不排播。 */
+    fun audioPhaseTs(sampleRate: Int): Long {
+        val h = sessionPumpHandle
+        if (h == 0L) return 0
+        return NativeBridge.nativeAirplayAudioPhaseTs(h, sampleRate)
+    }
+
     /** 固件式 SetupPlan：control→info 已完成，modes 已发；本方法推进 流→RECORD。 */
     @Synchronized
     fun runFirmwareSetupPlan(

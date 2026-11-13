@@ -136,6 +136,15 @@ object NativeBridge {
         controlPort: Int,
     ): String
 
+    /** 当前车机相位锚定的 RTP 时基（样本数；0 = 无锚）。fw: feedback 200 体
+     *  streams[]{sampleTime,timestamp,timestampRawNs} 读回 →
+     *  updateZeroTimeFromPhaseValues @0x22775b46c → SetZeroTimeStamp = 打包器
+     *  时基源——音频包 ts 必须落在车机相位帧（锚间插值 Rust 侧完成）。 */
+    external fun nativeAirplayAudioPhaseTs(
+        handle: Long,
+        sampleRate: Int,
+    ): Long
+
     /** 固件式 SetupPlan：streamsJson=[{streamType,...}]；control→info→modes 回执→流→RECORD。 */
     external fun nativeAirplaySetupPlan(
         handle: Long,

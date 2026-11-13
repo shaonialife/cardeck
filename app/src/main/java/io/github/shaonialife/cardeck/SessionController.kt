@@ -1983,6 +1983,9 @@ object SessionController {
                     // 同步包目标端口：车机在 SETUP 应答里下发。缺了它就没有 RTP↔NTP 锚点，
                     // 接收端只能「按到达时刻猜」，严格的实现干脆不排播（2026-10-20 实测）。
                     controlPort = audio.controlPort,
+                    // 车机相位锚（fw: feedback 200 体相位读回 → SetZeroTimeStamp
+                    // @0x22775b73c = 打包器时基源——RTP ts 落车机相位帧）
+                    phaseTsProvider = { client.audioPhaseTs(audio.sampleRate) },
                 )
             audioSender = sender
             // 6011 监听探针（2026-11-12 真车诊断：controlPort 语义 = 手机 RTCP

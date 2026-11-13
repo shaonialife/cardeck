@@ -63,6 +63,14 @@ class AudioSender(
      * 发一个同步包（Rust 组包）建立 RTP↔NTP 锚点；0 = 车机没给（旧车机），只发音频。
      */
     private val controlPort: Int = 0,
+    /**
+     * 车机相位锚定的当前 RTP 时基查询（样本数；0 = 无锚）。fw: feedback 200
+     * 体 streams[]{sampleTime,timestamp,timestampRawNs} 读回 →
+     * updateZeroTimeFromPhaseValues @0x22775b46c → SetZeroTimeStamp = 打包器
+     * 时基源——RTP ts 必须落在车机相位帧（锚间插值 Rust 侧完成），否则车机
+     * 排播引擎对不上帧不播（2026-11-13 真车无声根因）。
+     */
+    private val phaseTsProvider: () -> Long = { 0L },
 ) {
     companion object {
         const val CHANNELS = 2
@@ -132,6 +140,9 @@ class AudioSender(
 
     /** 首个音频包标记（打完就清）；AAC 自检只跑一次。 */
     private var markerPending = true
+
+    /** 车机相位锚是否已接合（首锚跳变置 marker 一次）。 */
+    @Volatile private var phaseAnchorEngaged = false
 
     /** 距上次发包时刻毫秒钟（fw: sendOne 块流对象 +0x208 同构——每包更新）。 */
     private var lastPacketAt = 0L
@@ -605,6 +616,19 @@ class AudioSender(
      */
     private fun sendPayload(payload: ByteArray): Boolean {
         val now = android.os.SystemClock.uptimeMillis()
+        // 车机相位锚定（fw: feedback 200 体相位读回 → SetZeroTimeStamp = 打包器
+        // 时基源 @0x22775b73c）：有锚时 ts = 锚帧当前值（Rust 侧锚间插值），
+        // 每包重锚消漂移；无锚（台架/首包前）保持自零累计。锚跳变置 marker
+        // （帧不连续 = 接收端 jitter 适配域，同 50ms 间隙语义）。
+        val anchored = phaseTsProvider()
+        if (anchored > 0) {
+            if (!phaseAnchorEngaged) {
+                phaseAnchorEngaged = true
+                markerPending = true
+                log("AUDIO: 车机相位锚生效 ts $timestamp → $anchored（车机相位帧）")
+            }
+            timestamp = anchored
+        }
         val gapBurst = !markerPending && lastPacketAt != 0L && now - lastPacketAt > 50
         val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending || gapBurst)
         markerPending = false
