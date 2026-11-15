@@ -486,7 +486,6 @@ class AirPlayLink(
                         setupReceiverIdentity?.let { saveReceiverIdentity(it) }
                     }
                     val write = hexToBytes(json.getString("writeKey")) ?: ByteArray(0)
-                    val read = hexToBytes(json.getString("readKey")) ?: ByteArray(0)
                     // §10.53：X25519 共享密钥原文（事件通道密钥派生的 ikm——
                     // Rust Done 交付；此前空数组 → Kotlin 事件加密密钥错 → 接收端
                     // BAD_DECRYPT，真机 22:04:46 实证）
@@ -500,7 +499,7 @@ class AirPlayLink(
                     // M5.2：会话句柄存活跨连接序（fw: apsession 生命周期——
                     // 控制建立/流 SETUP/事件通道全走同一加密会话）
                     controlSessionHandle = handle
-                    lastKeys = ControlKeys(write, read, shared, eventsWrite, eventsRead)
+                    lastKeys = ControlKeys(write, shared, eventsWrite, eventsRead)
                     return "{\"op\":\"pairDone\"}"
                 }
                 "error" -> {
@@ -792,6 +791,7 @@ class AirPlayLink(
         audioControlSocket = null
         activeHost = null
         activeAddress = null
+        NativeBridge.nativeAirplayEventIapBind(controlSessionHandle, 0)
         iapLink?.close()
         iapLink = null
         val h = controlSessionHandle
@@ -892,9 +892,6 @@ class AirPlayLink(
     @Volatile
     var modesState = ModesState(false, false, false)
         private set
-
-    /** 车机资源被占用（通话/语音/借用）——此期间 modesChanged 会被仲裁拒绝，重申必须冻结。 */
-    fun modesBusy(): Boolean = modesState.busy
 
     /** 车机归还资源（UNBORROW/UNTAKE）回调——切屏窗口，宿主应立即补发 modesChanged。 */
     var onModesRestored: (() -> Unit)? = null
@@ -1165,10 +1162,9 @@ class AirPlayLink(
                     }
                 }
                 "volume" -> {
-                    // G8：初始音量事件（SDP 序 GET /volume 回包；fw:
-                    // __NTPClock... 同层）——先记录，宿主音量执行面后续接。
-                    initialVolumeDb = json.optDouble("db", Double.NaN)
-                    log("AIRPLAY: 初始音量 db=$initialVolumeDb")
+                    // G8：初始音量事件（SDP 序 GET /volume 回包）——诊断记录，
+                    // 宿主音量执行面挂账未接（AGENTS 挂账序）。
+                    log("AIRPLAY: 初始音量 db=${json.optDouble("db", Double.NaN)}")
                 }
                 "controlSetup" -> {
                     controlJson = json
@@ -1215,16 +1211,6 @@ class AirPlayLink(
                             "timingPort=${pendingSetupInfo!!.timingPort} " +
                             "display=${pendingSetupInfo!!.displayWidth}x${pendingSetupInfo!!.displayHeight}",
                     )
-                    // G6：屏幕锚消费——NTP 客户端 offset（raw，fw 未除 2 语义）；
-                    // 只在样本存在且 |offset|<2s 时应用，异常样本不污染时间戳。
-                    val off = timingServer.offsetSecs
-                    if (off.isFinite() && kotlin.math.abs(off) < 2.0) {
-                        ntpEpochAnchorSecs += Math.round(off)
-                        log("TIMING: 会话锚应用 offset=${String.format("%.6f", off)}s")
-                    } else {
-                        val shown = if (off.isFinite()) String.format("%.6f", off) else "NaN"
-                        log("TIMING: offset 未应用（offset=$shown）")
-                    }
                     // §10.57：会话生命周期 Rust 泵（控制通道读写单持有者）
                     sock.soTimeout = 1_000
                     startSessionPump(handle, input, output)
@@ -1354,21 +1340,13 @@ class AirPlayLink(
 
     // ---- 事件通道上的虚拟 iAP2 链路 ----
     //
-    // 奥迪实测（2026-10-11）：车机通过 iAPSendMessage 发来 iAP2 链路层 marker
-    // （ff 55 02 00 ee 10）——它在事件通道上开了一条虚拟 iAP2 链路（type-130 TCP
-    // 被车机拒绝：200 但无 dataPort）。EA 数据（触摸 HID）走这条链路。
-    // 复用 [io.github.shaonialife.cardeck.iap2.Iap2LinkEngine] 完成握手与帧收发。
+    // 车机经 iAPSendMessage 发 iAP2 链路字节（marker ff 55 02 00 ee 10 开链
+    // ——fallback 形态；fw: ForwardData 径），收向 Rust 直喂第二端点
+    // （nativeAirplayEventIapBind 汇点），发向 sendIap（事件通道命令）。
 
     @Volatile
     private var iapLink: NativeTunnelIap2Link? = null
 
-    /**
-     * 车机媒体键回调（方向盘/面板的上一曲、下一曲）。
-     *
-     * 通路：事件通道 → iAPSendMessage → iAP2 控制会话 `0x6802 AccessoryHIDReport`
-     * → [ConsumerKeys] 映射成 Android KeyEvent → 本回调。由 SessionController 注入
-     * `dispatchMediaKey`（与 HID 直投那条路合并处理）。
-     */
     /** 控制通道 TCP 连接失败回执（每轮 connectToEndpoint 全候选失败时一次）——
      *  宿主据此检测网络变化（热点被系统切走→socket 失败是直接证据）并重走加入。
      *  2026-11-04 ENONET 案：热点无上行被系统秒级切回家庭 WiFi，
@@ -1402,18 +1380,17 @@ class AirPlayLink(
         }
     }
 
+    /** 车机媒体键回调（方向盘/面板的上一曲、下一曲）。
+     *
+     * 通路：虚拟链 0x6802 AccessoryHIDReport（Rust hid 分派）→ [ConsumerKeys]
+     * 映射 Android KeyEvent → 本回调（SessionController 注入 dispatchMediaKey）。 */
     var onMediaKey: ((Int) -> Unit)? = null
 
     /** 导航键（iDrive 旋钮/四向拨杆）：需要虚拟屏焦点，由会话层注入 DPAD。 */
     var onNavKey: ((Int) -> Unit)? = null
 
-    /**
-     * MIB3 隧道控制会话完成（auth+burst 已发）回调：宿主据此调度 modesChanged
-     * 资源重申 burst（AADisplay r17 时序 +1.5/4/12/30s）。082446 定谳：不重申的
-     * 话车机全程健康却永不切到 CarPlay 画面。
-     */
-
-    /** 视频起流回调（屏幕上第一帧发出后）——实验模式下重申的触发源。 */
+    /** 视频起流回调（屏幕上第一帧发出后）——modesChanged 宣告的事件触发源
+     *  （fw: 起流 = Stark 控制器等价的模式状态变更，事件驱动单发无重申）。 */
     var onStreamingStarted: (() -> Unit)? = null
 
     /** 隧道链路唯一实例（原生会话薄层，协议行为全在 cardeck-protocol）。 */
@@ -1464,11 +1441,6 @@ class AirPlayLink(
         log("IAPLINK: 隧道链编排已布防（flow_start，等车机 SYN）")
     }
 
-    /** 车机 iAPSendMessage 字节入口（SessionController 事件命令处理器调用）。 */
-    fun onIapEventBytes(data: ByteArray) {
-        obtainIapLink().onCarBytes(data)
-    }
-
     // ---- iAP2 数据隧道（stream 130）数据面（G3 第二刀，2026-11-08）----
     //
     // 130 SETUP 应答 dataPort → Rust attach（编解码接管第二端传输槽，宿主
@@ -1483,8 +1455,6 @@ class AirPlayLink(
     private var tunnelThread: Thread? = null
 
     /** 隧道数据面已激活（事件通道 iAP 入口让路的判据）。 */
-    val tunnelActive: Boolean
-        get() = iapLink?.tunnelActive == true
 
     /** 由 streamSetup 事件（streamType=130）建立隧道数据面。 */
     fun startTunnelDataPlane(streamEvent: org.json.JSONObject): Boolean {
@@ -1532,11 +1502,11 @@ class AirPlayLink(
                                 if (n < 0) break
                                 if (n > 0) {
                                     val w = NativeBridge.nativeAirplayTunnelFeed(iap2, buf.copyOf(n))
-                                    if (w != null && w.isNotEmpty()) out.write(w)
+                                    if (w.isNotEmpty()) out.write(w)
                                 }
                                 // 周期冲洗：tick/takeEvents 蹦床产物（出站响应）
                                 val d = NativeBridge.nativeAirplayTunnelDrain(iap2)
-                                if (d != null && d.isNotEmpty()) out.write(d)
+                                if (d.isNotEmpty()) out.write(d)
                             }
                         } catch (_: Exception) {
                             // socket 失败 = 隧道亡（网络切换/车机拆链）；会话级
@@ -1656,19 +1626,6 @@ class AirPlayLink(
     }
 
     /**
-     * 车机身份文本（音频档位记忆的键来源）：只用 /info 里稳定的 model + manufacturer，
-     * 蓝牙名/固件串会随重连变化，不能进键。
-     * R2 修复：读 Rust info 事件（此前 negotiatedInfo 从未赋值 → 恒 "unknown"，
-     * 档位记忆键退化——该记忆已随 R3 退役）。
-     */
-    fun receiverIdentity(): String {
-        val info = rustInfoEvent
-        val manufacturer = info?.optString("manufacturer").orEmpty().trim()
-        val model = info?.optString("model").orEmpty().trim()
-        return "$manufacturer $model".trim().ifBlank { "unknown" }
-    }
-
-    /**
      * SETUP #2：协商主屏视频流（type 110）。streamConnectionID 由客户端指定，
      * 接收端开 TCP 数据端口并在应答里返回。
      *
@@ -1677,16 +1634,6 @@ class AirPlayLink(
      * → AES-128-CTR（全零会话钥派生，catplay 对照域））——宿主零本地派生，
      * 事件 `cipher` 键选择形态、`streamKey`/`key`+`iv` 携钥。
      */
-
-    /** 屏流的 endpoint 描述（SetupPlan 输入；uuid 来自 /info displays[0]）。 */
-    fun screenStreamPlanJson(displayUuid: String?): String {
-        val uuid = displayUuid?.takeIf { it.isNotBlank() }
-        return if (uuid == null) {
-            "[{\"streamType\":110}]"
-        } else {
-            "[{\"streamType\":110,\"uuid\":\"$uuid\"}]"
-        }
-    }
 
     /** SetupPlan 结果：各流 SETUP 事件（按 streamType）+ RECORD 完成。 */
     class PlanResult(
@@ -1885,6 +1832,16 @@ class AirPlayLink(
             val wk = eventsWriteKey ?: ByteArray(0)
             val rk = eventsReadKey ?: ByteArray(0)
             val created = NativeBridge.nativeAirplayEventCreate(controlSessionHandle, wk, rk) == 1
+            // fw ForwardData 径（2026-11-14 拆 JSON 中转层）：事件通道上的
+            // iAPSendMessage（iAP2 虚链字节）在 Rust 内直喂第二端点，不经
+            // Kotlin 命令面。链接须在**读线程起跑前**预创建并绑定——固件 =
+            // activateInternal 激活径同步建 APAccClientEndpoint（非首字节
+            // 懒触发），早建无行为差（flow_start 仅布防，链路 Connected 前
+            // 不出帧）。
+            if (created) {
+                val link = obtainIapLink()
+                NativeBridge.nativeAirplayEventIapBind(controlSessionHandle, link.handle)
+            }
             log(
                 "EVENT: ✓ 已连接事件通道 $host:${setup.eventPort}" +
                     "（${if (wk.size == 32) "加密(Rust)" else "明文"} created=$created）",
@@ -1954,6 +1911,7 @@ class AirPlayLink(
                     // 事件通道断开 = 整条会话将拆：虚拟链路的 MFi 静默计时必须停
                     // （断链≠静默，防止把该车所有挑战档位污染成快速跳过）
                     stopTunnelDataPlane()
+                    NativeBridge.nativeAirplayEventIapBind(controlSessionHandle, 0)
                     iapLink?.close()
                     iapLink = null
                 }
@@ -2101,11 +2059,6 @@ class AirPlayLink(
     /** 会话墙钟锚（NTP-1900 秒 @ 进程时钟零点；runFlow 每连接轮刷新）。 */
     @Volatile
     var ntpEpochAnchorSecs: Long = 0L
-        private set
-
-    /** G8：初始音量（dB；NaN = 未收到/未请求）。 */
-    @Volatile
-    var initialVolumeDb: Double = Double.NaN
         private set
 
     // ---- 身份持久化 ----
@@ -2320,7 +2273,6 @@ class AirPlayLink(
  */
 data class ControlKeys(
     val phoneWriteKey: ByteArray,
-    val phoneReadKey: ByteArray,
     val sharedSecret: ByteArray,
     /** Events 双钥（fw: CreateEncryptionKeysForContext Events-Salt 族，Rust Done 交付）——
      *  事件通道加密态直用，Kotlin 不再本地 HKDF（M5：事件通道加解密全 Rust）。 */

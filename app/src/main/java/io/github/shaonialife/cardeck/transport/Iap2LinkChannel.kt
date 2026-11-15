@@ -8,11 +8,6 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
- * 链路通道：一个读线程 + 一个节奏线程驱动原生会话（cardeck-protocol 固件真身），向会话层暴露
- * 阻塞式的 sendControl/recvControl 与 awaitReady。
- */
-
-/**
  * 链路通道：一个读线程 + 一个节奏线程驱动【原生会话】（cardeck-protocol
  * 固件真身：accessoryd iAP2Link/FSM/分包器/队列全链），向会话层暴露
  * sendControl 与 awaitReady。

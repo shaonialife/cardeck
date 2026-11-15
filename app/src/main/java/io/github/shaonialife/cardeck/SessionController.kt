@@ -525,11 +525,6 @@ object SessionController {
         }
     }
 
-    /** 状态行文本（Activity 渲染 statusText 用）。 */
-    fun statusLine(): String =
-        "wifi=${wifiConnector?.currentNetwork != null} " +
-            "bt=${bluetoothServer?.isRunning == true} ctrl=${(ctrlAdvertiser?.port ?: -1) > 0}"
-
     /** 会话是否活跃（推出流进程或 BT 任一在跑）。 */
     fun isSessionRunning(): Boolean =
         videoSender?.isRunning == true ||
@@ -947,7 +942,7 @@ object SessionController {
             appendLog("AUDIO: 动态音频 plan 无流密钥——跳过")
             return
         }
-        startAudioChannel(context, client, secret != null, currentAudioHost, profile to info)
+        startAudioChannel(context, client, true, currentAudioHost, profile to info)
     }
 
     /**
@@ -2585,19 +2580,6 @@ object SessionController {
                                     }
                                 }
 
-                                "iAPSendMessage" -> {
-                                    // 事件通道上的 iAP2 虚拟链路字节（车机先发 marker 开场）。
-                                    // 喂给链路引擎：握手 → EA 会话 → 触摸 HID。
-                                    val params = command["params"] as? Map<*, *>
-                                    val data = params?.get("data") as? ByteArray
-                                    if (data == null) {
-                                        appendLog("EVENT: iAPSendMessage 无 data（params=$params）")
-                                    } else {
-                                        iapEventMessageCount++
-                                        client.onIapEventBytes(data)
-                                    }
-                                }
-
                                 "forceKeyFrame" -> {
                                     // 车机解不出画面时会要 I 帧。必须立即响应：
                                     // 拖到下一个周期 I 帧（1s）车机可能一直卡在等帧状态。
@@ -2833,7 +2815,7 @@ object SessionController {
                                         // 保留屏复用完成（或全新建立）——退出保留态（清计时器）
                                         exitDisplayRetention()
                                         ScreenDimmer.setSessionActive(true)
-                                        // 视频起流（虚拟屏已就绪）——实验模式下重申的触发源
+                                        // 视频起流（虚拟屏已就绪）——modesChanged 宣告的事件触发源
                                         client.onStreamingStarted?.invoke()
                                         // 虚拟屏已建好 → 按「连接时真息屏」开关决定是否硬件断电
                                         if (DisplayPrefs.screenOffOnConnect(context)) {
@@ -2993,7 +2975,4 @@ object SessionController {
 
     @Volatile
     private var touchSummaryAt = 0L
-
-    @Volatile
-    private var iapEventMessageCount = 0
 }

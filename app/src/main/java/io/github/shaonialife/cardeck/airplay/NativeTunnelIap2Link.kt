@@ -12,14 +12,17 @@ import io.github.shaonialife.cardeck.protocol.NativeBridge
  * 真车 sysdiagnose 2026-10-15 21:14:31 实证：隧道 = 新 iAP2 链，车机 SYN
  * 后整链重跑 1D00→1D01→AA→通知波，与 BT 链同构）。
  *
- * **字节面双形态（2026-11-08 G3 重接）**：
+ * **字节面双形态（收/发不对称，全 Rust）**：
  * - **type-130 数据隧道**（真车/iPhone 形态）：`nativeAirplayTunnelAttach`
  *   后 Rust 蹦床接管本会话传输槽——出站 FF 5A 帧 → package('comm')+ChaCha
  *   封帧进隧道 outbox，宿主经 nativeAirplayTunnelFeed/Drain 搬运 TCP 字节
  *   （编解码全在 Rust，宿主零钥面）。[tunnelActive] = true。
  * - **事件通道虚拟链**（车机 fallback 形态，2026-10-11 实证）：无 dataPort
- *   时车机经 iAPSendMessage 发 marker 开链——出站走 [sendEventIap]，
- *   [tunnelActive] = false。
+ *   时车机经 iAPSendMessage 发 marker 开链——**收向 = Rust 直喂**
+ *   （fw: handleEventCreatingReply @0x2276b8214 iAPSendMessage 支
+ *   ForwardData 特判直转；宿主 nativeAirplayEventIapBind 绑汇点后
+ *   Rust 内 cardeck_session_feed 直达本会话，不经 Kotlin），**发向**
+ *   走 [sendEventIap]，[tunnelActive] = false。
  */
 class NativeTunnelIap2Link(
     private val log: (String) -> Unit,
@@ -138,28 +141,6 @@ class NativeTunnelIap2Link(
      *  控制通道直写已随 MIB3 隧道退役，2026-11-03 对接期清理）。 */
     private fun routeOutbound(bytes: ByteArray) {
         sendEventIap(bytes)
-    }
-
-    /**
-     * 车机字节入口：事件通道（onIapEventBytes）与隧道读取共用。
-     *
-     * **隧道激活后两路都喂同一端点**（2026-11-10 5 分钟断连定谳）：
-     * 台架/车机的隧道 duplex 桥是不对称的——台架侧 `AirPlayIapTunnelStream`
-     * 发向（DETECT/SYN/1D01）走**事件通道 iAPSendMessage**、收向只读隧道
-     * socket（IapTunnel）；我方应答经 Rust 蹦床进隧道 outbox → socket。
-     * 旧实现「隧道激活即忽略事件通道字节」= 台架链路帧喂地板 →
-     * awaitReady 300s 超时 → 台架整链拆除（每轮存活恰 5 分钟）。
-     * 隧道 socket 入站（真车形）由 AirPlayLink 泵线程喂，两路同链引擎
-     * 去重安全（重复帧再 ACK 不交付）。
-     *
-     * **全部进原生链**（含 6B FF 55 marker——fw: ParseBuffer FF55 扫描器
-     * 完成码分派 @0x10000d8f0-914：DETECT→0x13→FSM 0x17 SendDetect 全六态
-     * 回显 + 协商域重置；RequestIdentify(…FE)→0x15→FSM 0x19 仅 ATTACHED
-     * SendRST——引擎 endpoint.rs 同径实现）。
-     */
-    fun onCarBytes(bytes: ByteArray) {
-        if (handle == 0L) return
-        NativeBridge.nativeSessionFeed(handle, bytes)
     }
 
     private fun dispatchHid(params: List<ByteArray>) {

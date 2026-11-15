@@ -544,6 +544,16 @@ object NativeBridge {
         readKey: ByteArray,
     ): Int
 
+    /**
+     * 绑事件通道 iAPSendMessage 直喂汇点（第二 iAP2 端点句柄；0=解绑）。
+     * fw: handleEventCreatingReply @0x2276b8214 的 ForwardData 径——该命令
+     * 在 Rust 内特判直转，不经 Kotlin 命令 JSON 面（2026-11-14 拆中转层）。
+     */
+    external fun nativeAirplayEventIapBind(
+        handle: Long,
+        linkHandle: Long,
+    )
+
     /** 事件通道泵：注入字节，返回事件 JSON 数组
      *  [{"type":"command","cseq":N,"body":{...}},{"type":"reply","status":200}]。 */
     external fun nativeAirplayEventOnBytes(
@@ -759,25 +769,6 @@ object NativeBridge {
         transmitNanos: Long,
         epochSecsUnix: Long,
     ): ByteArray?
-
-    /** timing 客户端态请求构造（轮询车机 timingPeerInfo 端口——fw:
-     *  _NTPClockClientSendRequest @0x19293fe94 模板直切）。
-     *  [rtcp] = 1 → 32B RTCP 变体，0 → 48B 经典 NTP。
-     *  **Int 约定（jboolean ABI 加固）**：0/1 显式传值。 */
-    external fun nativeAirplayTimingRequest(
-        rtcp: Int,
-        nowNanos: Long,
-        epochSecsUnix: Long,
-    ): ByteArray
-
-    /** timing 客户端态偏移观测（秒；fw: __NTPClockClientProcessResponse
-     *  + 偏移公式 @0x1929402d0 直切——未除 2 固件语义）。
-     *  NaN = 响应非法。 */
-    external fun nativeAirplayTimingObserve(
-        response: ByteArray,
-        arrivalNanos: Long,
-        epochSecsUnix: Long,
-    ): Double
 
     // ---- 通用格式/地址策略原语（跨平台下沉刀，fw::media_format + fw::netaddr）----
 

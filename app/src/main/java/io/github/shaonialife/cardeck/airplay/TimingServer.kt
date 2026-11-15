@@ -3,8 +3,6 @@ package io.github.shaonialife.cardeck.airplay
 import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.SocketTimeoutException
 
 /**
  * AirPlay 计时服务（timing UDP 泵——**字节域已移交 Rust 固件逆向实现**，
@@ -25,7 +23,9 @@ import java.net.SocketTimeoutException
  * = `NativeBridge.nativeAirplayTimingRespond`（纯函数，Rust 侧有全量测试）。
  *
  * 旧 catplay 对照实现（32B 硬编码 version/pt 校验、t2==t3、无 1900 纪元）
- * 已删除——那不是固件语义。
+ * 已删除——那不是固件语义。时钟对齐走纪元墙钟锚（runFlow 会话墙钟锚 +
+ * fw::airplay::rtp build_sync_packet），NTPClockStartClient 客户端径 =
+ * 固件域实现保留在 Rust（fw::airplay::ntp 纯函数+测试），宿主管线未接。
  */
 class TimingServer(
     private val log: (String) -> Unit = {},
@@ -35,22 +35,6 @@ class TimingServer(
 
     @Volatile
     private var running = false
-
-    /** 客户端态（G6）：轮询车机 timingPort，offset 供屏幕时间戳锚未来消费。 */
-    private var clientSocket: DatagramSocket? = null
-    private var clientThread: Thread? = null
-
-    @Volatile
-    private var clientRunning = false
-
-    @Volatile
-    var offsetSecs: Double = Double.NaN
-        private set
-
-    private var clientSamples = 0L
-    private var clientAttempts = 0L
-    private var clientHost: String? = null
-    private var clientPort = 0
 
     /** 收到的 timesync 请求计数（诊断：车机是否真的来同步媒体时钟）。 */
     private var syncRequests = 0L
@@ -93,99 +77,6 @@ class TimingServer(
         runCatching { socket?.close() }
         socket = null
         thread = null
-        stopClient()
-    }
-
-    /** 启动客户端轮询（fw: `_NTPClockStartClient` 发送环——G6）。
-     *  offset 只记录，屏幕时间戳锚的消费待接入 VideoSender。 */
-    @Synchronized
-    fun startClient(
-        host: String,
-        port: Int,
-    ) {
-        if (port <= 0) return
-        if (clientRunning && clientThread?.isAlive == true) {
-            if (clientHost == host && clientPort == port) return
-            // 端口变了（重连/新一轮 controlSetup）——旧目标必须换，否则永远打旧端口
-            stopClient()
-        }
-        stopClient()
-        try {
-            val s = DatagramSocket()
-            s.soTimeout = 1500
-            clientSocket = s
-            clientRunning = true
-            clientHost = host
-            clientPort = port
-            log("TIMING: 客户端启动 host=$host port=$port")
-            clientAttempts = 0
-            clientThread =
-                Thread({ clientLoop(s, host, port) }, "airplay-timing-client").apply {
-                    isDaemon = true
-                    start()
-                }
-        } catch (error: Exception) {
-            log("TIMING: 客户端启动失败 - ${error.message}")
-        }
-    }
-
-    @Synchronized
-    private fun stopClient() {
-        clientRunning = false
-        runCatching { clientSocket?.close() }
-        clientSocket = null
-        clientThread = null
-    }
-
-    private fun clientLoop(
-        s: DatagramSocket,
-        host: String,
-        port: Int,
-    ) {
-        val addr =
-            try {
-                InetAddress.getByName(host)
-            } catch (_: Exception) {
-                return
-            }
-        val buffer = ByteArray(256)
-        while (clientRunning) {
-            val epoch = System.currentTimeMillis() / 1000L
-            val request =
-                NativeBridge.nativeAirplayTimingRequest(0, System.nanoTime(), epoch)
-                    ?: break
-            try {
-                s.send(DatagramPacket(request, request.size, addr, port))
-            } catch (_: Exception) {
-                break
-            }
-            try {
-                val packet = DatagramPacket(buffer, buffer.size)
-                s.receive(packet)
-                val arrival = System.nanoTime()
-                val response = buffer.copyOfRange(0, packet.length)
-                val offset = NativeBridge.nativeAirplayTimingObserve(response, arrival, epoch)
-                if (!offset.isNaN()) {
-                    offsetSecs = offset
-                    clientSamples++
-                    if (clientSamples <= 3 || clientSamples % 20L == 0L) {
-                        log("TIMING: 客户端 offset=${String.format("%.6f", offset)}s samples=$clientSamples")
-                    }
-                }
-            } catch (_: SocketTimeoutException) {
-                clientAttempts++
-                if (clientAttempts <= 3) {
-                    log("TIMING: 客户端无应答 #$clientAttempts（car timingPort 未回——待 SETPEERS/网络时钟）")
-                }
-            } catch (_: Exception) {
-                break
-            }
-            try {
-                Thread.sleep(3_000L)
-            } catch (_: InterruptedException) {
-                return
-            }
-        }
     }
 
     private fun loop(s: DatagramSocket) {

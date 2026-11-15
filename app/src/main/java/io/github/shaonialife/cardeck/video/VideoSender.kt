@@ -391,40 +391,6 @@ class VideoSender(
         }
     }
 
-    /** 按 00 00 00 01 / 00 00 01 起始码切分 AnnexB 码流为 NAL 列表。 */
-    private fun splitAnnexB(bytes: ByteArray): List<ByteArray> {
-        val units = ArrayList<ByteArray>()
-        val starts = ArrayList<Int>()
-        var index = 0
-        while (index + 3 < bytes.size) {
-            if (bytes[index] == 0.toByte() && bytes[index + 1] == 0.toByte()) {
-                if (bytes[index + 2] == 1.toByte()) {
-                    starts += index
-                    index += 3
-                    continue
-                }
-                if (index + 3 < bytes.size && bytes[index + 2] == 0.toByte() && bytes[index + 3] == 1.toByte()) {
-                    starts += index
-                    index += 4
-                    continue
-                }
-            }
-            index++
-        }
-        if (starts.isEmpty()) {
-            if (bytes.isNotEmpty()) units += bytes
-            return units
-        }
-        for (unit in 0 until starts.size) {
-            val start = starts[unit]
-            val prefix = if (bytes[start + 2] == 1.toByte()) 3 else 4
-            val bodyStart = start + prefix
-            val bodyEnd = if (unit + 1 < starts.size) starts[unit + 1] else bytes.size
-            if (bodyEnd > bodyStart) units += bytes.copyOfRange(bodyStart, bodyEnd)
-        }
-        return units
-    }
-
     companion object {
         private const val OP_FRAME = 0
         private const val OP_KEEP_ALIVE = 2

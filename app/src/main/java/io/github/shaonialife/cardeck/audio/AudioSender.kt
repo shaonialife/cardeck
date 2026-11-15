@@ -156,13 +156,6 @@ class AudioSender(
     private val samplesPerPacket: Long
         get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.FRAME_SAMPLES.toLong() else SAMPLES_PER_PACKET.toLong()
 
-    /**
-     * RTP SSRC：固定 0（catplay `prepare_header` 在真车上即用 0；DiPlay 收端不校验）。
-     * 2026-10-17 实测：此前用随机值，奥迪接收端无声音——部分车机按 SSRC 关联 SETUP
-     * 声明的流（非 0 视为未知流丢弃）。
-     */
-    private val ssrc = 0
-
     /** 采集+推流统计（日志限流用）。 */
     private var packetsSent = 0L
     private var bytesSent = 0L
