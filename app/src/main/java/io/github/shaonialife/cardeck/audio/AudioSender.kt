@@ -566,7 +566,9 @@ class AudioSender(
                 // 一次性自检：把编码结果自己解一遍，证明比特流有效且非静音。
                 // 这是「车机无声」最需要的一条证据——如果自解码峰值是 0，问题在编码器，
                 // 如果自解码有声音而车机静音，问题在车机侧（会话/音量/路由）。
-                if (!selfChecked) {
+                // 仅 AAC 比特流有意义（PCM 裸帧喂 AAC 解码器必然失败——
+                // 0.1.28.114 真车日志「没解出样本」即此噪声）。
+                if (!selfChecked && codec == AudioCodec.AAC_LC) {
                     selfChecked = true
                     verifyEncodedFrame(payloads.first())
                 }
@@ -696,6 +698,11 @@ class AudioSender(
             marker = if (marker) 1 else 0,
             nonceCounter,
             pcm,
-            pcmSwapBe = if (codec == AudioCodec.PCM) 1 else 0,
+            // 2026-11-17 真车判形翻转：BE 形态（固件 ASBD ORR 0x2 直切）
+            // 台架可通、真奥迪无声（111→115 五轮装机全程无声，发包率
+            // 136.4 包/s=48k 精确、锚生效、协议全 200 = 其余变量已排除）；
+            // catplay fill_pcm = NATIVE_ENDIAN(LE) 真车实测可出声。真车
+            // 消费域与固件 ASBD 声明不符 → 按真车实测切 LE。
+            pcmSwapBe = 0,
         ) ?: ByteArray(0)
 }
