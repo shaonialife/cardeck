@@ -74,7 +74,9 @@ object SessionController {
 
     private val logLock = Any()
     private val logBuilder = StringBuilder()
-    private val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    /** 行时间戳含日期（用户令 2026-11-17：跨天测试只有时分秒会混淆）。 */
+    private val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     /** 当前挂屏 Activity 的渲染回调（收到**本条新增日志行**，含时间戳前缀）；Activity onDestroy 时清空。 */
     @Volatile

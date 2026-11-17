@@ -88,14 +88,14 @@ class AudioSenderTest {
         val nonce = ByteArray(12).also { shortNonce.copyInto(it, 4) }
 
         val decrypted = NativeBridge.nativeAirplayChachaOpen(key, nonce, aad, sealed)!!
-        // 线格式为**大端 s16**（接收端会 byteSwapS16 转回小端喂 AudioTrack）：
-        // 解密结果应等于原 PCM 换序，换回后与原 PCM 一致。
-        val receiverPcm = swapS16(decrypted) // 接收端 byteSwapS16（换序是对合运算）
-        assertArrayEquals(pcm, receiverPcm)
+        // 线格式为**小端 s16 直通**（2026-11-17 真车判形定谳：BE 七轮无声、
+        // catplay NATIVE_ENDIAN 真车可出声 → 0.1.28.116 起切 LE）：
+        // 解密结果与原采集 PCM 逐字节一致，接收端无需再换序。
+        assertArrayEquals(pcm, decrypted)
     }
 
     @Test
-    fun wirePayloadIsByteSwappedRelativeToCapture() {
+    fun wirePayloadMatchesCaptureLittleEndian() {
         val pcm = byteArrayOf(0x34, 0x12, 0x78, 0x56) // 小端样本 0x1234, 0x5678
         val wire = sender().sealPacket(pcm, sequence = 0, timestamp = 0, nonceCounter = 0)
         val decrypted =
@@ -105,8 +105,8 @@ class AudioSenderTest {
                 wire.copyOfRange(4, 12),
                 wire.copyOfRange(12, wire.size - 8),
             )!!
-        // 线上应为大端：0x12 0x34 0x56 0x78
-        assertArrayEquals(byteArrayOf(0x12, 0x34, 0x56, 0x78), decrypted)
+        // 线上 = 采集小端原样（0.1.28.116 起；BE 形态已判形排除）
+        assertArrayEquals(pcm, decrypted)
     }
 
     @Test

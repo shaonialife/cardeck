@@ -109,7 +109,39 @@ object LogExporter {
                 appendLine("（文件日志不可用——导出界面缓冲，可能不完整）")
                 append(fallbackText)
             }
+            appendNativeLog(context, scope)
         }
+
+    /**
+     * 追加 Rust 侧原生日志（`files/native_debug.log`）。
+     *
+     * 2026-11-17 用户令：此前导出只含宿主 `main_debug.log`，**Rust 日志
+     * （FW-TX/RTSP-PHASE/EVENT-IAP 等协议证据行）从未被导出**——这些恰是
+     * 固件判形最关键的证据。同时该文件此前无上限（真车实测 47MB），
+     * Rust 侧已加 2MB 轮转（src/lib.rs rotate_if_needed）。
+     *
+     * 分段：CURRENT_SESSION 仍取整份（Rust 侧已按会话量级轮转，头部老日志
+     * 由轮转裁掉）；ALL 取全文。
+     */
+    private fun StringBuilder.appendNativeLog(
+        context: Context,
+        scope: Scope,
+    ) {
+        val file = java.io.File(context.filesDir, "native_debug.log")
+        if (!file.isFile) return
+        runCatching {
+            appendLine()
+            appendLine("==================================================")
+            appendLine("Rust 原生日志 (native_debug.log)")
+            appendLine("大小: ${file.length()} 字节（Rust 侧超 2MB 自动轮转，保留最近约 1MB）")
+            appendLine("==================================================")
+            val text = file.readText(Charsets.UTF_8)
+            append(text)
+            if (text.isNotEmpty() && !text.endsWith('\n')) appendLine()
+        }.onFailure {
+            appendLine("（Rust 日志读取失败：${it.message}）")
+        }
+    }
 
     @Suppress("DEPRECATION")
     private fun versionName(context: Context): String =

@@ -58,8 +58,16 @@ class AudioAacPayloadTest {
         assertArrayEquals(frame, decrypted)
     }
 
+    /**
+     * PCM 线上为**小端直通**（不换序）。
+     *
+     * 2026-11-17 定谳（0.1.28.116 起）：固件 ASBD 的 IsBigEndian 位
+     * 在台架可通，但真奥迪 BE/LE 双形态共 7 轮装机全程无声；catplay
+     * `fill_pcm` = NATIVE_ENDIAN(LE) 真车实测可出声 → 按真车实测切 LE。
+     * 本钉锁现行实现：采集小端原样上 wire。
+     */
     @Test
-    fun pcmIsStillByteSwapped() {
+    fun pcmPassesThroughLittleEndian() {
         val pcm = byteArrayOf(0x34, 0x12, 0x78, 0x56)
         val wire = sender(AudioCodec.PCM).sealPacket(pcm, 0, 0, 0)
         val decrypted =
@@ -69,7 +77,7 @@ class AudioAacPayloadTest {
                 wire.copyOfRange(4, 12),
                 wire.copyOfRange(12, wire.size - 8),
             )!!
-        assertArrayEquals(byteArrayOf(0x12, 0x34, 0x56, 0x78), decrypted)
+        assertArrayEquals(pcm, decrypted)
     }
 
     @Test

@@ -15,7 +15,12 @@ import java.util.Locale
  */
 object DebugFileLog {
     private val lock = Any()
-    private val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    /**
+     * 行时间戳格式：**含日期**（2026-11-17 用户令——跨天测试时只有时分秒
+     * 无法区分是哪一天，日志会「混乱」）。年-月-日 时:分:秒.毫秒。
+     */
+    private val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     /**
      * 调试桥 tap：每条落盘的日志同步交给监听者（**远程调试变体**在 Application 里安装；
