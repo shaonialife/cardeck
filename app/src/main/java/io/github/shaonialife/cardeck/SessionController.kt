@@ -1975,9 +1975,21 @@ object SessionController {
                     codec = profile.codec,
                     streamType = profile.streamType,
                     adtsFrames = tuning.adts,
-                    // 同步包目标端口：车机在 SETUP 应答里下发。缺了它就没有 RTP↔NTP 锚点，
-                    // 接收端只能「按到达时刻猜」，严格的实现干脆不排播（2026-10-20 实测）。
-                    controlPort = audio.controlPort,
+                    // 同步包（0xD4 time announce）目标端口。**控制端口缺失时
+                    // 回退 dataPort**——接收端直切定谳（2026-11-17，
+                    // AirPlayReceiver `_audioSession_networkThread`
+                    // @0x245527d40-df0）：0xD4/0xD6/0xD7 与 RTP **共用同一
+                    // recv buffer**（`ldrb w10,[sp,#0x109]` 紧跟 RTP 包解析
+                    // 同栈帧、同 socket），即接收端在同一端口上多路分解
+                    // RTP 与 time announce。真奥迪 SETUP 应答只给 dataPort
+                    // （无 controlPort，台架才给）→ 旧实现直接 return，
+                    // 一个 sync 包都不发 → 接收端 `+0x820`（time announce
+                    // 计数）恒 0 → `ReadAudio` @0x245523460-514 反复把 RTP
+                    // 时间基准归零 = 收包但永不排播（本机 7 轮无声的机制）。
+                    // 固件侧同构：sender time announce 走 hose 聚合器内部
+                    // 分发（hoseSBAR_audioHoseTimeAnnounce @0x2279a8c28 →
+                    // 'tanm' 24B → 同一条 audio hose），与 RTP 同通道。
+                    controlPort = if (audio.controlPort > 0) audio.controlPort else audio.dataPort,
                     // 车机相位锚（fw: feedback 200 体相位读回 → SetZeroTimeStamp
                     // @0x22775b73c = 打包器时基源——RTP ts 落车机相位帧）
                     phaseTsProvider = { client.audioPhaseTs(audio.sampleRate) },
