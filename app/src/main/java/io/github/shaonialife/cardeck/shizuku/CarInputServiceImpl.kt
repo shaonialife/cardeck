@@ -1369,7 +1369,7 @@ class CarInputServiceImpl(
                 w
                     .append(
                         android.text.format.DateFormat
-                            .format("yyyy-MM-dd HH:mm:ss.SSS", System.currentTimeMillis())
+                            .format("MM-dd HH:mm:ss.SSS", System.currentTimeMillis())
                             .toString(),
                     ).append(' ')
                     .append(message)

@@ -16,7 +16,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -93,7 +92,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logBody: View
     private lateinit var logChevron: ImageView
     private lateinit var switchLog: androidx.appcompat.widget.SwitchCompat
-    private lateinit var logText: TextView
+    private lateinit var logList: androidx.recyclerview.widget.RecyclerView
+
+    /** UI 控制台保留的最大日志行数（环形缓冲；RecyclerView 只渲染可见行）。 */
+    private val maxLogLines = 4000
+
+    /** 日志行环形缓冲（只保留最近 [maxLogLines] 行，超出从头部淘汰）。 */
+    private val logLines = ArrayDeque<String>(maxLogLines + 16)
+
+    /** RecyclerView 适配器（定长行，仅可见行参与布局）。 */
+    private val logAdapter = LogLineAdapter()
     private lateinit var snackbar: TextView
     private lateinit var appVersionFooter: TextView
 
@@ -583,13 +591,31 @@ class MainActivity : AppCompatActivity() {
         logBody = findViewById(R.id.logBody)
         logChevron = findViewById(R.id.logChevron)
         switchLog = findViewById(R.id.switchLog)
-        logText = findViewById(R.id.logText)
+        logList = findViewById(R.id.logList)
         snackbar = findViewById(R.id.snackbar)
 
         deviceSubtitle.text = deviceName()
-        logText.movementMethod = ScrollingMovementMethod()
-        // 控制台在长页面 ScrollView 内：按下时申请父级不拦截竖向手势，否则无法手动滚动
-        logText.setOnTouchListener { v, event ->
+        // 日志列表（RecyclerView）：定长行 + 环形缓冲，仅可见行参与布局。
+        // 控制台嵌在长页面 ScrollView 里：手指落在列表上时先申请父级不拦截
+        // 竖向手势，让列表自己滚；滑到顶/底后再交还给外层页面。
+        logList.layoutManager =
+            androidx.recyclerview.widget.LinearLayoutManager(this).apply {
+                stackFromEnd = false
+            }
+        logList.adapter = logAdapter
+        logList.itemAnimator = null // 高频追加下动画无意义且是额外开销
+        logList.addOnScrollListener(
+            object : androidx.recyclerview.widget.RecyclerView.OnScrollListener() {
+                override fun onScrolled(
+                    rv: androidx.recyclerview.widget.RecyclerView,
+                    dx: Int,
+                    dy: Int,
+                ) {
+                    updateLogBottomButton()
+                }
+            },
+        )
+        logList.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 android.view.MotionEvent.ACTION_DOWN ->
                     v.parent.requestDisallowInterceptTouchEvent(true)
@@ -599,6 +625,8 @@ class MainActivity : AppCompatActivity() {
             }
             false
         }
+        // 顶部继续下拉时把滚动手势交还外层 ScrollView（否则列表到顶后页面卡住）
+        logList.setOnScrollChangeListener { _, _, _, _, _ -> }
         findViewById<ImageView>(R.id.btnLogBottom).setOnClickListener {
             // 跳到底部：滚动后自动跟底也随之恢复
             scrollConsoleToBottom()
@@ -1959,49 +1987,103 @@ class MainActivity : AppCompatActivity() {
             if (consoleAtBottom()) View.INVISIBLE else View.VISIBLE
     }
 
-    /** 日志内容最大滚动偏移。 */
-    private fun consoleMaxScroll(): Int {
-        val layout = logText.layout ?: return 0
-        return (
-            layout.getLineBottom(layout.lineCount - 1) +
-                logText.paddingBottom - logText.height
-        ).coerceAtLeast(0)
+    /** 是否已滚到底（40px 容差：吸收行高舍入，避免永远差几像素判不到底）。 */
+    private fun consoleAtBottom(): Boolean {
+        val lm = logList.layoutManager as? androidx.recyclerview.widget.LinearLayoutManager ?: return true
+        val last = lm.findLastVisibleItemPosition()
+        return last < 0 || last >= logAdapter.itemCount - 1
     }
-
-    /** 是否已在底部（40px 容差：吸收行高舍入，避免永远差几像素判不到底）。 */
-    private fun consoleAtBottom(): Boolean = consoleMaxScroll() - logText.scrollY <= 40
 
     private fun scrollConsoleToBottom() {
-        // +16px 过冲补齐舍入差（控制台深色底，过冲不可见；View 不钳制但视觉无感）
-        logText.scrollTo(0, consoleMaxScroll() + 16)
-        logText.post { updateLogBottomButton() }
+        if (logAdapter.itemCount == 0) return
+        logList.scrollToPosition(logAdapter.itemCount - 1)
+        logList.post { updateLogBottomButton() }
     }
 
+    /**
+     * 全量重渲染控制台（日志开关切换 / 清空 / 打开页面）。
+     *
+     * 文本按行切分灌入环形缓冲——RecyclerView 只渲染可见行，长历史不再
+     * 触发整段文本 relayout（旧单 TextView 44KB 全量 setText 的主要开销）。
+     */
     private fun renderConsole(text: String) {
-        // 改文本前已在底部（或用户上翻阅读中）：决定本次是否自动跟底
         val follow = consoleAtBottom()
-        logText.text =
-            if (SessionController.logEnabled) text else "日志采集已关闭（打开「监听日志」开关恢复）"
-        logText.post {
+        logLines.clear()
+        if (!SessionController.logEnabled) {
+            logLines.addLast("日志采集已关闭（打开「监听日志」开关恢复）")
+        } else {
+            text.lineSequence().forEach { line ->
+                if (line.isNotEmpty()) logLines.addLast(line)
+            }
+            while (logLines.size > maxLogLines) logLines.removeFirst()
+        }
+        logAdapter.notifyDataSetChanged()
+        logList.post {
             if (follow) scrollConsoleToBottom() else updateLogBottomButton()
         }
     }
 
     /**
-     * 增量追加一行日志（SessionController 逐行直送；此前每行全量 toString + setText
-     * 整段文本，高频日志下 UI/GC 双重放大）。超限时从进程缓冲全量对账一次完成裁剪。
+     * 增量追加一行（SessionController 逐行直送）。
+     *
+     * 2026-11-17 起 = 环形缓冲 + notifyItemInserted（不再整段 setText）：
+     * 超 [maxLogLines] 从头部淘汰一行并 notifyItemRemoved(0)，其余位置
+     * 由 RecyclerView 自行复用，代价与日志总量无关。
      */
     private fun appendConsole(line: String) {
         val follow = consoleAtBottom()
-        if (logText.text.length > 44_000) {
-            renderConsole(SessionController.logText())
-            return
+        val trimmed = line.trimEnd('\n')
+        if (trimmed.isEmpty()) return
+        if (logLines.size >= maxLogLines) {
+            logLines.removeFirst()
+            logAdapter.notifyItemRemoved(0)
         }
-        logText.append(line)
-        logText.post {
-            if (follow) scrollConsoleToBottom() else updateLogBottomButton()
-        }
+        logLines.addLast(trimmed)
+        logAdapter.notifyItemInserted(logLines.size - 1)
+        if (follow) logList.post { scrollConsoleToBottom() } else logList.post { updateLogBottomButton() }
     }
+
+    /** 日志行适配器：定长 TextView（monospace，与原控制台观感一致）。 */
+    private inner class LogLineAdapter : androidx.recyclerview.widget.RecyclerView.Adapter<LogLineAdapter.Holder>() {
+        inner class Holder(
+            val view: TextView,
+        ) : androidx.recyclerview.widget.RecyclerView.ViewHolder(view)
+
+        override fun onCreateViewHolder(
+            parent: android.view.ViewGroup,
+            viewType: Int,
+        ): Holder {
+            val tv =
+                TextView(this@MainActivity).apply {
+                    layoutParams =
+                        android.view.ViewGroup.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                        )
+                    typeface = android.graphics.Typeface.MONOSPACE
+                    setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                    setTextColor(
+                        androidx.core.content.ContextCompat
+                            .getColor(this@MainActivity, R.color.m3_console_text),
+                    )
+                    setLineSpacing(dp(3).toFloat(), 1f)
+                    // 长行折行而不是横向溢出
+                    setSingleLine(false)
+                }
+            return Holder(tv)
+        }
+
+        override fun onBindViewHolder(
+            holder: Holder,
+            position: Int,
+        ) {
+            holder.view.text = logLines.getOrNull(position).orEmpty()
+        }
+
+        override fun getItemCount(): Int = logLines.size
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private var snackRunnable: Runnable? = null
 

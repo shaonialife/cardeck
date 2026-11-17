@@ -1139,20 +1139,19 @@
                         android:layout_height="wrap_content"
                         android:layout_marginTop="10dp">
 
-                    <TextView
-                        android:id="@+id/logText"
+                    <!-- 日志列表：RecyclerView（2026-11-17 用户令，替换单 TextView）
+                         —— 只有可见行参与布局，追加是 notifyItemInserted 而非整段
+                         setText；环形缓冲保留最近 N 行（MainActivity.MAX_LOG_LINES）。-->
+                    <androidx.recyclerview.widget.RecyclerView
+                        android:id="@+id/logList"
                         android:layout_width="match_parent"
                         android:layout_height="172dp"
                         android:layout_marginTop="10dp"
                         android:background="@drawable/bg_console"
+                        android:clipToPadding="false"
                         android:fadeScrollbars="true"
-                        android:fontFamily="monospace"
-                        android:gravity="top"
-                        android:lineSpacingExtra="3dp"
                         android:padding="11dp"
-                        android:scrollbars="vertical"
-                        android:textColor="@color/m3_console_text"
-                        android:textSize="10.5sp" />
+                        android:scrollbars="vertical" />
 
                         <ImageView
                             android:id="@+id/btnLogBottom"
