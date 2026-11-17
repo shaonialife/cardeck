@@ -702,11 +702,16 @@ class AudioSender(
             marker = if (marker) 1 else 0,
             nonceCounter,
             pcm,
-            // 2026-11-17 真车判形翻转：BE 形态（固件 ASBD ORR 0x2 直切）
-            // 台架可通、真奥迪无声（111→115 五轮装机全程无声，发包率
-            // 136.4 包/s=48k 精确、锚生效、协议全 200 = 其余变量已排除）；
-            // catplay fill_pcm = NATIVE_ENDIAN(LE) 真车实测可出声。真车
-            // 消费域与固件 ASBD 声明不符 → 按真车实测切 LE。
-            pcmSwapBe = 0,
+            // **PCM 线上 = 大端**（2026-11-18 回溯 0.1.10 有声版定谳）：
+            // 用户提供的已知出声版本 3d23b3bf（0.1.10，纯 Kotlin 音频）里
+            // `sealPacket` 明确 `wirePayload = bigEndianS16(pcm)`，注释记
+            // 「接收端对收到的负载做 byteSwapS16 转回小端再喂 AudioTrack」。
+            // 直切接收端互证：certplay `AndroidMediaSink.kt:1000`
+            // `AudioCodecKind.LPCM -> writePcm(byteSwapS16(rtp.copyOfRange(12,...)))`
+            // ——接收端逐样本换序 = **线上必为大端**。
+            // 116 那次按 catplay `fill_pcm`=NATIVE_ENDIAN 改成 LE 是错读
+            // （catplay 的 ASBD 是本地面，不代表 wire；真车 111→123 全程
+            // 无声与 116 的 LE 直接相关）。改回 BE（= 0.1.10 有声形态）。
+            pcmSwapBe = 1,
         ) ?: ByteArray(0)
 }
