@@ -112,16 +112,17 @@ object LogExporter {
             appendNativeLog(context, scope)
         }
 
+    /** Rust 侧「本轮启动」标记（与 cardeck-protocol src/lib.rs SESSION_MARKER 同文）。 */
+    private const val NATIVE_SESSION_MARKER = "===== CarDeck 原生引擎启动（本轮日志起点）====="
+
     /**
      * 追加 Rust 侧原生日志（`files/native_debug.log`）。
      *
-     * 2026-11-17 用户令：此前导出只含宿主 `main_debug.log`，**Rust 日志
-     * （FW-TX/RTSP-PHASE/EVENT-IAP 等协议证据行）从未被导出**——这些恰是
-     * 固件判形最关键的证据。同时该文件此前无上限（真车实测 47MB），
-     * Rust 侧已加 2MB 轮转（src/lib.rs rotate_if_needed）。
-     *
-     * 分段：CURRENT_SESSION 仍取整份（Rust 侧已按会话量级轮转，头部老日志
-     * 由轮转裁掉）；ALL 取全文。
+     * 2026-11-17 用户令：①此前导出只含宿主 `main_debug.log`，**Rust 日志
+     * （FW-TX/RTSP-PHASE/EVENT-IAP 等协议证据行）从未被导出**；②Rust 侧
+     * 日志量大，上限 2MB → **10MB**（保留尾部 5MB）；③**「本轮导出」只导
+     * 本轮**——按 [NATIVE_SESSION_MARKER] 切分（Rust 在注入日志路径时写入，
+     * 轮转后若标记被切走会自动补一条）；只有「导出全部」才导整份。
      */
     private fun StringBuilder.appendNativeLog(
         context: Context,
@@ -130,14 +131,29 @@ object LogExporter {
         val file = java.io.File(context.filesDir, "native_debug.log")
         if (!file.isFile) return
         runCatching {
+            val whole = file.readText(Charsets.UTF_8)
+            val text =
+                if (scope == Scope.CURRENT_SESSION) {
+                    // 取最后一条标记之后（无标记 = 旧文件/刚注入，退回整份）
+                    val at = whole.lastIndexOf(NATIVE_SESSION_MARKER)
+                    if (at >= 0) whole.substring(at + NATIVE_SESSION_MARKER.length) else whole
+                } else {
+                    whole
+                }
             appendLine()
             appendLine("==================================================")
             appendLine("Rust 原生日志 (native_debug.log)")
-            appendLine("大小: ${file.length()} 字节（Rust 侧超 2MB 自动轮转，保留最近约 1MB）")
+            appendLine(
+                "文件大小: ${file.length()} 字节（上限 10MB，超出轮转保留最近约 5MB）｜导出范围: " +
+                    if (scope == Scope.CURRENT_SESSION) "本轮（标记之后）" else "全量",
+            )
             appendLine("==================================================")
-            val text = file.readText(Charsets.UTF_8)
-            append(text)
-            if (text.isNotEmpty() && !text.endsWith('\n')) appendLine()
+            if (scope == Scope.CURRENT_SESSION && text.isBlank()) {
+                appendLine("（本轮尚无 Rust 日志）")
+            } else {
+                append(text)
+                if (text.isNotEmpty() && !text.endsWith('\n')) appendLine()
+            }
         }.onFailure {
             appendLine("（Rust 日志读取失败：${it.message}）")
         }
