@@ -612,17 +612,21 @@ class AudioSender(
     private fun sendPayload(payload: ByteArray): Boolean {
         val now = android.os.SystemClock.uptimeMillis()
         // 车机相位锚定（fw: feedback 200 体相位读回 → SetZeroTimeStamp = 打包器
-        // 时基源 @0x22775b73c）：有锚时 ts = 锚帧当前值（Rust 侧锚间插值），
-        // 每包重锚消漂移；无锚（台架/首包前）保持自零累计。锚跳变置 marker
-        // （帧不连续 = 接收端 jitter 适配域，同 50ms 间隙语义）。
-        val anchored = phaseTsProvider()
-        if (anchored > 0) {
-            if (!phaseAnchorEngaged) {
+        // 时基源 @0x22775b73c）：**锚只做一次性起点对齐**，此后 ts 必须严格
+        // 线性 += samplesPerPacket。2026-11-17 真车定谳：旧「每包重锚」
+        // （timestamp = anchored，anchored = sampleTime + age×rate/1000 每包
+        // 重算）使 ts 增量实测 350.7 样本/包（≠352）且随采集抖动跳变——车机
+        // 按 ts 差测得到达率只剩 62%（sr 均值 29633/48000），且永不排播。
+        // RTP ts 是样本时钟不是墙钟：抖动归接收端 jitter buffer，发送端
+        // 改 ts 等于告诉车机「丢样本了」。
+        if (!phaseAnchorEngaged) {
+            val anchored = phaseTsProvider()
+            if (anchored > 0) {
                 phaseAnchorEngaged = true
                 markerPending = true
-                log("AUDIO: 车机相位锚生效 ts $timestamp → $anchored（车机相位帧）")
+                log("AUDIO: 车机相位锚生效（一次性起点对齐） ts $timestamp → $anchored（此后线性累计 +$samplesPerPacket/包）")
+                timestamp = anchored
             }
-            timestamp = anchored
         }
         val gapBurst = !markerPending && lastPacketAt != 0L && now - lastPacketAt > 50
         val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending || gapBurst)
