@@ -8,10 +8,12 @@ import android.widget.SeekBar
 import android.widget.TextView
 import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.bt.AutoConnectPrefs
+import io.github.shaonialife.cardeck.input.TouchRouter
 
 /**
  * 「杂项设置」面板：不属于任何主题域的开关。2026-10-26 从「显示」面板拆出
- * （「上车自动连接」「HID 原始日志」与显示毫无关系，挤在一起误导归类）。
+ * （「上车自动连接」「HID 原始日志」与显示毫无关系，挤在一起误导归类）；
+ * 2026-11-18「触摸注入节流」自「显示」面板移入（调试调优类）。
  * 偏好存储位置不变（AutoConnectPrefs / DisplayPrefs），只是入口换了地方。
  */
 class MiscPanelFragment : SettingsPanelFragment() {
@@ -210,6 +212,42 @@ class MiscPanelFragment : SettingsPanelFragment() {
                     val retries = retriesSeek.progress + DisplayPrefs.RETENTION_RETRIES_MIN
                     DisplayPrefs.setDisplayRetentionRetries(ctx, retries)
                     hostToast("保留期重试窗口：$retries（约 $retries 分钟）")
+                }
+            },
+        )
+
+        // 触摸注入节流（0=关闭，步进 8ms）：缓解「交互滞后但帧率正常」的事件堆积。
+        // 2026-11-18 自「显示」面板移入（调试调优类），偏好键与即时生效行为不变。
+        val throttleSeek = view.findViewById<SeekBar>(R.id.throttleSeek)
+        val throttleValue = view.findViewById<TextView>(R.id.throttleValue)
+
+        fun throttleText(ms: Int) = if (ms <= 0) "关闭" else "${ms}ms"
+
+        val savedThrottle = DisplayPrefs.moveThrottleMs(ctx)
+        throttleSeek.progress = savedThrottle / 8
+        throttleValue.text = throttleText(savedThrottle)
+        TouchRouter.moveThrottleMs = savedThrottle.toLong()
+
+        throttleSeek.setOnSeekBarChangeListener(
+            object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(
+                    seekBar: SeekBar?,
+                    progress: Int,
+                    fromUser: Boolean,
+                ) {
+                    if (!fromUser) return
+                    val ms = progress * 8
+                    throttleValue.text = throttleText(ms)
+                    DisplayPrefs.setMoveThrottleMs(ctx, ms)
+                    TouchRouter.moveThrottleMs = ms.toLong()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    hostToast(
+                        "触摸节流 " + throttleText(DisplayPrefs.moveThrottleMs(ctx)),
+                    )
                 }
             },
         )

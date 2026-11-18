@@ -10,7 +10,7 @@ import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.launcher.DesktopApps
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 
-/** 设置列表行：分组标题 / 拼音字母标题 / 应用（三个应用列表共用）。 */
+/** 设置列表行：分组标题 / 拼音字母标题 / 应用（管理桌面应用列表）。 */
 sealed class SettingsRow {
     abstract val id: Long
 
@@ -29,7 +29,8 @@ sealed class SettingsRow {
 }
 
 /**
- * 行构建与字母导航条（管理桌面 / 应用超采样 / 应用横屏共用）：
+ * 行构建与字母导航条（管理桌面应用面板；历史上桌面/超采样/横屏三面板共用，2026-11-18
+ * 横屏并入桌面、超采样面板早已删除，现仅剩一个使用方）：
  * 两级分组——先按桌面勾选（「在桌面的应用」→「不在桌面的应用」）。
  * 仅「不在桌面」组内按拼音首字母分节（A/B/…/#，数字应用归 #），字母导航条
  * 也只对应后者——**在桌面组不分节**：其数量通常少，若分节，其字母会出现在
@@ -154,8 +155,8 @@ object SettingsRows {
 }
 
 /**
- * 应用清单列表的通用适配器骨架（桌面/超采样/横屏三面板共用）：两级分组头由骨架
- * 统一渲染，应用行的布局与绑定由子类提供——替代此前三份近乎复制的适配器样板。
+ * 应用清单列表的通用适配器骨架（管理桌面应用面板；历史上三面板共用）：两级分组头由骨架
+ * 统一渲染，应用行的布局与绑定由子类提供——替代此前多份近乎复制的适配器样板。
  */
 abstract class AppRowsAdapter(
     private val fragment: androidx.fragment.app.Fragment,

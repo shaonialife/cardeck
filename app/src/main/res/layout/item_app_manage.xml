@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 设置页应用横屏行：图标 + 名称（下方可带红色状态小字）+ 开关状态勾选框（整行可点） -->
+<!-- 设置页「管理桌面应用」行：图标 + 名称（下方可带横屏状态小字）+ 双勾选框
+     （左=应用横屏，右=桌面显示；表头列文案见 fragment_panel_desktop 的对齐注释） -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
@@ -15,7 +16,7 @@
     android:paddingBottom="7dp">
 
     <ImageView
-        android:id="@+id/oriIcon"
+        android:id="@+id/manageIcon"
         android:layout_width="30dp"
         android:layout_height="30dp"
         android:importantForAccessibility="no" />
@@ -28,7 +29,7 @@
         android:orientation="vertical">
 
         <TextView
-            android:id="@+id/oriName"
+            android:id="@+id/manageName"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:ellipsize="end"
@@ -36,9 +37,9 @@
             android:textColor="#FFF5F5F7"
             android:textSize="13sp" />
 
-        <!-- 系统侧覆盖状态小字：默认隐藏；打开时显示、残留（勾选框关但系统开）时红色高亮 -->
+        <!-- 横屏系统侧覆盖状态小字：默认隐藏；残留（勾选框关但系统开）时红色高亮可点清除 -->
         <TextView
-            android:id="@+id/oriHint"
+            android:id="@+id/manageHint"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="2dp"
@@ -50,7 +51,14 @@
     </LinearLayout>
 
     <ImageView
-        android:id="@+id/oriCheck"
+        android:id="@+id/manageOriCheck"
+        android:layout_width="20dp"
+        android:layout_height="20dp"
+        android:layout_marginRight="14dp"
+        android:importantForAccessibility="no" />
+
+    <ImageView
+        android:id="@+id/manageDesktopCheck"
         android:layout_width="20dp"
         android:layout_height="20dp"
         android:importantForAccessibility="no" />

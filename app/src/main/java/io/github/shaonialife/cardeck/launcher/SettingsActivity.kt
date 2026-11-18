@@ -15,7 +15,6 @@ import io.github.shaonialife.cardeck.launcher.settings.DesktopPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.DockPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.MiscPanelFragment
-import io.github.shaonialife.cardeck.launcher.settings.OrientationPanelFragment
 import io.github.shaonialife.cardeck.launcher.settings.SettingsMenus
 import io.github.shaonialife.cardeck.launcher.settings.SettingsToastHost
 
@@ -95,7 +94,6 @@ class SettingsActivity :
         val defs =
             listOf(
                 R.id.menuDesktopApps to SettingsMenus.DESKTOP,
-                R.id.menuOrientation to SettingsMenus.ORIENTATION,
                 R.id.menuDock to SettingsMenus.DOCK,
                 R.id.menuDefaultMap to SettingsMenus.DEFAULT_MAP,
                 R.id.menuDisplay to SettingsMenus.DISPLAY,
@@ -126,7 +124,6 @@ class SettingsActivity :
         val menuId =
             when (restored) {
                 is DesktopPanelFragment -> SettingsMenus.DESKTOP
-                is OrientationPanelFragment -> SettingsMenus.ORIENTATION
                 is DockPanelFragment -> SettingsMenus.DOCK
                 is DashboardPanelFragment -> SettingsMenus.DEFAULT_MAP
                 is DisplayPanelFragment -> SettingsMenus.DISPLAY

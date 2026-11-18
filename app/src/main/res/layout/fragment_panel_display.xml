@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 车机/手机共用的「显示」面板。外层 ScrollView：车机侧内容区只有约 200dp 高，
-     4 段内容（真息屏 / 分辨率 / 帧率 / 触摸节流）必须能滚动，否则最后一段被裁掉。 -->
+     多段内容（真息屏 / 分辨率 / 帧率 / 密度基准 / 壁纸）必须能滚动，否则最后一段被裁掉。
+     「触摸注入节流」2026-11-18 移入「杂项设置」（调试调优类）。 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -164,46 +165,6 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
             android:text="连接中切换实时生效；英雄卡实时显示「实际/目标」帧率"
-            android:textColor="#FF8E8E93"
-            android:textSize="12sp" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="触摸注入节流"
-            android:textColor="#FFF5F5F7"
-            android:textSize="14sp" />
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <SeekBar
-                android:id="@+id/throttleSeek"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:max="6" />
-
-            <TextView
-                android:id="@+id/throttleValue"
-                android:layout_width="72dp"
-                android:layout_height="wrap_content"
-                android:layout_marginLeft="8dp"
-                android:gravity="right"
-                android:textColor="#FF8E8E93"
-                android:textSize="12sp" />
-        </LinearLayout>
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="交互滞后但帧率正常（事件派发堆积）时调高试验；拖动即时生效"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 

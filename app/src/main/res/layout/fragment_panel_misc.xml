@@ -178,6 +178,47 @@
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 
+        <!-- 触摸注入节流（2026-11-18 自「显示」面板移入）：调试调优类，与触摸日志相邻 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="触摸注入节流"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/throttleSeek"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="6" />
+
+            <TextView
+                android:id="@+id/throttleValue"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="8dp"
+                android:gravity="right"
+                android:textColor="#FF8E8E93"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="交互滞后但帧率正常（事件派发堆积）时调高试验；拖动即时生效"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
 <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

@@ -973,6 +973,17 @@ CarPlayMap（地图屏，同密度=手机侧；仪表盘 tile/全屏间动态 re
   「映射分叉」类 bug 根除）。坑：主题改继承不透明的 `Theme.CarPlaySender`——原
   Launcher 派生透明窗口在手机侧会透出桌面；窄屏返回语义分形态（详情=回列表，
   列表=关页）；narrow 用 onSaveInstanceState 保形态与详情态。
+  ⑫ **「应用横屏」并入「管理桌面应用」（0.1.28.153）**：同一应用列表每行双勾选框
+  （左「横屏」= 强制横屏覆盖、右「桌面」= 显示到车机桌面，行点击=桌面、横屏框自己
+  接管点击），列表上方表头两列文案与勾选框列**像素对齐**（对齐推导写死在
+  fragment_panel_desktop.xml 注释：列表 paddingRight 26+行 margin/padding 12=38 等）。
+  原独立「应用横屏」菜单/面板/两布局/旋转图标全删；`SettingsMenus.ORIENTATION(=2)`
+  const 删除、id 不复用（视图→id 显式映射，天然免疫错位）。合并带来的新坑：
+  **桌面勾选触发整表 notifyDataSetChanged（行分组按桌面勾选重排）**，横屏写入是异步
+  （2 次 shell 最坏 8s），回调回来时 Holder 可能已复用绑定到别的应用——回调里必须
+  校验 `entry.component` 身份再刷行 UI（面板级 `systemOn` 缓存则无条件更新）；
+  能力探测不支持时只灰「横屏」列（表头+各行勾选框 alpha，bind 按 supported 判定），
+  桌面列不受影响。
 - **意外断开保留虚拟屏 + 重连复用（2026-11-10 落地，0.1.28.91）**：意外断开
   （车机软件拆链/WiFi 断 = onEnded；熄火/出范围 = AUTO_STOP 即
   `disconnect(userInitiated=false)`）→ 虚拟屏不动进保留态，自动重连成功后

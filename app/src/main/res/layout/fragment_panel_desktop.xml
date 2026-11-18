@@ -16,6 +16,86 @@
         android:textColor="#FF8E8E93"
         android:textSize="12sp" />
 
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="「横屏」开启后竖屏应用在车机横屏全屏显示，下次连接自动生效；切换时会立即重启该应用（未保存的界面状态会丢失）。"
+        android:textColor="#FF8E8E93"
+        android:textSize="11.5sp" />
+
+    <!-- 横屏能力不可用横幅：本机 ROM 未注册 ChangeId（需 Android 14+）时显示，
+         仅「横屏」列置灰（桌面勾选不受影响）。 -->
+    <TextView
+        android:id="@+id/oriUnsupportedBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:background="#33E8C072"
+        android:paddingLeft="10dp"
+        android:paddingTop="8dp"
+        android:paddingRight="10dp"
+        android:paddingBottom="8dp"
+        android:textColor="#FFE8C072"
+        android:textSize="11.5sp"
+        android:visibility="gone" />
+
+    <!-- 横屏列表外残留：系统侧开着覆盖、但应用已卸载——列表里点不到，顶部汇总清理 -->
+    <TextView
+        android:id="@+id/oriOrphanBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:background="#33FF6B6B"
+        android:paddingLeft="10dp"
+        android:paddingTop="8dp"
+        android:paddingRight="10dp"
+        android:paddingBottom="8dp"
+        android:textColor="#FFFF6B6B"
+        android:textSize="11.5sp"
+        android:visibility="gone" />
+
+    <!-- 双列勾选表头（2026-11-18 应用横屏并入）：文案与行内两个勾选框列对齐，
+         紧贴列表上方（在说明文案之下）。对齐推导（右起）：列表 paddingRight 26 +
+         行 marginRight 4 + 行 paddingRight 8 = 38 → 表头 paddingRight；
+         横屏框与桌面框间距 14dp 与 item_app_manage 一致。 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingLeft="12dp"
+        android:paddingRight="38dp">
+
+        <View
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/oriHeaderLabel"
+            android:layout_width="20dp"
+            android:layout_height="wrap_content"
+            android:layout_marginRight="14dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:text="横屏"
+            android:textColor="#FF8E8E93"
+            android:textSize="10sp" />
+
+        <TextView
+            android:layout_width="20dp"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:text="桌面"
+            android:textColor="#FF8E8E93"
+            android:textSize="10sp" />
+    </LinearLayout>
+
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
