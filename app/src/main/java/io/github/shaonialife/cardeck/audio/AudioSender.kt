@@ -149,6 +149,73 @@ class AudioSender(
     private var lastPacketAt = 0L
     private var selfChecked = false
 
+    /**
+     * 已进入采集缓冲的采样点数（每声道样本帧，与 RTP ts 同单位）。
+     *
+     * **必须用采集计数、不能用 RTP 游标 [timestamp]**：两者之差正是管线滞后
+     * （采集缓冲 + REMOTE_SUBMIX 管道 + AAC 编码），也就是本次要消除的 d。
+     * RTP ts 从 0 起逐包 +spf，故 **ts 就等于采样点序号**，可与本计数直接对表。
+     */
+    @Volatile private var capturedSamples = 0L
+
+    /**
+     * 采集锚点：第 [syncAnchorTs] 个采样点是在 [syncAnchorNanos] 到达采集缓冲的。
+     *
+     * **0xD4 同步包时间轴的唯一来源（2026-11-18 音画不同步修正）**：
+     * 采集循环每读满一帧就成对更新 —— read 返回意味着该帧全部样本已到齐，
+     * 此刻即「最后一个已到样本」的采集时刻。
+     *
+     * 此前同步包锚的是 `System.nanoTime()`（**发包瞬间**），而这一包样本是
+     * d 毫秒之前采集的，车机照此排播就把每个样本推迟 d；视频帧头带的是
+     * MediaCodec PTS（内容时刻），两路相差 d = **音频落后**。
+     */
+    @Volatile private var syncAnchorTs = -1L
+
+    @Volatile private var syncAnchorNanos = 0L
+
+    /** 上一个采集锚（线性外推需要相邻两点，单点会随编码器批量出帧抖动）。 */
+    @Volatile private var prevAnchorTs = -1L
+
+    @Volatile private var prevAnchorNanos = 0L
+
+    /** 单测注入口（internal）：直接摆放采集锚，供 [captureTimeOf] 时间轴钉测试。 */
+    internal fun setCaptureAnchorForTest(
+        prevTs: Long,
+        prevNanos: Long,
+        ts: Long,
+        nanos: Long,
+    ) {
+        prevAnchorTs = prevTs
+        prevAnchorNanos = prevNanos
+        syncAnchorTs = ts
+        syncAnchorNanos = nanos
+    }
+
+    /** 单测注入口（internal）：读回当前锚（验证采集循环是否成对推进）。 */
+    internal fun captureAnchorForTest(): LongArray = longArrayOf(prevAnchorTs, prevAnchorNanos, syncAnchorTs, syncAnchorNanos)
+
+    /**
+     * 采样点序号 → 采集时刻（nanoTime）。用最近两个采集锚线性外推。
+     *
+     * 外推而非直取：同步包通常落在两个采集锚之间（AAC 一帧 21ms，同步包 1s 一次），
+     * 用相邻两锚的实测斜率可吸收采集时钟与标称采样率的微小偏差。
+     * 返回 null = 尚无锚点，调用方退化用当前时刻（此时也还没包可锚）。
+     *
+     * internal：单测直测（时间轴换算，音画同步的唯一定量点）。
+     */
+    internal fun captureTimeOf(sampleTs: Long): Long? {
+        val t1 = syncAnchorTs
+        val n1 = syncAnchorNanos
+        if (t1 < 0 || n1 == 0L) return null
+        val t0 = prevAnchorTs
+        val n0 = prevAnchorNanos
+        return if (t0 >= 0 && n0 > 0 && t1 > t0) {
+            n1 + (sampleTs - t1) * (n1 - n0) / (t1 - t0)
+        } else {
+            n1 + (sampleTs - t1) * 1_000_000_000L / sampleRate
+        }
+    }
+
     /** 每包/每帧对应的 PCM 字节数（PCM 通路=一包的负载；AAC 通路=一帧的输入）。 */
     private val framePcmBytes: Int
         get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.pcmBytes(CHANNELS) else PACKET_BYTES
@@ -451,14 +518,22 @@ class AudioSender(
                     var refusedStreak = 0
                     while (running.get() && !client.isClosed) {
                         try {
+                            // **锚 = 该 RTP ts 的采集时刻，不是发包时刻**
+                            // （2026-11-18 音画不同步修正）：RTP ts 本身只是样本
+                            // 计数，赋予它绝对意义的只有这个 0xD4 锚。
+                            // [syncAnchorTs]/[syncAnchorNanos] 是采集循环在「读满
+                            // 一帧」时成对写下的样本序号↔采集时刻；用相邻锚点线性
+                            // 外推到当前 ts，避免受 AAC 编码器批量出帧的抖动影响。
                             val next = timestamp
                             val current = (next - samplesPerPacket).coerceAtLeast(0L)
+                            val anchorNanos =
+                                captureTimeOf(next) ?: System.nanoTime()
                             val packet =
                                 NativeBridge.nativeAirplayAudioSyncPacket(
                                     syncSequence,
                                     current.toInt(),
                                     next.toInt(),
-                                    System.nanoTime(),
+                                    anchorNanos,
                                     first = if (first) 1 else 0,
                                     epochNtpSecs = ntpEpochAnchorSecs.toInt(),
                                 ) ?: continue
@@ -467,9 +542,12 @@ class AudioSender(
                             syncSequence = (syncSequence + 1) and 0xFFFF
                             if (first) {
                                 first = false
+                                // 诊断：把锚与「现在」的差打出来 = 本次修掉的音频落后量
+                                val lagMs = (System.nanoTime() - anchorNanos) / 1_000_000
                                 log(
-                                    "AUDIO: 首个同步包已发出（X 位=1）ts=$current→$next——" +
-                                        "车机若仍无声，说明它没在等这个锚点",
+                                    "AUDIO: 首个同步包已发出（X 位=1）ts=$current→$next " +
+                                        "锚=采集时刻（滞后 ${lagMs}ms 已扣除）" +
+                                        "——车机若仍无声，说明它没在等这个锚点",
                                 )
                             }
                         } catch (ioe: java.io.IOException) {
@@ -535,6 +613,17 @@ class AudioSender(
                 }
                 if (read < frameBytes) continue // 残包（缓冲尾部）：丢弃，等下一个整包
                 readFailures = 0
+                // **采集锚更新（0xD4 同步包用，见 [capturedSamples]/[syncAnchorTs]）**：
+                // read 返回 = 这 read/4 个样本帧全部到齐，此刻即「最后一个已到样本」
+                // 的采集时刻。用采集计数（不是 RTP 游标）——两者的差就是待消除的
+                // 管线滞后。
+                run {
+                    capturedSamples += read / (CHANNELS * 2)
+                    prevAnchorTs = syncAnchorTs
+                    prevAnchorNanos = syncAnchorNanos
+                    syncAnchorTs = capturedSamples
+                    syncAnchorNanos = System.nanoTime()
+                }
 
                 // 内容诊断（2026-10-17）：播放捕获可能拿到全零（app 禁止捕获 / 音频路由
                 // 到蓝牙 / 无音频播放）。全零时车机静音但手机仍在响，用户会报「声音在

@@ -120,4 +120,55 @@ class AudioSenderTest {
         // 明文相同但 nonce 递增：密文必须不同（防 nonce 复用）
         org.junit.Assert.assertFalse(cipherA.contentEquals(cipherB))
     }
+
+    // ---- 0xD4 同步包时间轴（2026-11-18 音画不同步修正）----
+    //
+    // 语义：RTP ts 只是样本计数，赋予它绝对时间的只有同步包。锚必须取「该 ts
+    // 对应的采集时刻」；取发包时刻会把「d 毫秒前采集的样本」标成「现在」，
+    // 车机排播即整体推迟 d —— 而视频帧头带的是内容时刻（MediaCodec PTS），
+    // 两路相差 d = 音频落后。
+
+    @Test
+    fun captureTimeExtrapolatesBetweenAnchors() {
+        val s = sender()
+        // 两个采集锚：ts=1024@1.000s、ts=2048@1.0213s（48k 下 1024 样本 ≈ 21.3ms）
+        s.setCaptureAnchorForTest(
+            prevTs = 1024,
+            prevNanos = 1_000_000_000L,
+            ts = 2048,
+            nanos = 1_021_333_333L,
+        )
+        // 锚点本身精确命中
+        assertEquals(1_021_333_333L, s.captureTimeOf(2048)!!)
+        assertEquals(1_000_000_000L, s.captureTimeOf(1024)!!)
+        // 锚间外推应落在两锚之间
+        val mid = s.captureTimeOf(1536)!!
+        org.junit.Assert.assertTrue(
+            "锚间外推应落在两锚之间，得 $mid",
+            mid in 1_000_000_000L..1_021_333_333L,
+        )
+        // 锚后外推：ts +1024 → 约再 +21.3ms（容差 1ms）
+        val later = s.captureTimeOf(3072)!!
+        org.junit.Assert.assertTrue(
+            "锚后外推应约 1.0427s，得 $later",
+            kotlin.math.abs(later - 1_042_666_666L) < 1_000_000L,
+        )
+    }
+
+    @Test
+    fun captureTimeFallsBackToNominalRateWithSingleAnchor() {
+        val s = sender()
+        // 只有单锚：按标称采样率外推（48k → 1024 样本 = 21.333ms）
+        s.setCaptureAnchorForTest(prevTs = -1, prevNanos = 0, ts = 48_000, nanos = 5_000_000_000L)
+        val expected = 5_000_000_000L + 1_024L * 1_000_000_000L / 48_000L
+        val got = s.captureTimeOf(48_000 + 1024)!!
+        org.junit.Assert.assertTrue("单锚按标称率外推，期望 $expected 得 $got", kotlin.math.abs(got - expected) < 2_000L)
+    }
+
+    @Test
+    fun captureTimeIsNullBeforeAnyAnchor() {
+        // 尚未采集到任何帧 → null（调用方退化用当前时刻，此时也无包可锚）
+        org.junit.Assert.assertNull(sender().captureTimeOf(0))
+        org.junit.Assert.assertNull(sender().captureTimeOf(1024))
+    }
 }
