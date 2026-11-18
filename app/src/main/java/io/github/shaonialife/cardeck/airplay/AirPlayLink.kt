@@ -769,8 +769,21 @@ class AirPlayLink(
                         val p = java.net.DatagramPacket(buf, buf.size)
                         s.receive(p)
                         n++
-                        if (n == 1 || n % 50 == 0) {
-                            onAudioControlPacket?.invoke(n, p.length, "${p.address?.hostAddress}:${p.port}")
+                        // **前 10 包全量 hex dump**（2026-11-18）：车机发来的
+                        // RTCP 包里有 0xD6 重传请求——其线上格式固件侧未直切到
+                        // （S5.2 R14 残叶），抓一次真实字节即可反推。此前只报
+                        // "n/bytes/from" 三个数，字节内容全丢。前 10 包全打 +
+                        // 之后每 50 包打一次（保住首包形态差异，又不刷屏）。
+                        if (n <= 10 || n % 50 == 0) {
+                            val hex =
+                                p.data
+                                    .copyOfRange(0, minOf(p.length, 64))
+                                    .joinToString(" ") { "%02x".format(it) }
+                            onAudioControlPacket?.invoke(
+                                n,
+                                p.length,
+                                "${p.address?.hostAddress}:${p.port} hex=$hex",
+                            )
                         }
                     } catch (e: Exception) {
                         break
