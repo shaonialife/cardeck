@@ -2855,38 +2855,16 @@ object SessionController {
                                     }
                                 }
                             }
-                            // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
-                            // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
+                            // 音频通道（可选）：SETUP → UDP RTP 推流。
+                            // 会话激活（RECORD）已由 Rust plan 在**全部流 SETUP 之前**
+                            // 完成（固件 one-shot 形态），此处不再补发。
                             val audioStarted =
                                 if (audioProfile != null && preAudio == null) {
-                                    // **两段式（0.1.10 有声形态）下这里必然走到**：
-                                    // 音频流 SETUP 发生在 plan 返回之后（「流后加入」），
-                                    // 故 plan.streams 里没有 100 → preAudio 恒 null。
-                                    // 旧代码在此判定「失败」并停手 = 音频彻底没起
-                                    // （2026-11-18 136 实测：7 轮全卡在此）。
-                                    // 正确动作 = 复用已经建好的流信息。
-                                    // plan 结果里应有事件（Rust 在 RECORD 后推进音频流
-                                    // SETUP，事件已随 plan 返回一并交付）。
-                                    appendLog("AUDIO: SetupPlan 音频流事件缺失——检查两段式时序")
+                                    appendLog("AUDIO: SetupPlan 音频流事件缺失——检查 plan 时序")
                                     false
                                 } else {
                                     startAudioChannel(context, client, sessionKey != null, host, preAudio)
                                 }
-                            if (audioStarted) {
-                                // **音频起流后必须补发 RECORD**（2026-11-18 定谳，
-                                // 0.1.10 有声版同款且注释写明原因）：
-                                //   「流在 RECORD 之后加入：AirPlay 语义要求再发一次
-                                //    RECORD 把新流纳入已激活的会话。**缺这一步时车机
-                                //    对 SETUP 回 200 并给 dataPort，但不会真正播放**
-                                //    （2026-10-17 奥迪实测：音频包持续发送、采集内容
-                                //    非零，车机无声）」。
-                                // 旧条件 `preAudio == null` 只在「音频 SETUP 晚于
-                                // plan」时成立；我方主路径是 plan 预协商（preAudio
-                                // 非空）→ **从未补发过**，正是本轮无声 + 车机音量条
-                                // 灰色（不认为有活跃音频源）的直接原因。
-                                appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
-                                client.record()
-                            }
                         }
                     } else {
                         // 会话级 SETUP 被拒（典型：接收端按设备过滤回 403——

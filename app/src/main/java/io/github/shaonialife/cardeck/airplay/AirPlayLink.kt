@@ -1789,20 +1789,6 @@ class AirPlayLink(
         )
     }
 
-    /** RECORD：激活会话（接收端 onSessionActive）。路径用相对 `/`（catplay record() 同款）。 */
-    fun record(): Boolean {
-        // 音频流后加入会话的**再激活**（2026-10-17 奥迪定谳：缺这一步车机回
-        // 200 给 dataPort 但不真正播放）。连接序的首个 RECORD 已由 Rust 自动
-        // 链完成；此处经 Rust 泵补发（fw: RECORD 每流 SETUP 后重发，
-        // Stage2StartTransaction @0x2276cf53c 域）。未建泵（无会话）返回 false。
-        val h = sessionPumpHandle
-        if (h == 0L) return false
-        val ev = NativeBridge.nativeAirplayRecord(h)
-        drainRustOutbound(h, socket?.getOutputStream() ?: return false)
-        log("AIRPLAY: RECORD 补发（流后加入再激活）ev=$ev")
-        return true
-    }
-
     /**
      * 连接事件通道（接收端在 SETUP 应答的 eventPort 上等我们）。
      *

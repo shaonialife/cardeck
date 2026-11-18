@@ -763,10 +763,6 @@ object NativeBridge {
         paramsJson: ByteArray,
     ): String?
 
-    /** 发 RECORD（'rcrd'，空体——fw: Stage2StartTransaction
-     *  @0x2276cf518 直切）。回复经泵 {"type":"recorded"}。 */
-    external fun nativeAirplayRecord(handle: Long): String?
-
     /** timing UDP 服务器态应答（车机轮询我方 timingPort——fw:
      *  __NTPClockServerProcessPacket @0x1928677bc 直切；纯函数）。
      *  [epochSecsUnix] = 当前 Unix 秒（内部 + NTP 1900 纪元偏移）。
