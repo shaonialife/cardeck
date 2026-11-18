@@ -1,0 +1,51 @@
+# UI 杂项 / 对外
+
+> 2026-11-18 从宿主 `AGENTS.md` 拆出（原 1397 行 / 136KB）。
+> 共 6 条，42 行。
+>
+> 免责声明、UI 风格、媒体卡片等跨域条目。
+
+---
+
+- **默认地图解析禁止回环**（2026-10-18，「卸载重装后地图卡不渲染」根因）：
+  `DefaultMapPrefs.resolve()` 在「未设置默认地图」时曾回调
+  `VirtualLauncher.defaultMapComponent()`，而后者只是转调回 `resolve()` ——
+  无限递归 → `StackOverflowError`。触发条件恰好是**偏好为空**（卸载重装/清除数据
+  后的状态），所以症状是「重装后首次连接地图卡黑屏、在车机设置里重选一次默认地图
+  就恢复」。异常还被 `Bg.run` 的 catch 吞进 logcat（本机型 HKS 加密读不到），
+  文件日志完全静默——极易误判成虚拟屏/合成器问题。
+  现状：解析逻辑集中在纯函数 `resolveDefaultMap()`（显式优先 → 优先序扫描），
+  单测 `DefaultMapPrefsTest` 覆盖 5 条路径（含「反复解析必须终止」）。
+  **改默认地图相关代码时不要引入跨对象互调**；`VirtualLauncher.defaultMapComponent`
+  只允许单向转调 `DefaultMapPrefs`。
+- **会话生命周期钩子**：强制横屏覆盖（AppOrientationCompat）attach 时 applyAll、
+  retireSession/onEnded 时 resetAll——新加系统级写入（settings/cmd）照此模式收口。
+- **目标车机选择（多台车机场景，2026-10-16）**：用户可能配对多台 CarPlay 车机
+  （真车 Audi + 测试台 DiPlay）。未指定目标时出站客户端逐个尝试全部候选、入站
+  服务端来者不拒——连到哪台取决于谁先应答；选定目标后**出站只连该设备、入站
+  拒绝其它设备**（`TargetDevicePrefs` 存地址+名称快照，地址大小写不敏感比对；
+  `targetProvider` 动态读取，选择立即生效、无需重连）。实测证据：目标=Audi 时
+  日志只出现「连接 Audi_MMI_6318 失败」并且 DiPlay 的周期回连被
+  「忽略非目标设备连入」拒绝；切回「自动」后 DiPlay 立刻恢复连入。
+  注意：选择列表**只列已配对设备**（无线 CarPlay 前置是系统级蓝牙配对，未配对
+  设备无法建 iAP2 会话，故不做蓝牙扫描发现新设备）；目标从系统配对列表消失时
+  UI 提示「需重选」。`btnPickTarget` 在「蓝牙配对」标题右侧（仅已配对>0 时显示；
+  最初放行尾与右侧徽标拥挤，2026-10-16 移入标题行）。
+- **免责声明（对外分享的启动门）**：`legal/DisclaimerPrefs.CURRENT_VERSION` 用**版本号**
+  而非布尔记录接受状态——**改 `DisclaimerContent` 文案必须同步 +1**，否则老用户不会重新
+  确认；布尔值只能靠卸载重装才会再弹。强制形态三条约束同时成立才放行「接受」：
+  10 秒倒计时、内容需滚动时已滑到底、（由 UI 保证）未点「放弃使用」；三者是**并列**关系，
+  滑到底不能跳过倒计时。「放弃使用」立即可点（拒绝不该被阻拦）并 `finishAndRemoveTask()`。
+  判定「内容是否可滚动」必须等布局完成（`scroll.height > 0`）：布局未完成时
+  `canScrollVertically` 恒为 false，会被误判成「内容不足一屏」从而永久放行（真机踩到）。
+  倒计时存**绝对截止时刻**（`elapsedRealtime`）经 `onSaveInstanceState` 透传，旋转重建
+  后继续剩余时间而不是重新等 10 秒。强制弹窗 `setCancelable(false)` +
+  `setCanceledOnTouchOutside(false)`；底部菜单入口只读（无倒计时/无滚动要求）。
+- **8015/宝马攻关的第三方对照结论**（2026-10-24 起，`docs/THIRD-PARTY-COMPARE.md`，
+  依据=真 iPhone sysdiagnose 抓包推导 + `reference/` 下未入库的第三方同类实现行为
+  对照，后者溯源见 `reference/README.md`）：8015 迭代前必读——涉及 WiFi 侧 iAP2
+  会话载体选择（type130 隧道 vs 事件通道）、探测应答形态、MFi 流程步骤与挑战
+  长度、链路重协商、锁屏推流（VirtualDevice 路线）等关键分叉与行动清单。
+- **风格**：Kotlin，中文注释（注释写「为什么/实测依据」而非复述代码）；UI 文案中文。
+  `reference/` 下是 GPL 参考仓库（gitignore，勿复制代码入本项目、勿外传）。
+
