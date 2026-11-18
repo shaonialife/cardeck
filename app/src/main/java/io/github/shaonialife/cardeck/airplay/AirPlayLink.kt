@@ -598,6 +598,15 @@ class AirPlayLink(
                         input.read(buf)
                     } catch (_: java.net.SocketTimeoutException) {
                         drainRustOutbound(handle, output)
+                        // 超时轮询也要进 on_bytes：Rust 侧可能缓存着待交付的
+                        // Step（plan 收尾 `recorded` 排在末条流 `streamSetup`
+                        // 之后——两次投递，2026-11-18 155 修复）
+                        val pending = NativeBridge.nativeAirplayOnBytes(handle, ByteArray(0))
+                        if (!pending.isNullOrEmpty()) {
+                            runCatching { org.json.JSONObject(pending) }.getOrNull()?.let {
+                                if (it.optString("type") == "recorded") controlEventQueue.offer(it)
+                            }
+                        }
                         continue
                     } catch (_: IOException) {
                         break
