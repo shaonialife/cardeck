@@ -1443,6 +1443,12 @@ object VirtualLauncher {
         dashboardMode = dashboard
         if (changed) notifyDashboard()
         if (dashboard) {
+            // 卡片先出画面：立即切 SPLIT，再做后台对账。对账（pullBack×2 + ensureMapTask）
+            // 内含多次 dumpsys/am shell 往返 ~1s，此前 setTileLayout(SPLIT) 排在对账末尾，
+            // home 进仪表盘就成了「页面先切、地图/固定应用卡干等 1s 才渲染」；pager 滑动
+            // 路径没这问题是因为滑动预览（showMapTile）在起手就把 tile 切出来了
+            // （2026-11-18 用户实测对比：滑动丝滑、home 卡顿）。
+            composer?.setTileLayout(DualDisplayComposer.TileLayout.SPLIT)
             Bg.run("dashboard-enter") {
                 // 冻结对账先行（幂等）：地图/固定应用被拉到手机侧 → 回仪表盘即自动拉回
                 // （pullBack 内部健康态只花一次 dumpsys 快照）；之后再补默认地图任务
