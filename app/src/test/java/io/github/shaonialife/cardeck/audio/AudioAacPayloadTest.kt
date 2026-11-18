@@ -59,15 +59,16 @@ class AudioAacPayloadTest {
     }
 
     /**
-     * PCM 线上为**小端直通**（不换序）。
+     * PCM 线上为**大端**（逐样本换序）。
      *
-     * 2026-11-17 定谳（0.1.28.116 起）：固件 ASBD 的 IsBigEndian 位
-     * 在台架可通，但真奥迪 BE/LE 双形态共 7 轮装机全程无声；catplay
-     * `fill_pcm` = NATIVE_ENDIAN(LE) 真车实测可出声 → 按真车实测切 LE。
-     * 本钉锁现行实现：采集小端原样上 wire。
+     * 2026-11-18 定谳（回溯 0.1.10 有声版 `3d23b3bf`）：其 `sealPacket`
+     * 明确 `wirePayload = bigEndianS16(pcm)`；互证 = 接收端
+     * `xcertplay/AndroidMediaSink.kt:1000`
+     * `AudioCodecKind.LPCM -> writePcm(byteSwapS16(rtp.copyOfRange(12,...)))`
+     * ——接收端逐样本换序 = 线上必为大端。
      */
     @Test
-    fun pcmPassesThroughLittleEndian() {
+    fun pcmIsByteSwappedToBigEndian() {
         val pcm = byteArrayOf(0x34, 0x12, 0x78, 0x56)
         val wire = sender(AudioCodec.PCM).sealPacket(pcm, 0, 0, 0)
         val decrypted =
@@ -77,7 +78,7 @@ class AudioAacPayloadTest {
                 wire.copyOfRange(4, 12),
                 wire.copyOfRange(12, wire.size - 8),
             )!!
-        assertArrayEquals(pcm, decrypted)
+        assertArrayEquals(byteArrayOf(0x12, 0x34, 0x56, 0x78), decrypted)
     }
 
     @Test

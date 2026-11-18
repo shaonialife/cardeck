@@ -1027,6 +1027,10 @@ class MainActivity : AppCompatActivity() {
         }
         updateConnectedSubline()
         updateHeroStats()
+        // 音频 sender 启动/停止后刷新「车机侧声音」标签（2026-11-18）
+        SessionController.onAudioSenderChanged = {
+            runOnUiThread { if (!isFinishing && !isDestroyed) updateAudioTag() }
+        }
         updateAudioTag()
         updateReadyRow()
         updateShizukuChip()

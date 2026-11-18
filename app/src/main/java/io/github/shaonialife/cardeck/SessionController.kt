@@ -340,6 +340,13 @@ object SessionController {
     @Volatile
     var audioEnabledForSession: Boolean = false
 
+    /**
+     * 音频收发器就绪回调（2026-11-18）：`updateAudioTag` 此前只在连接成功那一刻
+     * 调一次，而 AudioSender 是在那之后才 `start()`（isRunning 尚 false）→ UI
+     * 恒显示「车机侧声音 · 关闭」，用户据此误判测试状态。启动后回调一次。
+     */
+    var onAudioSenderChanged: (() -> Unit)? = null
+
     /** 会话建立互斥（端点交接 → 配对 → 推流全程只允许一条）。 */
     val sessionStarting = AtomicBoolean(false)
 
@@ -1951,20 +1958,27 @@ object SessionController {
                 appendLog("AUDIO: 无预协商音频流——本次仅推视频")
                 return false
             }
-            // 首选 REMOTE_SUBMIX 采集（shell UserService，免投屏授权链）：submix 输入
-            // 激活时系统把媒体策略整体路由走——手机本地自然静音，**音量条不动**；
-            // 不可用（服务未绑/ROM 拒绝）回退投影播放捕获（旧行为：需 MediaProjection
-            // + 会话中静音手机媒体音量）
+            // **采集源：优先播放捕获（MediaProjection）**，REMOTE_SUBMIX 退为兜底。
+            // 2026-11-18：回溯 0.1.10 有声版 `3d23b3bf`——该版本**只有播放捕获**
+            // （`AudioRecord.Builder.setAudioPlaybackCaptureConfig`），且真车出声。
+            // 本机 0.1.28.x 系列改用 REMOTE_SUBMIX（shell UserService 管道）后
+            // 全程无声；两者的 AudioFlinger policy 挂点不同（submix 在音量应用点
+            // 之前凭空接管媒体路由，播放捕获走系统标准 capture 路径），是本轮
+            // 已核对的**最后一处形态差异**。先按有声版走播放捕获。
             val submixService = CarInputClient.service
+            val projection0 = CarPlayService.mediaProjection
             val submixFd =
-                submixService?.let { service ->
-                    runCatching { service.startSubmixAudio(audio.sampleRate) }
-                        .onFailure { appendLog("AUDIO: REMOTE_SUBMIX 启动异常：${it.message}") }
-                        .getOrNull()
+                if (projection0 != null) {
+                    appendLog("AUDIO: 采集走播放捕获（MediaProjection，0.1.10 有声形态）")
+                    null
+                } else {
+                    submixService
+                        ?.let { service ->
+                            runCatching { service.startSubmixAudio(audio.sampleRate) }
+                                .onFailure { appendLog("AUDIO: REMOTE_SUBMIX 启动异常：${it.message}") }
+                                .getOrNull()
+                        }?.also { appendLog("AUDIO: 无投屏权限——回退 REMOTE_SUBMIX") }
                 }
-            if (submixFd != null) {
-                appendLog("AUDIO: 采集走 REMOTE_SUBMIX（免投屏链路，手机音量条不动）")
-            }
             val sender =
                 AudioSender(
                     host = host,
@@ -1977,21 +1991,14 @@ object SessionController {
                     codec = profile.codec,
                     streamType = profile.streamType,
                     adtsFrames = tuning.adts,
-                    // 同步包（0xD4 time announce）目标端口。**控制端口缺失时
-                    // 回退 dataPort**——接收端直切定谳（2026-11-17，
-                    // AirPlayReceiver `_audioSession_networkThread`
-                    // @0x245527d40-df0）：0xD4/0xD6/0xD7 与 RTP **共用同一
-                    // recv buffer**（`ldrb w10,[sp,#0x109]` 紧跟 RTP 包解析
-                    // 同栈帧、同 socket），即接收端在同一端口上多路分解
-                    // RTP 与 time announce。真奥迪 SETUP 应答只给 dataPort
-                    // （无 controlPort，台架才给）→ 旧实现直接 return，
-                    // 一个 sync 包都不发 → 接收端 `+0x820`（time announce
-                    // 计数）恒 0 → `ReadAudio` @0x245523460-514 反复把 RTP
-                    // 时间基准归零 = 收包但永不排播（本机 7 轮无声的机制）。
-                    // 固件侧同构：sender time announce 走 hose 聚合器内部
-                    // 分发（hoseSBAR_audioHoseTimeAnnounce @0x2279a8c28 →
-                    // 'tanm' 24B → 同一条 audio hose），与 RTP 同通道。
-                    controlPort = if (audio.controlPort > 0) audio.controlPort else audio.dataPort,
+                    // 同步包目标端口 = **仅**车机 SETUP 应答的 controlPort。
+                    // 2026-11-18 回溯 0.1.10 有声版定谳：该版本同样绑
+                    // controlPort、真车不给时直接 return（一个 sync 包都不发），
+                    // 却能在真车出声 → **sync 包对 Audi 不是必要条件**。
+                    // 119 引入的「controlPort 缺失回退 dataPort」已撤销：往
+                    // RTP 数据口(7070) 混发 0xD4 在 0.1.10 形态里不存在，且
+                    // 可能被接收端当异常影响排播判定。恢复有声版形态。
+                    controlPort = audio.controlPort,
                     // 车机相位锚（fw: feedback 200 体相位读回 → SetZeroTimeStamp
                     // @0x22775b73c = 打包器时基源——RTP ts 落车机相位帧）
                     phaseTsProvider = { client.audioPhaseTs(audio.sampleRate) },
@@ -2001,11 +2008,18 @@ object SessionController {
             // 收包口——绑上等车机发，替代旧「发同步包到 car:6011」死方向）
             if (audio.controlPort > 0) {
                 client.startControlPortProbe(audio.controlPort)
-                // 音量域（fw: 取初始音量→RECORD→set-volume 回写激活；
-                // 0.1.10 probeAndFixVolume 同源——车机 AirPlay 混音器条目
-                // 静音位 ≠ 用户手调的总音量）
-                client.fetchVolume()
             }
+            // 音量域：**无条件查+纠正**（2026-11-18 回溯 0.1.10 有声版定谳）。
+            // 0.1.10 `probeAndFixVolume` 注释正是我们这个症状：
+            //   「AAC-LC 通路建好后车机在实时消费样本（/feedback 的 sampleTime
+            //    按 44.1k 走），但喇叭全静音。真 iPhone 会主动 SET_PARAMETER
+            //    volume；接收端的 AirPlay 增益若停留在静音位（-144dB），表现
+            //    就正好是『数据在流、声音没有』。**查不到（Honda 实测 501）时
+            //    也要下发一次**——原来直接 return，等于整个会话从没设置过
+            //    接收端音量，若增益停在静音位就是无声且拿不到日志。」
+            // 我方此前把它包在 `controlPort > 0` 里，而**真车 controlPort=0**
+            // → 整个会话从未发过 SET_PARAMETER volume = 本轮无声的直接嫌疑。
+            client.fetchVolume()
             // 音频路由抢占自愈（2026-10-26 荣耀实测：耳机 X7e 抢占 A2DP 后，
             // 采集全零、推给车机的是静音流——用户视角「车机没声音了」）
             sender.onRouteHijackSuspect = { maybeReclaimAudioRoute() }
@@ -2029,6 +2043,7 @@ object SessionController {
                         sender.start(projection)
                     }
                 }
+            onAudioSenderChanged?.invoke()
             if (!started) {
                 audioSender = null
                 // 未成功进入采集循环也显式收口（stop 已触发 onStopped，此处幂等兜底）
@@ -2844,16 +2859,31 @@ object SessionController {
                             // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
                             val audioStarted =
                                 if (audioProfile != null && preAudio == null) {
-                                    appendLog("AUDIO: SetupPlan 音频流未成功（缺 streamKey/端口）——不再二次发 SETUP")
+                                    // **两段式（0.1.10 有声形态）下这里必然走到**：
+                                    // 音频流 SETUP 发生在 plan 返回之后（「流后加入」），
+                                    // 故 plan.streams 里没有 100 → preAudio 恒 null。
+                                    // 旧代码在此判定「失败」并停手 = 音频彻底没起
+                                    // （2026-11-18 136 实测：7 轮全卡在此）。
+                                    // 正确动作 = 复用已经建好的流信息。
+                                    // plan 结果里应有事件（Rust 在 RECORD 后推进音频流
+                                    // SETUP，事件已随 plan 返回一并交付）。
+                                    appendLog("AUDIO: SetupPlan 音频流事件缺失——检查两段式时序")
                                     false
                                 } else {
                                     startAudioChannel(context, client, sessionKey != null, host, preAudio)
                                 }
-                            if (audioStarted && preAudio == null) {
-                                // 流在 RECORD 之后加入：AirPlay 语义要求再发一次 RECORD
-                                // 把新流纳入已激活的会话。缺这一步时车机对 SETUP 回 200
-                                // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：
-                                // 音频包持续发送、采集内容非零，车机无声）。
+                            if (audioStarted) {
+                                // **音频起流后必须补发 RECORD**（2026-11-18 定谳，
+                                // 0.1.10 有声版同款且注释写明原因）：
+                                //   「流在 RECORD 之后加入：AirPlay 语义要求再发一次
+                                //    RECORD 把新流纳入已激活的会话。**缺这一步时车机
+                                //    对 SETUP 回 200 并给 dataPort，但不会真正播放**
+                                //    （2026-10-17 奥迪实测：音频包持续发送、采集内容
+                                //    非零，车机无声）」。
+                                // 旧条件 `preAudio == null` 只在「音频 SETUP 晚于
+                                // plan」时成立；我方主路径是 plan 预协商（preAudio
+                                // 非空）→ **从未补发过**，正是本轮无声 + 车机音量条
+                                // 灰色（不认为有活跃音频源）的直接原因。
                                 appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
                                 client.record()
                             }

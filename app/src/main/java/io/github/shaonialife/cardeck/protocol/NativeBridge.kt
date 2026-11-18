@@ -561,6 +561,24 @@ object NativeBridge {
         bytes: ByteArray?,
     ): String?
 
+    /**
+     * 注入流 SETUP 的绝对 URL 基 `rtsp://host:port`（空 = 相对 "/"）。
+     * 0.1.10 有声版用绝对 URL 发流 SETUP（2026-11-18 对齐）。
+     */
+    external fun nativeAirplaySetStreamUrlBase(
+        handle: Long,
+        base: ByteArray,
+    )
+
+    /** `modesChanged` 走**控制通道**（0.1.10 有声形态）。 */
+    external fun nativeAirplayAssertModesControl(handle: Long)
+
+    /** iAP2 虚链字节走**控制通道** iAPSendMessage（0.1.10 有声形态）。 */
+    external fun nativeAirplaySendIapControl(
+        handle: Long,
+        data: ByteArray,
+    )
+
     /** 事件通道发 'comm' 命令（JSON 体 → plist）。 */
     external fun nativeAirplaySendCommand(
         handle: Long,

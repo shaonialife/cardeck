@@ -922,12 +922,13 @@ class AirPlayLink(
         // POST /command；控制通道明文直写会绕过 Rust 会话加密 → 接收端
         // BAD_DECRYPT 断连，真机 2026-11-02 实证）。R2 起命令体在 Rust
         // （EventChannel::send_modes_assert——catplay assert_modes 镜像）。
-        val result = NativeBridge.nativeAirplayAssertModes(controlSessionHandle)
-        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
-        if (!sent) log("EVENT: modesChanged 发送失败(rust) - $result")
+        // **控制通道**（2026-11-18 基线定谳：0.1.10 有声版 modesChanged 走
+        // `request("POST","/command")` 主连接；我方此前挪到事件通道是 §10.56
+        // 的推断，与有声版不符）。命令体在 Rust，加密走会话 cipher。
+        NativeBridge.nativeAirplayAssertModesControl(controlSessionHandle)
         pumpEventOutbound()
-        log("AIRPLAY: modesChanged（声明持有主屏/主音频资源）[事件通道] ok=$sent")
-        return sent
+        log("AIRPLAY: modesChanged（声明持有主屏/主音频资源）[控制通道]")
+        return true
     }
 
     /**
@@ -1324,14 +1325,17 @@ class AirPlayLink(
      * @0x227892c60——dict{data} → sendCommandInternal）。
      */
     fun sendIap(data: ByteArray): Boolean {
-        val result = NativeBridge.nativeAirplaySendIap(controlSessionHandle, data)
-        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
-        if (!sent) log("EVENT: iAPSendMessage 发送失败(rust) - $result")
+        // **控制通道**（2026-11-18 基线定谳：0.1.10 有声版的 iAP2 虚链字节走
+        // `postControlIap` → `request("POST","/command")` 主连接；事件通道
+        // 只承载车机→手机方向）。命令体在 Rust（fw: setUpAPAccClientEndpoint
+        // ForIdType_block_invoke @0x227892c60 dict{data}）。
+        NativeBridge.nativeAirplaySendIapControl(controlSessionHandle, data)
+        val sent = true
         pumpEventOutbound()
         sendIapCount++
         if (sendIapCount <= 10) {
             log(
-                "IAPLINK: tx(事件通道) ${data.size}B ok=$sent hex=" +
+                "IAPLINK: tx(控制通道) ${data.size}B ok=$sent hex=" +
                     data.joinToString(" ") { "%02x".format(it) }.take(120),
             )
         }
@@ -2092,6 +2096,16 @@ class AirPlayLink(
 
     /** fw: appendControlSetupRequest 恒写身份键注入（平台值）。 */
     private fun applyPlatformIdentity(handle: Long) {
+        // 流 SETUP 绝对 URL 基（0.1.10 有声版用 `rtsp://host:port/` 发流 SETUP；
+        // 2026-11-18 对齐）。host/port 取自当前连接目标，缺失则留空 = 相对 "/"。
+        val urlHost = activeHost ?: currentEndpoint.ipAddresses.firstOrNull()
+        if (urlHost != null) {
+            val port = currentEndpoint.airPlayPort.takeIf { it > 0 } ?: 7000
+            NativeBridge.nativeAirplaySetStreamUrlBase(
+                handle,
+                "rtsp://$urlHost:$port".toByteArray(),
+            )
+        }
         val mac = DeviceIdentity.cachedBluetoothMac() ?: "02:00:00:00:00:00"
         val model = Build.MODEL?.takeIf { it.isNotBlank() } ?: "iPhone"
         val name = context?.let { DeviceIdentity.deviceName(it) } ?: model

@@ -142,7 +142,8 @@ class AudioSender(
     private var markerPending = true
 
     /** 车机相位锚是否已接合（首锚跳变置 marker 一次）。 */
-    @Volatile private var phaseAnchorEngaged = false
+    /** 相位锚可用性只记录一次（诊断；**不影响 ts**——ts 零基自增）。 */
+    @Volatile private var phaseAnchorChecked = false
 
     /** 距上次发包时刻毫秒钟（fw: sendOne 块流对象 +0x208 同构——每包更新）。 */
     private var lastPacketAt = 0L
@@ -323,7 +324,9 @@ class AudioSender(
                 this.submixStream = null
                 running.set(true)
                 // 音频通道激活后声音只从车机出（真 CarPlay 行为）：播放捕获取自
-                // REMOTE_SUBMIX（音量应用点之前），静音手机不影响捕获数据
+                // REMOTE_SUBMIX（音量应用点之前），静音手机不影响捕获数据。
+                // （2026-11-18 验证：禁用静音后采集仍时有时无 → 静音与捕获无关，
+                //   恢复静音；采集跳变是音乐本身静音段/路由抖动，非本逻辑所致。）
                 mutePhoneMedia()
             } else {
                 this.submixStream = submixStream
@@ -469,11 +472,17 @@ class AudioSender(
                                         "车机若仍无声，说明它没在等这个锚点",
                                 )
                             }
-                        } catch (retryable: java.io.IOException) {
-                            refusedStreak++
-                            if (refusedStreak == 1 || refusedStreak % 10 == 0) {
-                                log("AUDIO: 同步包暂被拒（$refusedStreak 次，车机 controlPort 未绑定？持续重试）- ${retryable.message}")
-                            }
+                        } catch (ioe: java.io.IOException) {
+                            // **ECONNREFUSED 即停发**（2026-11-18 回溯 0.1.10 有声版）：
+                            // 0.1.10 的 sync 循环是 `try { while(...) {...} } catch
+                            // (Exception) { if (running) log("同步包发送停止 - ...") }`
+                            // —— 异常直接**跳出整个循环**、线程结束，**不重试**。
+                            // 我方此前「持续重试」是发明：车机 controlPort 6011 在
+                            // 首次 ECONNREFUSED 后就不再接受，持续往它发包既无用
+                            // 又可能干扰车机音频通路初始化（140 实测：每 2s 一条
+                            // 「同步包暂被拒」刷满日志，而 0.1.10 同场景出声）。
+                            log("AUDIO: 同步包发送停止 - ${ioe.message}（0.1.10 形态：不重试）")
+                            break
                         }
                         Thread.sleep(SYNC_INTERVAL_MILLIS)
                     }
@@ -611,31 +620,44 @@ class AudioSender(
      */
     private fun sendPayload(payload: ByteArray): Boolean {
         val now = android.os.SystemClock.uptimeMillis()
-        // 车机相位锚定（fw: feedback 200 体相位读回 → SetZeroTimeStamp = 打包器
-        // 时基源 @0x22775b73c）：**锚只做一次性起点对齐**，此后 ts 必须严格
-        // 线性 += samplesPerPacket。2026-11-17 真车定谳：旧「每包重锚」
-        // （timestamp = anchored，anchored = sampleTime + age×rate/1000 每包
-        // 重算）使 ts 增量实测 350.7 样本/包（≠352）且随采集抖动跳变——车机
-        // 按 ts 差测得到达率只剩 62%（sr 均值 29633/48000），且永不排播。
-        // RTP ts 是样本时钟不是墙钟：抖动归接收端 jitter buffer，发送端
-        // 改 ts 等于告诉车机「丢样本了」。
-        if (!phaseAnchorEngaged) {
+        // **相位锚已废弃（2026-11-18 回溯 0.1.10 有声版）**：0.1.10 的
+        // `AudioSender` 里 `timestamp` 初值 0L、每包 `+= samplesPerPacket`，
+        // **完全没有锚定机制**——ts 纯自 RECORD 零基自增（真车出声实证）。
+        // 我方 115 起引入「相位锚一次性起点对齐」，使首包 ts = 车机 sampleTime
+        // 外推值（实测各轮起点 6432/18480/38880 等非零），与 0.1.10 形态
+        // 根本不同。且接收端相位锚路径
+        // `_carAudioStream_updateZeroTimeFromPhaseValues` @0x22775b46c
+        // **无门控、无条件覆盖时基**（写 +0x110/+0x118/+0x148=3）——
+        // 若两侧时基不同源会把整个排播时基搬走。按有声版恢复纯零基自增。
+        if (!phaseAnchorChecked) {
+            phaseAnchorChecked = true
+            // 仅记录一次锚可用性（诊断用，不改变 ts）
             val anchored = phaseTsProvider()
             if (anchored > 0) {
-                phaseAnchorEngaged = true
-                markerPending = true
-                log("AUDIO: 车机相位锚生效（一次性起点对齐） ts $timestamp → $anchored（此后线性累计 +$samplesPerPacket/包）")
-                timestamp = anchored
+                log("AUDIO: 车机相位锚可用（$anchored）但**不采用**——ts 按 0.1.10 有声形态零基自增（首包 ts=0）")
             }
         }
-        val gapBurst = !markerPending && lastPacketAt != 0L && now - lastPacketAt > 50
-        val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending || gapBurst)
+        // **marker 只在首包置位**（2026-11-18 回溯 0.1.10 有声版定谳）：
+        // 0.1.10 的 `sendPayload` 只有 `markerPending`（初值 true，发一次后
+        // false，**再也不置**），完全没有 gapBurst 逻辑。
+        // 我方此前每包判断「距上一包 >50ms 即重打 marker」——采集抖动时会
+        // 反复打标，接收端每见一次 marker 就当作帧不连续、重置 jitter buffer
+        // → 可能永不进入稳定排播。按有声版恢复「仅首包打标」。
+        val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
         markerPending = false
         lastPacketAt = now
         sequence = (sequence + 1) and 0xFFFF
         timestamp += samplesPerPacket
         nonceCounter++
         val client = socket ?: return false
+        // 前 5 包完整 hex 落盘（2026-11-18 诊断：与 0.1.10 算法本地重算结果
+        // 逐字节对照用——这是唯一能排除「组包/加密隐藏差异」的手段）
+        if (packetsSent < 5) {
+            log(
+                "AUDIO-PKT[$packetsSent]: seq=$sequence ts=$timestamp nonce=$nonceCounter " +
+                    "len=${wire.size} hex=" + wire.joinToString(" ") { "%02x".format(it) },
+            )
+        }
         return try {
             client.send(DatagramPacket(wire, wire.size))
             packetsSent++
@@ -710,8 +732,11 @@ class AudioSender(
             // `AudioCodecKind.LPCM -> writePcm(byteSwapS16(rtp.copyOfRange(12,...)))`
             // ——接收端逐样本换序 = **线上必为大端**。
             // 116 那次按 catplay `fill_pcm`=NATIVE_ENDIAN 改成 LE 是错读
-            // （catplay 的 ASBD 是本地面，不代表 wire；真车 111→123 全程
-            // 无声与 116 的 LE 直接相关）。改回 BE（= 0.1.10 有声形态）。
-            pcmSwapBe = 1,
+            // （catplay 的 ASBD 是本地面，不代表 wire）。改回 BE（= 0.1.10 形态）。
+            //
+            // **换序只许作用于 PCM**（0.1.10 注释记载的真车根因：对所有负载
+            // 无条件 s16 换序会把 AAC 比特流搅烂 → 车机解码器判坏帧 → 包在流
+            // 里、sampleTime 一路推进、喇叭全静音）。
+            pcmSwapBe = if (codec == AudioCodec.PCM) 1 else 0,
         ) ?: ByteArray(0)
 }
