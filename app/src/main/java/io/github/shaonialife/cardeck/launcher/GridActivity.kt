@@ -356,6 +356,7 @@ class GridActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        current = this
         setContentView(R.layout.activity_grid)
 
         // 格子尺寸/行数按屏幕动态计算（布局关系在 XML，尺寸测量在代码）
@@ -886,6 +887,7 @@ class GridActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (current === this) current = null
         tickHandler.removeCallbacks(mediaTick)
         WallpaperStore
             .removeListener(wallpaperListener)
@@ -903,7 +905,15 @@ class GridActivity : AppCompatActivity() {
 
     override fun onBackPressed() = Unit // 桌面不退出
 
-    private companion object {
+    companion object {
+        /**
+         * 车机桌面实例：VirtualLauncher.detach 释放屏前 finishAndRemoveTask——
+         * 虚拟屏不带 DESTROY_CONTENT_ON_REMOVAL 时任务会被系统 reparent 回主屏，
+         * 自有桌面不能被搬上手机。
+         */
+        @Volatile
+        var current: GridActivity? = null
+
         const val COLUMNS = 4 // CarPlay 规格：强制 4 列
 
         /** 横屏 CarPlay 规格行数（竖屏自适应时用作下限）。 */

@@ -673,10 +673,12 @@ class DualDisplayComposer(
                 }
                 // 固定应用屏（右侧卡片）：PINNED_FULLSCREEN=盖满应用区（地图不画）；
                 // SPLIT=画在地图卡下方（= 音乐卡 View 的区域），同 slide 跟手滑动。
+                // ⚠ 必须带 layoutP == SPLIT 闸（2026-11-19 竖屏实测：缺了它 FULLSCREEN
+                // 布局也会把固定卡画在下半屏、盖住全屏地图——横屏分支同款闸一直都在）
                 if (pinnedInput?.hasContent == true && layoutP != TileLayout.HIDDEN) {
                     if (layoutP == TileLayout.PINNED_FULLSCREEN) {
                         drawInput(pinnedInput!!, 0f, outWidth.toFloat(), dockH.toFloat(), outHeight.toFloat())
-                    } else if (pinnedCardVisible) {
+                    } else if (layoutP == TileLayout.SPLIT && pinnedCardVisible) {
                         val tileH = (outHeight - dockH) / 2f - CARD_MARGIN_PX * 1.5f
                         val handleEdge =
                             if (tileEdgeOverride > 0f) tileEdgeOverride else CARD_MARGIN_PX + tileH

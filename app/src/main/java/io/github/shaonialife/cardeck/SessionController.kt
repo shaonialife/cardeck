@@ -610,22 +610,26 @@ object SessionController {
             autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
             appendLog("SESSION: 手动断开——自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟（ACL 抖动不再自动拉起）")
             // 手动终态：抑制 stop 拆卸触发的 onEnded 误进保留态（见 suppressRetentionOnce
-            // 注释），并清掉可能残留的保留态/计时器（此前意外断开保了屏、用户又手动断开的
-            // 场景——destroy 照旧执行，保留态必须一起收掉，否则泄漏到下一轮）
+            // 注释——下方 enterDisplayRetention 已显式进保留态，同轮 onEnded 再触发
+            // 只会走非保留分支的空 CAS），并清掉可能残留的旧保留态/计时器（此前意外
+            // 断开保了屏、用户又手动断开的场景——旧保留态必须先收掉再重新进入）
             suppressRetentionOnce.set(true)
             cancelRetentionTimer()
             displayRetentionActive.set(false)
             retentionFailures = 0
-            // 清复原挂起标记：下方已无条件复原一次，retireSession→stop 触发的
-            // onEnded（非保留分支）再走 CAS 复原就是重复执行（2026-11-12 用户
-            // 实测「已复原 x 个应用」出现两次的根因）
+            // 复原挂起标记清零：进入保留态时本来就不复原；未进保留态（开关关）时
+            // 下方已无条件复原一次，retireSession→stop 触发的 onEnded（非保留分支）
+            // 再走 CAS 复原就是重复执行（2026-11-12 用户实测双重复原的根因）
             orientationRestorePending.set(false)
         }
-        // 熄火/出范围（AUTO_STOP，userInitiated=false）= 意外断开：进保留态保屏，
-        // 下次上车 ACL 拉起连接后复用。手动断开（userInitiated=true）始终销毁。
+        // 断开保留虚拟屏（2026-11-19 起手动断开与意外断开同语义）：屏不动进保留态，
+        // 屏上应用原样存活（页面状态分毫不动——销毁屏再 reparent 回主屏会触发
+        // Activity 重建，视频进度/导航视图回不去，2026-11-19 用户实测）；重连复用
+        // 零状态损失；N 窗超时销毁时应用挪回手机（进程活、Activity 重建一次）。
+        // 开关关 → enterDisplayRetention 返回 false → 照旧立即销毁。
         // 已在保留态（onEnded 先触发过）→ 幂等返回 true，不再重复进。
-        val keepDisplaysOnAutoStop = !userInitiated && enterDisplayRetention()
-        retireSession(keepDisplays = keepDisplaysOnAutoStop)
+        val keepDisplaysOnTeardown = enterDisplayRetention()
+        retireSession(keepDisplays = keepDisplaysOnTeardown)
         // BT 控制会话只在这里（用户终态）退役，socket close 让保活读循环立刻退出：
         // 否则它阻塞到对端超时（实测 ~24s）才结束，用户取消后英雄卡持续转圈。
         // 配对中绝不能断——DiPlay 在隧道 iAP2 就绪前看到 RFCOMM 断开即判
@@ -642,11 +646,11 @@ object SessionController {
         boundCarSsid = null
         // 「强制应用横屏」覆盖的用户终态复原（原先在 retireSession 里——那里每轮
         // 配对起步也执行，会杀掉新一轮刚拉起的应用，2026-10-23 移出到真实终态）。
-        // **仅手动断开执行**：复用重连轮次跳过了 applyAll（保屏语义），pending 未
-        // 置位——无条件执行曾让每轮断连复原两次（2026-11-12 用户实测）；AUTO_STOP
-        // /保留态不复原（覆盖要留着供重连复用）。pending 已在上方清零，同轮
-        // onEnded 的 CAS 复原落空、不会重复。
-        if (userInitiated) {
+        // **仅手动断开且未进保留态执行**：保留态的语义就是保应用状态（活应用由
+        // resetAll 的 pidof 过滤跳过；这里整体跳过更干净）；开关关（未进保留态）时
+        // 照旧全量复原（用户显式选择旧行为）。pending 已在上方清零，同轮 onEnded
+        // 的 CAS 复原落空、不会重复。
+        if (userInitiated && !keepDisplaysOnTeardown) {
             appContext?.let { ctx -> AppOrientationCompat.resetAllAsync(ctx, ::appendLog) }
         }
         // shell 兜底存下的系统网络（connect-network）自动 forget 还原：无互联网热点
@@ -818,9 +822,12 @@ object SessionController {
         // 仪表盘时走 syncDashboard(true) 的完整对账（地图/固定应用拉回、卡片尺寸、
         // 合成布局逐项恢复）
         VirtualLauncher.resetUiToDesktopForRetention()
+        // 快照入盘：CarDeck 进程被杀后屏仍存活（UserService 持有），重启按快照恢复
+        // 保留态，重连照走复用分支（2026-11-19）
+        VirtualLauncher.persistRetentionSnapshot()
         appendLog(
-            "SESSION: 意外断开——虚拟屏进入保留态（等待自动重连复用；" +
-                "${DisplayPrefs.displayRetentionRetries(ctx)} 个重试窗口未恢复则销毁）",
+            "SESSION: 断开——虚拟屏进入保留态（屏上应用原样存活；重连复用零状态损失，" +
+                "${DisplayPrefs.displayRetentionRetries(ctx)} 个重试窗口未恢复则销毁并把应用挪回手机）",
         )
         startRetentionTimer()
         return true
@@ -833,6 +840,24 @@ object SessionController {
             retentionFailures = 0
             appendLog("SESSION: 保留虚拟屏已复用——退出保留态")
         }
+        appContext?.let { VirtualLauncher.clearRetentionSnapshot(it) }
+    }
+
+    /**
+     * 启动时按磁盘快照恢复保留态（跨进程重启复用，2026-11-19）：CarDeck 被杀后
+     * UserService 仍持着屏，快照有效则恢复保留字段并重启计时器；返回 true 时调用方
+     * 必须**跳过启动残留清理**（清屏 = 复用无从谈起）与同条件的横屏复原。
+     */
+    fun tryRestoreRetentionSnapshot(context: Context): Boolean {
+        ensure(context)
+        val restored = VirtualLauncher.restoreRetentionSnapshotIfValid(context)
+        if (restored) {
+            displayRetentionActive.set(true)
+            retentionFailures = 0
+            startRetentionTimer()
+            appendLog("SESSION: 进程重启——按快照恢复保留态，等待重连复用")
+        }
+        return restored
     }
 
     private fun startRetentionTimer() {
@@ -889,7 +914,7 @@ object SessionController {
         currentSharedSecret = null
         currentAudioHost = null
         if (keepDisplays) {
-            appendLog("SESSION: 保留虚拟屏（意外断开）——跳过销毁，等待重连复用")
+            appendLog("SESSION: 保留虚拟屏（保留态）——跳过销毁，等待重连复用")
         } else {
             currentHiddenSource?.release()
         }

@@ -716,20 +716,21 @@ object VirtualLauncher {
         densityDpi: Int,
         log: (String) -> Unit,
     ): Boolean {
-        // 保留态复用判定（2026-11-10 意外断开保留虚拟屏）：屏只有在「流画布几何
-        // 完全一致」时才复用——用户改了流分辨率偏好 → 几何不一致 → 放弃复用走
-        // 正常销毁重建（保守正确：复用屏的尺寸与新 composer 输入必须逐像素匹配）
-        val reuse =
-            sessionRetained &&
-                totalWidth == retainedStreamW &&
-                totalHeight == retainedStreamH &&
-                dockDisplayId >= 0 &&
-                appDisplayId >= 0
+        // 保留态复用判定（2026-11-10；2026-11-19 放宽几何要求）：屏 id 有效即复用。
+        // 几何不一致（横竖屏切换/换车机画布不同/密度偏好变更）由下方 obtain() 逐屏
+        // resize 到新尺寸再接 surface——机制同会话中地图屏「全屏⇄分屏」：同屏
+        // configuration change 对声明了方向自适应的应用只是 onConfigurationChanged
+        // （高德/抖音不重建 Activity，视频接着放），未声明的重建一次但任务/进程不动，
+        // 不再有 reparent 回主屏的中间态。resize 失败逐屏回退新建自愈。
+        val reuse = sessionRetained && dockDisplayId >= 0 && appDisplayId >= 0
         if (reuse) {
-            // 保留期间旧 composer 仍在以 33ms 心跳合成（写向已失效的编码 surface
-            // 静默失败）：先停掉释放旧输入 surface，新 composer 建好后经
-            // svc.setDisplaySurface 把新 surface 接回旧屏（窗口期几百 ms）
-            log("LAUNCHER: 保留虚拟屏复用（几何一致 ${totalWidth}x$totalHeight）——跳过销毁重建")
+            val geomNote =
+                if (totalWidth == retainedStreamW && totalHeight == retainedStreamH) {
+                    "几何一致"
+                } else {
+                    "几何变化 ${retainedStreamW}x$retainedStreamH → ${totalWidth}x$totalHeight（逐屏 resize）"
+                }
+            log("LAUNCHER: 保留虚拟屏复用（$geomNote）——跳过销毁重建")
             runCatching { composer?.stop() }
             composer = null
         } else {
@@ -904,9 +905,33 @@ object VirtualLauncher {
                         trusted: Boolean,
                     ): Int {
                         val retainedId = retainedIds[slot]
-                        if (reuseRetained && retainedId >= 0 && svc!!.setDisplaySurface(retainedId, surface)) {
-                            log("LAUNCHER: 复用保留屏 $name#$retainedId")
-                            return retainedId
+                        if (reuseRetained && retainedId >= 0) {
+                            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                            val display = dm.getDisplay(retainedId)
+                            if (display == null) {
+                                // 屏已被系统回收：无从复用，直接新建
+                                return svc!!.createDisplay(name, w, h, dpi, surface, trusted)
+                            }
+                            val size = android.graphics.Point()
+                            display.getRealSize(size)
+                            if (size.x != w || size.y != h) {
+                                // 几何不一致：resize 到本次计算值（2026-11-19 起；机制同
+                                // 会话中地图屏「全屏⇄分屏」，横竖屏切换/换车机/改密度偏好
+                                // 都走这里，不再释放重建）
+                                if (!svc!!.resizeDisplay(retainedId, w, h, dpi)) {
+                                    log("LAUNCHER: 保留屏 $name#$retainedId resize 失败——释放重建")
+                                    runCatching { svc!!.releaseDisplay(retainedId) }
+                                    return svc!!.createDisplay(name, w, h, dpi, surface, trusted)
+                                }
+                                log("LAUNCHER: 保留屏 $name#$retainedId resize ${size.x}x${size.y} → ${w}x$h")
+                            }
+                            if (svc!!.setDisplaySurface(retainedId, surface)) {
+                                val suffix = if (size.x != w || size.y != h) "（resize 后）" else ""
+                                log("LAUNCHER: 复用保留屏 $name#$retainedId$suffix")
+                                return retainedId
+                            }
+                            log("LAUNCHER: 保留屏 $name#$retainedId 接 surface 失败——释放重建")
+                            runCatching { svc!!.releaseDisplay(retainedId) }
                         }
                         return svc!!.createDisplay(name, w, h, dpi, surface, trusted)
                     }
@@ -1252,6 +1277,75 @@ object VirtualLauncher {
         logSink?.invoke("LAUNCHER: 虚拟屏进入保留态（${streamWidthPx}x$streamHeightPx，等待重连复用）")
     }
 
+    // ---- 保留态快照持久化（2026-11-19 跨进程重启复用）----
+    // 屏由 Shizuku UserService 进程持有：CarDeck 进程死亡后屏仍存活，但保留态字段
+    // （id/几何）全在内存——持久化后重启可按快照恢复，重连照走复用分支（obtain()
+    // 的 setDisplaySurface 失败自愈路径兜底屏真被回收的情况）。
+
+    private const val SNAPSHOT_PREFS = "retention_snapshot"
+
+    /** 保留态入盘（enterDisplayRetention 成功后调用）。 */
+    fun persistRetentionSnapshot() {
+        val ctx = appContextRef ?: return
+        if (!sessionRetained || dockDisplayId < 0 || appDisplayId < 0) return
+        ctx
+            .getSharedPreferences(SNAPSHOT_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("valid", true)
+            .putLong("ts", System.currentTimeMillis())
+            .putInt("dockId", dockDisplayId)
+            .putInt("appId", appDisplayId)
+            .putInt("mapId", mapDisplayId)
+            .putInt("pinnedId", pinnedDisplayId)
+            .putInt("w", retainedStreamW)
+            .putInt("h", retainedStreamH)
+            .putString("pinnedPkg", pinnedComponent?.flattenToString())
+            .apply()
+        logSink?.invoke("LAUNCHER: 保留态快照已持久化（进程重启后也可复用）")
+    }
+
+    /** 快照失效（屏已真实销毁/复用完成）。 */
+    fun clearRetentionSnapshot(context: Context) {
+        context
+            .getSharedPreferences(SNAPSHOT_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .apply()
+    }
+
+    /**
+     * 启动时按磁盘快照恢复保留态：有效（未超时且本进程未持屏）= 恢复 id/几何并置
+     * 保留标记，attach 的复用判定（sessionRetained + 几何一致 + dock/app id≥0）随即
+     * 生效；无效清理后返回 false，调用方照走残留清理。窗口按 [DisplayPrefs]
+     * 重试窗数计算，自快照时间戳起算。
+     */
+    fun restoreRetentionSnapshotIfValid(context: Context): Boolean {
+        if (sessionRetained || dockDisplayId >= 0) return false // 本进程已持屏
+        val sp = context.getSharedPreferences(SNAPSHOT_PREFS, Context.MODE_PRIVATE)
+        if (!sp.getBoolean("valid", false)) return false
+        val windowMs = DisplayPrefs.displayRetentionRetries(context) * 60_000L
+        val age = System.currentTimeMillis() - sp.getLong("ts", 0L)
+        val dockId = sp.getInt("dockId", -1)
+        val appId = sp.getInt("appId", -1)
+        if (age < 0 || age >= windowMs || dockId < 0 || appId < 0) {
+            clearRetentionSnapshot(context)
+            return false
+        }
+        dockDisplayId = dockId
+        appDisplayId = appId
+        gridDisplayId = appId
+        appHiDisplayId = -1
+        mapDisplayId = sp.getInt("mapId", -1)
+        pinnedDisplayId = sp.getInt("pinnedId", -1)
+        retainedStreamW = sp.getInt("w", 0)
+        retainedStreamH = sp.getInt("h", 0)
+        pinnedComponent = sp.getString("pinnedPkg", null)?.let { ComponentName.unflattenFromString(it) }
+        displaysViaService = true
+        sessionRetained = true
+        logSink?.invoke("LAUNCHER: 保留态快照有效（屏存活已 ${age / 1000}s）——恢复保留态，待重连复用")
+        return true
+    }
+
     /**
      * 保留态 UI 复位到桌面（2026-11-12 用户要求）：意外断开即回桌面——重连复用后
      * 车机先看到桌面，用户点回仪表盘时经 syncDashboard(true) 的既有对账把地图/
@@ -1291,6 +1385,18 @@ object VirtualLauncher {
             }
         }
         stopDisplayWatchdog()
+        // 自有界面先于屏释放移除任务（同进程直接 finishAndRemoveTask，零 shell）。
+        // 2026-11-19 起虚拟屏不带 DESTROY_CONTENT_ON_REMOVAL——屏移除时系统会把
+        // 屏上任务 reparent 回主屏（第三方应用借此存活）；不先移除的话 CarDeck 的
+        // 桌面/dock/设置页也会被搬上手机全屏弹出。
+        runCatching {
+            GridActivity.current?.finishAndRemoveTask()
+            DockActivity.current?.finishAndRemoveTask()
+            SettingsActivity.current?.finishAndRemoveTask()
+        }
+        // 保留态快照随真实销毁一并失效（跨重启复用的磁盘凭证）。注意 appContextRef
+        // 在本方法末尾才清空，这里取到的就是它。
+        appContextRef?.let { ctx -> runCatching { clearRetentionSnapshot(ctx) } }
         if (displaysViaService) {
             val svc = CarInputClient.service
             if (svc != null) {

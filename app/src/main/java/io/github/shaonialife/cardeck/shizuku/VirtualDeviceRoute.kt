@@ -10,12 +10,11 @@ object VirtualDeviceRoute {
     /** VirtualDeviceManager / VirtualDeviceParams 自 Android 14（SDK 34）起可用。 */
     const val MIN_SDK = 34
 
-    // VirtualDisplayConfig flags（实测主值 1354 = 2+8+64+256+1024）：
+    // VirtualDisplayConfig flags（实测主值 1098 = 2+8+64+1024）：
     const val FLAG_PUBLIC = 1 // 1 << 0：公开屏——私有屏拒绝第三方 IME 窗口（2026-10-17 定谳的键盘坑）
     const val FLAG_PRESENTATION = 1 shl 1
     const val FLAG_OWN_CONTENT_ONLY = 1 shl 3
     const val FLAG_SUPPORTS_TOUCH = 1 shl 6
-    const val FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
     const val FLAG_TRUSTED = 1 shl 10
 
     /**
@@ -34,15 +33,22 @@ object VirtualDeviceRoute {
 
     /**
      * 受信屏的 flags 候选（逐级尝试，全部失败落 legacy DisplayManager 路径）：
-     * ① 1354|PUBLIC：参考原值 + 公开化——VDM 屏默认私有，键盘窗口会被 WMS 访问闸拒绝；
-     * ② 1354：参考实现原值（ROM 拒绝 PUBLIC 时）。
+     * ① 1098|PUBLIC：公开化——VDM 屏默认私有，键盘窗口会被 WMS 访问闸拒绝；
+     * ② 1098：ROM 拒绝 PUBLIC 时的降级。
+     *
+     * **不带 DESTROY_CONTENT_ON_REMOVAL（1<<8，2026-11-19 移除）**：该 flag 的语义是
+     * 「屏移除时销毁内容」；**不带**它时系统在屏移除时会把屏上任务 reparent 回主屏
+     * （display 0）——断开会话后第三方应用（导航等）随任务迁移继续存活、页面状态
+     * 保留（原 flag 下应用跟着屏一起死，2026-11-19 用户实测痛点）。配套：自有
+     * 启动器界面（Grid/Dock/Settings）在释放屏前由 detach 主动 finishAndRemoveTask，
+     * 否则会被一起搬上手机。
      */
     val trustedFlagCandidates: List<Int> =
         listOf(
             FLAG_PUBLIC or FLAG_PRESENTATION or FLAG_OWN_CONTENT_ONLY or
-                FLAG_SUPPORTS_TOUCH or FLAG_DESTROY_CONTENT_ON_REMOVAL or FLAG_TRUSTED,
+                FLAG_SUPPORTS_TOUCH or FLAG_TRUSTED,
             FLAG_PRESENTATION or FLAG_OWN_CONTENT_ONLY or
-                FLAG_SUPPORTS_TOUCH or FLAG_DESTROY_CONTENT_ON_REMOVAL or FLAG_TRUSTED,
+                FLAG_SUPPORTS_TOUCH or FLAG_TRUSTED,
         )
 
     /**
@@ -56,10 +62,9 @@ object VirtualDeviceRoute {
      */
     val dockFlagCandidates: List<Int> =
         listOf(
+            FLAG_PRESENTATION or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or FLAG_TRUSTED,
             FLAG_PRESENTATION or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or
-                FLAG_DESTROY_CONTENT_ON_REMOVAL or FLAG_TRUSTED,
-            FLAG_PRESENTATION or FLAG_OWN_CONTENT_ONLY or FLAG_SUPPORTS_TOUCH or
-                FLAG_DESTROY_CONTENT_ON_REMOVAL or FLAG_OWN_DISPLAY_GROUP or FLAG_ALWAYS_UNLOCKED,
+                FLAG_OWN_DISPLAY_GROUP or FLAG_ALWAYS_UNLOCKED,
         )
 
     /**

@@ -27,6 +27,12 @@ import io.github.shaonialife.cardeck.util.Bg
  * 形态由 dock 虚拟屏自身宽高决定（竖条 height>width；横条 width>height），与车机方向自动对齐。
  */
 class DockActivity : AppCompatActivity() {
+    companion object {
+        /** dock 实例（VirtualLauncher.detach 释放屏前 finishAndRemoveTask——防任务被搬上手机）。 */
+        @Volatile
+        var current: DockActivity? = null
+    }
+
     private var appsContainer: LinearLayout? = null
     private var clockView: TextView? = null
     private var batteryText: TextView? = null
@@ -88,6 +94,7 @@ class DockActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        current = this
         val dm = resources.displayMetrics
         barForm = dm.widthPixels > dm.heightPixels
         setContentView(if (barForm) R.layout.activity_dock_bar else R.layout.activity_dock_sidebar)
@@ -135,6 +142,7 @@ class DockActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (current === this) current = null
         VirtualLauncher.removeRunningAppsListener(refreshListener)
         pollHandler.removeCallbacksAndMessages(null)
         clockHandler.removeCallbacks(clockTicker)

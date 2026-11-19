@@ -576,3 +576,40 @@
   已退出的应用照常复原（顺手清系统侧防卸载残留）。三个复原入口（disconnect 手动
   / onEnded 非保留 / 启动残留清理）都走 resetAll 单点，gate 加在 resetAll 内
   一处生效。副作用：桌面面板「已开启横屏」状态小字不再断言「会话期间生效」。
+- **虚拟屏去掉 DESTROY_CONTENT_ON_REMOVAL（2026-11-19）**：该 flag 语义=「屏移除时
+  销毁内容」——手动断开释放屏的瞬间，屏上第三方任务全部销毁、无常驻服务的进程随即
+  被系统回收（「断开后保留应用横屏」的 pidof 查到的已是尸体，功能对屏上应用形同
+  虚设）。移除后（AOSP 语义）系统把屏上任务 **reparent 回主屏 display 0**：应用
+  存活、页面状态保留（Activity 按新屏配置重建一次，进程/导航引擎不中断）。配套与
+  注意：① 自有启动器界面（Grid/Dock/Settings）会在释放屏前被 detach 主动
+  finishAndRemoveTask（否则 CarDeck 桌面会被搬上手机全屏弹出）——三者各持
+  `current` 静态引用（注意 GridActivity/SettingsActivity 原有 private companion
+  要改为非私有后合并）；② reparent 后只有栈顶一个任务成为手机前台，其余进后台/
+  最近任务（不会「弹多个应用」）；③ 该 flag 只在屏移除时起作用，会话内零影响；
+  ④ 意外断开保留虚拟屏（不释放屏）不受影响；保留期超时销毁时第三方应用也从
+  「死亡」变「挪回手机」。flags 候选 1355/1354 → **1099/1098**（VirtualDeviceRouteTest
+  钉死 + 防回归断言不含 1<<8）；legacy 路径本来就没带这个 flag。
+- **几何变化的复用 = 逐屏 resize，不再重建（2026-11-19）**：复用判定放宽为「屏 id
+  有效即复用」，attach 头的流画布逐像素比对删除；`obtain()` 里保留屏实际分辨率
+  （Display.getRealSize）≠ 本次计算值时先 `svc.resizeDisplay(id, w, h, dpi)` 再接
+  surface（机制同会话中地图屏全屏⇄分屏），resize/接 surface 失败才逐屏回退新建。
+  横竖屏切换/换车机画布不同/保留期间改密度基准与 dock 宽度，全都走 resize：
+  声明了方向自适应的应用（高德/抖音）只收 onConfigurationChanged **不重建
+  Activity**（视频接着放），未声明的重建一次但任务/进程不动——优于 reparent
+  路径（reparent 必重建）。虚拟屏属于手机不属于接收端：两台车机画布相同则跨
+  设备复用照常成立。回退（应用侧 VirtualDisplay）路径未做 resize，几何变化仍走
+  setSurface（拉伸）或旧屏失效重建，罕见形态不追。
+- **竖屏两 bug（2026-11-19 DiPlay 红米旋转实测）**：① **TouchRouter 竖屏应用分支
+  漏乘 activeAppScale**——应用屏密度=手机侧（2026-11-06）后横屏分支补了倍率、竖屏
+  dockAtBottom 分支漏了（`localX=px` 直接注画布坐标），车机触摸全落在 ~1/scale 的
+  左上区域：点图标无反应/误翻页。历史原因：竖屏支持早于密度改造，当时 scale=1 是
+  对的；横屏补倍率时竖屏没人测。地图/固定卡竖屏分支一直有乘（mapScale/pinnedScale）。
+  ② **composer 竖屏分支固定卡绘制缺 SPLIT 闸**——`else if (pinnedCardVisible)` 没
+  限定布局，FULLSCREEN 时固定卡画在下半屏盖住全屏地图（横屏分支的
+  `layout == SPLIT &&` 闸一直都在）。取证方法：adb `input -d <displayId> tap` 直注
+  应用屏绕过 TouchRouter——直注正常 = 坐标换算层有问题（应用屏 id 用 dumpsys
+  display 查，坐标按截图 app 区占比 × 屏 px 换算）。
+- **VDM 屏 flags 仍带 DESTROY_CONTENT_ON_REMOVAL（2026-11-19 待查）**：候选已删但
+  dumpsys 仍见该 flag——疑似 VDM 对虚拟设备屏强制补挂（同屏还自动补了
+  ALWAYS_UNLOCKED）。注意：DESTROY 在屏释放时的实际行为（销毁 vs reparent）与此
+  flag 的关系在本 ROM 上未定谳——断开保留/reparent 存活已实测成立，别急着下结论。

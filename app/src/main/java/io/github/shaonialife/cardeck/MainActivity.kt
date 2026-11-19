@@ -2174,27 +2174,35 @@ class MainActivity : AppCompatActivity() {
             if (startupCheck) {
                 var residual = carDisplays.filter { it.first !in currentSessionDisplayIds() }
                 if (residual.isNotEmpty()) {
-                    log(
-                        "SHELL: 启动检测到 ${residual.size} 个残留虚拟屏: " +
-                            residual.joinToString(", ") { "${it.second}(${it.first})" },
-                    )
-                    // 残留屏 = 上次会话异常退出（进程被杀）：横屏覆盖的会话末复原
-                    // 也没执行——一并清理，避免应用在手机侧残留横屏状态
-                    runCatching {
-                        val reset =
-                            AppOrientationCompat
-                                .resetAll(applicationContext)
-                        if (reset > 0) log("ORIENTATION: 残留会话的横屏覆盖已复原 $reset 个")
-                    }
-                    // 先自动清理一轮（含旧版本 UserService 进程回收——其持有的屏跨进程
-                    // 无法 release，只有进程回收能释放；重装 APK 后 Shizuku 按版本复用的
-                    // 旧进程正是「点清理释放 0/N」的根因，2026-10-16）。清不掉的再问用户。
-                    val released = releaseDisplays(residual.map { it.first })
-                    log("SHELL: 启动残留自动清理（释放 $released/${residual.size}）")
-                    if (released > 0) {
-                        residual =
-                            parseCarPlayDisplays(sh("dumpsys display"))
-                                .filter { it.first !in currentSessionDisplayIds() }
+                    // 保留态快照（2026-11-19）：跨进程重启的保留屏先按快照恢复——
+                    // 屏是要复用的，不能走残留清理（清屏 = 复用无从谈起）；横屏复原
+                    // 一并跳过（「残留清理与复原同条件触发」的反向应用）
+                    if (SessionController.tryRestoreRetentionSnapshot(applicationContext)) {
+                        log("SHELL: 保留虚拟屏快照有效——跳过残留清理，等待重连复用")
+                        residual = emptyList()
+                    } else {
+                        log(
+                            "SHELL: 启动检测到 ${residual.size} 个残留虚拟屏: " +
+                                residual.joinToString(", ") { "${it.second}(${it.first})" },
+                        )
+                        // 残留屏 = 上次会话异常退出（进程被杀）：横屏覆盖的会话末复原
+                        // 也没执行——一并清理，避免应用在手机侧残留横屏状态
+                        runCatching {
+                            val reset =
+                                AppOrientationCompat
+                                    .resetAll(applicationContext)
+                            if (reset > 0) log("ORIENTATION: 残留会话的横屏覆盖已复原 $reset 个")
+                        }
+                        // 先自动清理一轮（含旧版本 UserService 进程回收——其持有的屏跨进程
+                        // 无法 release，只有进程回收能释放；重装 APK 后 Shizuku 按版本复用的
+                        // 旧进程正是「点清理释放 0/N」的根因，2026-10-16）。清不掉的再问用户。
+                        val released = releaseDisplays(residual.map { it.first })
+                        log("SHELL: 启动残留自动清理（释放 $released/${residual.size}）")
+                        if (released > 0) {
+                            residual =
+                                parseCarPlayDisplays(sh("dumpsys display"))
+                                    .filter { it.first !in currentSessionDisplayIds() }
+                        }
                     }
                 }
                 runOnUiThread {

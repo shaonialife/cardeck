@@ -27,7 +27,7 @@ plugins {
 //    已装用户可直接覆盖升级。
 //  - CI（`.github/workflows/android-ci.yml`）传 `-Pcardeck.buildNumber=<run_number>`
 //    时，构建号**顶替第 4 位**（0.1.28.57），无需往仓库写提交。
-val appVersionName = "0.1.28.170"
+val appVersionName = "0.1.28.171"
 val versionParts =
     appVersionName.split(".").map { part ->
         part.toIntOrNull() ?: error("appVersionName 必须是数字点分（收到 \"$part\"）")

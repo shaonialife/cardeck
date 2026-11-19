@@ -293,8 +293,17 @@ object TouchRouter {
             }
             if (!routedToMap && !routedToPinned) {
                 targetDisplay = if (inDock) launcher.dockDisplayId else launcher.appDisplayId
-                localX = px
-                localY = if (inDock) py - appH else py
+                if (inDock) {
+                    localX = px
+                    localY = py - appH
+                } else {
+                    // ⚠️ 必须乘 activeAppScale（应用屏密度=手机侧后屏 px > 画布 app 区 px，
+                    // 横屏分支同款倍率）——漏乘则车机触摸全部落在 ~1/scale 的左上区域
+                    // （2026-11-19 竖屏 DiPlay 实测：点图标无反应/误翻页）
+                    val scale = launcher.activeAppScale().coerceAtLeast(1f)
+                    localX = (px * scale).toInt()
+                    localY = (py * scale).toInt()
+                }
             }
         } else {
             inDock = px < dockW

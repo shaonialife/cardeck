@@ -11,10 +11,15 @@ class VirtualDeviceRouteTest {
     fun `trusted candidates carry reference flags plus public fallback`() {
         val candidates = VirtualDeviceRoute.trustedFlagCandidates
         assertEquals(2, candidates.size)
-        // 参考实现原值 1354 = PRESENTATION|OWN_CONTENT_ONLY|SUPPORTS_TOUCH|DESTROY|TRUSTED
-        assertEquals(1354, candidates[1])
+        // 主值 1098 = PRESENTATION|OWN_CONTENT_ONLY|SUPPORTS_TOUCH|TRUSTED
+        // （原参考值 1354 含 DESTROY_CONTENT_ON_REMOVAL=1<<8，2026-11-19 移除——
+        // 屏移除时任务要 reparent 回主屏保应用存活，不能销毁内容）
+        assertEquals(1098, candidates[1])
         // 首选多带 PUBLIC（私有屏拒绝第三方 IME 窗口——2026-10-17 定谳的键盘坑）
-        assertEquals(1354 or VirtualDeviceRoute.FLAG_PUBLIC, candidates[0])
+        assertEquals(1098 or VirtualDeviceRoute.FLAG_PUBLIC, candidates[0])
+        // 1098 各位都不含 256（DESTROY 位）——防回归
+        assertEquals(0, candidates[1] and 256)
+        assertEquals(0, candidates[0] and 256)
     }
 
     @Test

@@ -167,10 +167,11 @@ class MiscPanelFragment : SettingsPanelFragment() {
             retriesValue.alpha = if (enabled) 1f else 0.35f
             retentionNote.text =
                 if (enabled) {
-                    "意外断开（车机拆链/WiFi 断/熄火）后保留虚拟屏与运行中的应用，自动重连成功即恢复；" +
-                        "每 60s 一个重试窗口，连续 N 窗未恢复则销毁。手动断开始终立即销毁。"
+                    "任何断开（手动/意外）后保留虚拟屏，屏上应用原样存活、页面状态分毫不动；" +
+                        "重连成功即恢复原样。每 60s 一个重试窗口，连续 N 窗未恢复则销毁" +
+                        "（屏上应用自动挪回手机继续运行）。重装 CarDeck 后重进也能按快照复用。"
                 } else {
-                    "已关闭：任何断开（含意外断开）都立即销毁虚拟屏，重连后全新重建。"
+                    "已关闭：任何断开都立即销毁虚拟屏（屏上应用退出），重连后全新重建。"
                 }
         }
 
@@ -186,7 +187,7 @@ class MiscPanelFragment : SettingsPanelFragment() {
             refreshKeepDisplays(enabled)
             hostToast(
                 if (enabled) {
-                    "已开启：意外断开保留虚拟屏（手动断开仍立即销毁）"
+                    "已开启：断开后保留虚拟屏与应用，重连原样恢复"
                 } else {
                     "已关闭：断开立即销毁虚拟屏"
                 },
@@ -270,10 +271,12 @@ class MiscPanelFragment : SettingsPanelFragment() {
             keepOriOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
             keepOriNote.text =
                 if (enabled) {
-                    "断开会话时，仍在运行的应用（如导航）不撤销横屏覆盖、不重启应用，页面状态得以保留；" +
-                        "已退出的应用照常复原。在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
+                    "断开会话时，屏上应用（如导航）会自动挪回手机继续运行——不退出、页面状态保留，" +
+                        "名单内应用不撤销横屏覆盖、不重启；已退出的应用照常复原。" +
+                        "在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
                 } else {
-                    "已关闭：断开会话时复原所有应用的横屏覆盖（仍在运行的应用会被重启，未保存的页面状态会丢失）。"
+                    "已关闭：断开时撤销名单内所有应用的横屏覆盖（仍在运行的会被重启）；" +
+                        "应用本身仍会挪回手机继续运行。"
                 }
         }
 

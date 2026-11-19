@@ -356,7 +356,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="意外断开（车机拆链/WiFi 断/熄火）后保留虚拟屏与运行中的应用，自动重连成功即恢复；每 60s 一个重试窗口，连续 N 窗未恢复则销毁。手动断开始终立即销毁。"
+            android:text="任何断开（手动/意外）后保留虚拟屏，屏上应用原样存活、页面状态分毫不动；重连成功即恢复原样。每 60s 一个重试窗口，连续 N 窗未恢复则销毁（屏上应用自动挪回手机继续运行）。重装 CarDeck 后重进也能按快照复用。"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 
@@ -413,7 +413,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:text="断开会话时，仍在运行的应用（如导航）不撤销横屏覆盖、不重启应用，页面状态得以保留；已退出的应用照常复原。在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
+            android:text="断开会话时，屏上应用（如导航）会自动挪回手机继续运行——不退出、页面状态保留，名单内应用不撤销横屏覆盖、不重启；已退出的应用照常复原。在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 

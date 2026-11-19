@@ -53,6 +53,7 @@ class SettingsActivity :
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        current = this
         val cfg = resources.configuration
         isWide = cfg.screenWidthDp >= WIDE_MIN_WIDTH_DP && cfg.screenHeightDp >= WIDE_MIN_HEIGHT_DP
         if (savedInstanceState != null) {
@@ -71,6 +72,11 @@ class SettingsActivity :
         // 旋转重建保持形态与详情态（面板无状态，重建即恢复）
         outState.putBoolean(KEY_WIDE, isWide)
         if (!isWide) outState.putInt(KEY_MENU, currentMenu)
+    }
+
+    override fun onDestroy() {
+        if (current === this) current = null
+        super.onDestroy()
     }
 
     // ---- wide：车机横屏双栏 ----
@@ -256,7 +262,15 @@ class SettingsActivity :
             }.start()
     }
 
-    private companion object {
+    companion object {
+        /**
+         * 车机设置实例：VirtualLauncher.detach 释放屏前 finishAndRemoveTask——
+         * 虚拟屏不带 DESTROY_CONTENT_ON_REMOVAL 时任务会被系统 reparent 回主屏，
+         * 自有设置页不能被搬上手机。
+         */
+        @Volatile
+        var current: SettingsActivity? = null
+
         /** 双栏形态的最小屏（dp）：宽 ≥600 且高 ≥400（车机应用屏 ≈767×430 命中）。 */
         const val WIDE_MIN_WIDTH_DP = 600
 
