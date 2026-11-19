@@ -2004,6 +2004,11 @@ object SessionController {
                     phaseTsProvider = { client.audioPhaseTs(audio.sampleRate) },
                 )
             audioSender = sender
+            // 重传请求接线（2026-11-19 挂账#1 落码）：控制口收到车机 8B
+            // 重传请求（fw: retransmitsSendRequest @0x245521698 组包直切）
+            // → 缓存窗口查原包原样重发（R14.3：重传包走同一 processPacket）。
+            // audioSender 字段读取 = 收发生命周期解耦（sender stop 后 no-op）。
+            client.onRetransmitRequest = { seq -> audioSender?.resend(seq) }
             // 6011 监听探针（2026-11-12 真车诊断：controlPort 语义 = 手机 RTCP
             // 收包口——绑上等车机发，替代旧「发同步包到 car:6011」死方向）
             if (audio.controlPort > 0) {

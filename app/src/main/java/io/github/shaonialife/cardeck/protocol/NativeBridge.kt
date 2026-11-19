@@ -667,6 +667,12 @@ object NativeBridge {
         epochNtpSecs: Int,
     ): ByteArray?
 
+    /** 控制口入站包重传请求解析（A2 下沉——fw: retransmitsSendRequest
+     *  组包 @0x245521698-718 + demux @0x245527fa8 直切：wire = 8B
+     *  `80 D5|D6 00 01 [seq BE16] 00 01`）。返回请求的 seq；**-1 = 非请求**
+     *  （普通 RTCP/其它包）。纯函数。 */
+    external fun nativeAirplayParseRetransmitRequest(packet: ByteArray?): Int
+
     /** HID 报告分派（A6 下沉——fw::airplay::hid 判定树：media → nav →
      *  consumer-release → touch → other，描述符驱动；fw:
      *  APHIDClientHandleHIDReport @0x2276b7e4c 报告格式由 hidDescriptor

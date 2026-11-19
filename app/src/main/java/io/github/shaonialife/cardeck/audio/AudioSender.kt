@@ -89,6 +89,10 @@ class AudioSender(
         /** 同步包发送间隔（规范：每秒一个）。 */
         const val SYNC_INTERVAL_MILLIS = 1_000L
 
+        /** 重传缓存窗口（包数）——fw: 接收端 seq 9-bit 环绕窗口
+         *  @0x24552112c 对齐，超出窗口的请求必然 miss（PLC 兜底）。 */
+        const val RESEND_CACHE_SIZE = 512
+
         private const val READ_TIMEOUT_QUIET_MILLIS = 500L
 
         /** 静音前媒体音量的持久化键（进程被杀也不丢恢复目标）。 */
@@ -118,6 +122,18 @@ class AudioSender(
     private var record: AudioRecord? = null
     private var thread: Thread? = null
     private var syncThread: Thread? = null
+
+    // ---- 重传响应（2026-11-19 落码，挂账 #1）----
+    // fw: 车机丢包 → RTCP 通道发 8B 重传请求 `80 D5|D6 00 01 [seq BE16] 00 01`
+    // （AirPlayReceiver retransmitsSendRequest @0x245521698-718 组包直切，
+    // 发往我方 SETUP 声明的 controlPort）；重传包走接收端同一 processPacket
+    // 路径（R14.3）⇒ **缓存包原样重发**（原 seq/ts 不改，不重新封包）。
+    // 缓存窗口 = 512 包（fw: 接收端 9-bit 环绕窗口 @0x24552112c 对齐）。
+    private val resendCache = arrayOfNulls<ByteArray>(RESEND_CACHE_SIZE)
+
+    private var retransmitHits = 0
+
+    private var retransmitMisses = 0
 
     /**
      * 采集诊断发现全零时的嫌疑回调（宿主侧核「确有应用在播」后再断开蓝牙音频
@@ -370,6 +386,10 @@ class AudioSender(
     ): Boolean {
         if (running.get()) return true
         stopped.set(false)
+        // 重传缓存/计数复位（新会话旧包无意义）
+        resendCache.fill(null)
+        retransmitHits = 0
+        retransmitMisses = 0
         return try {
             val client = DatagramSocket()
             client.connect(InetAddress.getByName(host), dataPort)
@@ -466,6 +486,7 @@ class AudioSender(
         syncSocket = null
         syncThread = null
         thread = null
+        resendCache.fill(null)
         if (!wasSubmix) restorePhoneMedia()
         // 宿主收口（submix 模式释放 UserService 侧 AudioRecord，媒体路由随之恢复）；
         // 即使回调丢失，泵线程检测到读端关闭也会自愈
@@ -735,6 +756,8 @@ class AudioSender(
         val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
         markerPending = false
         lastPacketAt = now
+        // 重传缓存入窗（键 = 本包 seq；[resend] 原样重发）
+        resendCache[sequence] = wire
         sequence = (sequence + 1) and 0xFFFF
         timestamp += samplesPerPacket
         nonceCounter++
@@ -755,6 +778,37 @@ class AudioSender(
         } catch (error: IOException) {
             log("AUDIO: UDP 发送失败 - ${error.message}")
             false
+        }
+    }
+
+    /** 车机重传请求响应：缓存窗口查原包 → **原样重发**（fw: 接收端重传包
+     *  走同一 processPacket 路径 R14.3——原 seq/ts 不改、不重新封包）。
+     *  窗口外 miss 只记账（fw 接收端对「要不到的包」有 PLC 兜底渐弱帧，
+     *  R13.3——不发占位包，那不是固件形）。 */
+    fun resend(seq: Int) {
+        val wire = resendCache[seq and 0xFFFF]
+        if (wire == null) {
+            retransmitMisses++
+            if (retransmitMisses == 1 || retransmitMisses % 50 == 0) {
+                log(
+                    "AUDIO: 重传请求 seq=$seq 窗口外 miss（累计 miss=$retransmitMisses " +
+                        "hit=$retransmitHits）——PLC 兜底",
+                )
+            }
+            return
+        }
+        val client = socket ?: return
+        retransmitHits++
+        try {
+            client.send(DatagramPacket(wire, wire.size))
+            if (retransmitHits == 1 || retransmitHits % 20 == 0) {
+                log(
+                    "AUDIO: 重传响应 seq=$seq（${wire.size}B 原包重发，累计 " +
+                        "hit=$retransmitHits miss=$retransmitMisses）",
+                )
+            }
+        } catch (error: IOException) {
+            log("AUDIO: 重传发送失败 seq=$seq - ${error.message}")
         }
     }
 

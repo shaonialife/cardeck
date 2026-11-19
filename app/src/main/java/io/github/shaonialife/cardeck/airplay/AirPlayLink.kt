@@ -74,6 +74,14 @@ class AirPlayLink(
     @Volatile
     var onAudioControlPacket: ((count: Int, bytes: Int, from: String) -> Unit)? = null
 
+    /** 车机重传请求回调（0xD5/0xD6 8B mini-RTP，wire 格式 fw 直切：
+     *  retransmitsSendRequest @0x245521698-718 + demux @0x245527fa8；
+     *  经 [NativeBridge.nativeAirplayParseRetransmitRequest] 解析）。
+     *  SessionController 接 AudioSender.resend（原包原样重发——fw:
+     *  接收端重传包走同一 processPacket 路径 R14.3）。 */
+    @Volatile
+    var onRetransmitRequest: ((seq: Int) -> Unit)? = null
+
     /**
      * 最近一次成功连上接收端时使用的地址（字符串形式，IPv6 链路本地地址带 `%<iface>`）。
      *
@@ -769,15 +777,23 @@ class AirPlayLink(
                         val p = java.net.DatagramPacket(buf, buf.size)
                         s.receive(p)
                         n++
-                        // **前 10 包全量 hex dump**（2026-11-18）：车机发来的
-                        // RTCP 包里有 0xD6 重传请求——其线上格式固件侧未直切到
-                        // （S5.2 R14 残叶），抓一次真实字节即可反推。此前只报
-                        // "n/bytes/from" 三个数，字节内容全丢。前 10 包全打 +
-                        // 之后每 50 包打一次（保住首包形态差异，又不刷屏）。
+                        val payload = p.data.copyOfRange(0, p.length)
+                        // 重传请求解析（2026-11-19 落码：wire 格式固件直切，
+                        // 8B `80 D5|D6 00 01 [seq BE16] 00 01`——旧「格式未
+                        // 知只 dump」诊断位退役为兜底）。非请求包 -1。
+                        val requestSeq =
+                            runCatching {
+                                NativeBridge.nativeAirplayParseRetransmitRequest(payload)
+                            }.getOrDefault(-1)
+                        if (requestSeq >= 0) {
+                            onRetransmitRequest?.invoke(requestSeq)
+                        }
+                        // 前 10 包 hex dump 保留（兜底诊断：真车若发未知类型
+                        // RTCP 包，首见字节仍在案；之后每 50 包一次防刷屏）。
                         if (n <= 10 || n % 50 == 0) {
                             val hex =
-                                p.data
-                                    .copyOfRange(0, minOf(p.length, 64))
+                                payload
+                                    .copyOfRange(0, minOf(payload.size, 64))
                                     .joinToString(" ") { "%02x".format(it) }
                             onAudioControlPacket?.invoke(
                                 n,
@@ -963,9 +979,35 @@ class AirPlayLink(
         val result = NativeBridge.nativeAirplayRequestCarUi(controlSessionHandle)
         val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
         if (!sent) log("EVENT: requestUI 发送失败(rust) - $result")
-        // 控制通道命令：出站即写网（主 RTSP 连接；rtspWriteLock 防与泵并发）
-        socket?.let { drainRustOutbound(controlSessionHandle, it.getOutputStream()) }
-        log("AIRPLAY: requestUI（请求车机 UI）[控制通道] ok=$sent")
+        // 控制通道命令：出站即写网（主 RTSP 连接；rtspWriteLock 防与泵并发）。
+        //
+        // **2026-11-19 回退说明**：上一版曾改走 `pumpEventOutbound()`（事件通道），
+        // 依据是 catplay 实现 + 对固件 `TransportControlStream` 的误读——实际
+        // 那是一条 `APTransportConnectionUDPCreate` 建的 UDP 流，不是 eventPort。
+        // 且用户实测「iPhone 连 DiPlay 后点 OEM 图标能返回桌面」，DiPlay 的
+        // `handle()` 挂在 control I/O 上处理 `POST /command` ⇒ **控制通道是对的**。
+        //
+        // **诊断（本轮）**：真车点击后车机不切界面，需区分「没入队」「入队了
+        // 没写出」「写出去了车机不理」——记录实际 drain 的字节数。
+        val out = NativeBridge.nativeAirplayTakeOutbound(controlSessionHandle)
+        val n = out?.size ?: 0
+        if (out != null && n > 0) {
+            // 判形：dump 前 96 字节——若是 `ff 5a`（iAP2 链路帧）说明取错了池子；
+            // 若是 `POST /command` 说明是 RTSP 请求。
+            log(
+                "AIRPLAY: requestUI drain hex=" +
+                    out.take(96).joinToString(" ") { "%02x".format(it) },
+            )
+            synchronized(rtspWriteLock) {
+                runCatching {
+                    socket?.getOutputStream()?.apply {
+                        write(out)
+                        flush()
+                    }
+                }.onFailure { log("AIRPLAY: requestUI 写网失败 - ${it.message}") }
+            }
+        }
+        log("AIRPLAY: requestUI（请求车机 UI）[控制通道] ok=$sent drained=${n}B")
         return sent
     }
 
@@ -986,10 +1028,14 @@ class AirPlayLink(
                 .setOemBlock(null)
             return
         }
+        // 图标选**最大一档**：真车 Audi /info 给三档（104/156/256），
+        // DiPlay 台架只给一档（192）。旧码固定取 [0] = 最小档，桌面放大后糊
+        // （2026-11-19 真车补齐 OEM 域时发现）。
+        val icons = json.optJSONArray("oemIcons")
         val icon =
-            json
-                .optJSONArray("oemIcons")
-                ?.optJSONObject(0)
+            (0 until (icons?.length() ?: 0))
+                .mapNotNull { icons!!.optJSONObject(it) }
+                .maxByOrNull { it.optInt("widthPixels", 0) }
                 ?.optString("imageDataBase64", "")
                 ?.takeIf { it.isNotEmpty() }
                 ?.let { b64 ->
