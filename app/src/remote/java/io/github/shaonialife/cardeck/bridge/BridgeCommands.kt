@@ -26,8 +26,16 @@ object BridgeCommands {
 
             "get_state" ->
                 JSONObject()
-                    .put("ok", true)
-                    .put("detail", SessionController.statusLine() + " 会话=${if (SessionController.isSessionRunning()) "运行中" else "停止"}")
+                    .put(
+                        "ok",
+                        true,
+                    ).put(
+                        "detail",
+                        // statusLine 已随 0.1.28.114 死成员清扫删除（remote 不在
+                        // pre-commit lint 范围漏网）——改用英雄卡副标题同源的阶段提示
+                        (SessionController.phaseHint ?: "无阶段提示") +
+                            " 会话=${if (SessionController.isSessionRunning()) "运行中" else "停止"}",
+                    )
 
             "start_connection" -> {
                 // 与手机上点「启动连接」等价：前置（Shizuku/蓝牙）不满足时日志会说明

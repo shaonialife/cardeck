@@ -143,3 +143,11 @@
   另：监听器断开/销毁时必须 `MediaSessionsState.publish(null)`，否则卡片会保留旧歌名，
   出现「正在播放 + 未在播放」这类自相矛盾的残留状态（布局静态小标题也不能写死
   「正在播放」，已改为中性的「媒体」）。
+- **remote 变体不在 pre-commit lint 范围（2026-11-19 实锤）**：钩子只跑
+  lintStandardDebug，main 源码的 API 重构（哪怕只是删一个死成员，如 0.1.28.114 清扫
+  `SessionController.statusLine`）会**静默弄坏 remote 编译**——`compileRemoteDebugKotlin`
+  只在下一次手动构建 remote 时才炸。防复发的排查顺序：`./gradlew assembleRemoteDebug`
+  看第一条 `e:`；remote 源（app/src/remote/）引用面极窄（SessionController 公开 API +
+  BridgeOverlay），改 main 公共 API 时 `grep -rn "SessionController\." app/src/remote`
+  过一遍即可。0.1.28.171 修复：BridgeCommands.get_state 改用 `phaseHint`（英雄卡
+  副标题同源）。

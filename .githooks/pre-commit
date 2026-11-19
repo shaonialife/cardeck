@@ -58,4 +58,21 @@ if printf '%s\n' "$STAGED" | grep -qE '^(app/src/|[^ ]*\.gradle\.kts$|gradle\.pr
     fi
 fi
 
+# 3) remote 变体编译门禁：remote 源不在 lintStandardDebug 覆盖内，main 公共 API
+#    重构会静默弄坏 remote 编译（2026-11-19 实锤：0.1.28.114 删 statusLine，
+#    compileRemoteDebugKotlin 炸到下一次手动构建 remote 才发现）。仅当暂存了
+#    Kotlin 源时执行——增量编译秒级。
+if printf '%s\n' "$STAGED" | grep -qE '\.kt$'; then
+    echo "▶ 提交前检查：remote 变体编译（compileRemoteDebugKotlin）..."
+    if ./gradlew --console=plain -q :app:compileRemoteDebugKotlin; then
+        echo "✓ remote 编译通过"
+    else
+        echo ""
+        echo "✗ remote 变体编译失败，本次提交已被拦截。"
+        echo "  main 公共 API 变更需同步 app/src/remote/（引用面极窄：SessionController"
+        echo "  公开 API + BridgeOverlay，grep 一遍即知断点）。"
+        exit 1
+    fi
+fi
+
 exit 0
