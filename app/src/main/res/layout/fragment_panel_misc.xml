@@ -360,6 +360,62 @@
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 
+        <!-- 断开后保留活动应用横屏（2026-11-19）：teardown 复原跳过活进程，
+             避免 am compat disable 杀掉正在导航的应用 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="断开后保留应用横屏"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_segment"
+            android:orientation="horizontal"
+            android:padding="3dp">
+
+            <TextView
+                android:id="@+id/btnKeepOriOn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_segment_sel"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="开"
+                android:textColor="#FFFFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnKeepOriOff"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="2dp"
+                android:background="@drawable/bg_segment"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="关"
+                android:textColor="#FF8E8E93"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/keepOriNote"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="断开会话时，仍在运行的应用（如导航）不撤销横屏覆盖、不重启应用，页面状态得以保留；已退出的应用照常复原。在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
 
     </LinearLayout>
 </ScrollView>

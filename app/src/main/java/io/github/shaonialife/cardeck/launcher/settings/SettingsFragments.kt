@@ -297,7 +297,8 @@ class DesktopPanelFragment : SettingsPanelFragment() {
 
         /**
          * 横屏勾选框 + 系统侧状态小字。三种状态：
-         *   勾选开 + 系统开 → 灰字「已开启横屏（会话期间生效）」（正常）
+         *   勾选开 + 系统开 → 灰字「已开启横屏」（正常；断开后是否保留取决于
+         *                     杂项设置「断开后保留应用横屏」——不写死「会话期间」）
          *   勾选关 + 系统开 → 红字高亮「系统残留：横屏仍在生效，点击清除」（异常，可点清除）
          *   其它            → 隐藏（勾选框本身已表达偏好，不制造噪音）
          */
@@ -308,7 +309,7 @@ class DesktopPanelFragment : SettingsPanelFragment() {
             val onSystem = systemStateLoaded && pkg() in systemOn
             when {
                 onSystem && enabled -> {
-                    hint.text = "已开启横屏（会话期间生效）"
+                    hint.text = "已开启横屏"
                     hint.setTextColor(0xFF8E8E93.toInt())
                     hint.visibility = View.VISIBLE
                     hint.setOnClickListener(null)

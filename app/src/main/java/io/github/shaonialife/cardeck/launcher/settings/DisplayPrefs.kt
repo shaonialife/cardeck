@@ -45,6 +45,9 @@ object DisplayPrefs {
      */
     const val KEEP_DISPLAYS_DEFAULT = true
 
+    /** 断开后保留活动应用的横屏覆盖（默认开）。 */
+    const val KEEP_ORIENTATION_ALIVE_DEFAULT = true
+
     /** 保留期重试窗口数（每窗 60s）：连续 N 窗未恢复即销毁虚拟屏。 */
     const val RETENTION_RETRIES_DEFAULT = 3
     const val RETENTION_RETRIES_MIN = 1
@@ -134,6 +137,7 @@ object DisplayPrefs {
     private const val KEY_TOUCH_FULL_LOG = "touch_full_log"
     private const val KEY_AUDIO_ROUTE_RECLAIM = "audio_route_reclaim"
     private const val KEY_KEEP_DISPLAYS = "keep_displays_on_disconnect"
+    private const val KEY_KEEP_ORIENTATION_ALIVE = "keep_orientation_alive_on_teardown"
     private const val KEY_RETENTION_RETRIES = "display_retention_retries"
 
     /**
@@ -197,6 +201,28 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_KEEP_DISPLAYS, enabled)
+            .apply()
+    }
+
+    /**
+     * 断开后保留活动应用的横屏覆盖（默认开，2026-11-19）：会话结束复原
+     * （AppOrientationCompat.resetAll）时，仍在运行的应用跳过 `am compat disable`
+     * ——该命令会立即杀进程，正在导航的应用被打断、页面状态丢失。活着的不动
+     * （下轮 applyAll 按 systemEnabled 过滤天然幂等）；已退出的照常复原。
+     */
+    fun keepOrientationForAliveApps(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_KEEP_ORIENTATION_ALIVE, KEEP_ORIENTATION_ALIVE_DEFAULT)
+
+    fun setKeepOrientationForAliveApps(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_KEEP_ORIENTATION_ALIVE, enabled)
             .apply()
     }
 

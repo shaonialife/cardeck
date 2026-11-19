@@ -317,15 +317,41 @@ object AppOrientationCompat {
         return count
     }
 
-    /** 会话结束：名单内应用统一复原（偏好保留，仅撤销系统覆盖）。返回处理的应用数。 */
+    /**
+     * 会话结束：名单内应用统一复原（偏好保留，仅撤销系统覆盖）。返回实际撤销的应用数。
+     *
+     * 「断开后保留活动应用横屏」（DisplayPrefs.keepOrientationForAliveApps，默认开）：
+     * 仍在运行的应用**跳过撤销**——`am compat disable` 会立即杀进程，正在导航的应用
+     * 会被打断、页面状态全丢（2026-11-19 用户实测痛点）。活着的不动：下轮 applyAll
+     * 走 systemEnabled() 过滤天然幂等；面板里显式关掉该应用横屏时仍会立即写入（那是
+     * 用户明确意图，杀进程代价照旧告知）。已退出的应用照常复原（无进程可杀，顺手清
+     * 系统侧，避免卸载残留）。
+     */
     fun resetAll(context: Context): Int {
         var count = 0
+        var skippedAlive = 0
+        val keepAlive = DisplayPrefs.keepOrientationForAliveApps(context)
         enabledPkgs(context).forEach { pkg ->
+            if (keepAlive && isProcessAlive(pkg)) {
+                skippedAlive++
+                return@forEach
+            }
             Shell.exec("am compat disable $CHANGE_UNDEFINED_TO_NOSENSOR $pkg", timeoutMs = 4000)
             Shell.exec("am compat disable $CHANGE_ANY_ORIENTATION $pkg", timeoutMs = 4000)
             count++
         }
+        if (skippedAlive > 0) {
+            diagSink?.invoke(
+                "ORIENTATION: $skippedAlive 个应用仍在运行——跳过横屏复原（保留覆盖，避免杀进程打断使用）",
+            )
+        }
         return count
+    }
+
+    /** 进程是否存活（`pidof`：exit 0 且输出非空 = 活着；单次 ~几十 ms，名单很小逐个查）。 */
+    private fun isProcessAlive(pkg: String): Boolean {
+        val out = Shell.exec("pidof $pkg", timeoutMs = 2000)
+        return out.ok && out.output.isNotBlank()
     }
 
     /**

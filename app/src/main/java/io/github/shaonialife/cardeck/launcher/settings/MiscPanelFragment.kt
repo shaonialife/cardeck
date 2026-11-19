@@ -252,6 +252,49 @@ class MiscPanelFragment : SettingsPanelFragment() {
             },
         )
 
+        // 断开后保留活动应用横屏（默认开）：teardown 复原（resetAll）对仍在运行的
+        // 应用跳过 am compat disable——该命令会立即杀进程，正在导航的应用被打断
+        // （2026-11-19 用户要求）。已退出的应用照常复原。
+        val keepOriOn = view.findViewById<TextView>(R.id.btnKeepOriOn)
+        val keepOriOff = view.findViewById<TextView>(R.id.btnKeepOriOff)
+        val keepOriNote = view.findViewById<TextView>(R.id.keepOriNote)
+
+        fun refreshKeepOri(enabled: Boolean) {
+            keepOriOn.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            keepOriOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+            keepOriOff.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            keepOriOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
+            keepOriNote.text =
+                if (enabled) {
+                    "断开会话时，仍在运行的应用（如导航）不撤销横屏覆盖、不重启应用，页面状态得以保留；" +
+                        "已退出的应用照常复原。在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
+                } else {
+                    "已关闭：断开会话时复原所有应用的横屏覆盖（仍在运行的应用会被重启，未保存的页面状态会丢失）。"
+                }
+        }
+
+        val savedKeepOri = DisplayPrefs.keepOrientationForAliveApps(ctx)
+        refreshKeepOri(savedKeepOri)
+
+        fun applyKeepOri(enabled: Boolean) {
+            if (enabled == DisplayPrefs.keepOrientationForAliveApps(ctx)) return
+            DisplayPrefs.setKeepOrientationForAliveApps(ctx, enabled)
+            refreshKeepOri(enabled)
+            hostToast(
+                if (enabled) {
+                    "已开启：断开后仍在运行的应用保留横屏（不重启）"
+                } else {
+                    "已关闭：断开时复原全部应用横屏（运行中的应用会重启）"
+                },
+            )
+        }
+        keepOriOn.setOnClickListener { applyKeepOri(true) }
+        keepOriOff.setOnClickListener { applyKeepOri(false) }
+
         // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
     }
 }
