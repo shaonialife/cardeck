@@ -1,40 +1,130 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- 车机/手机共用的「仪表盘」面板。外层 ScrollView 与其它面板一致（车机侧内容区
+     只有约 200dp 高；2026-11-20 加卡片比例段后内容超一屏，必须能滚动）。 -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:paddingLeft="20dp"
-    android:paddingRight="13dp"
-    android:paddingTop="14dp"
-    android:paddingBottom="10dp">
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:layout_marginBottom="11dp"
-        android:text="仪表盘地图屏使用的地图应用，选中即生效。"
-        android:textColor="#FF8E8E93"
-        android:textSize="12sp" />
+    android:fillViewport="true"
+    android:scrollbars="none">
 
     <LinearLayout
-        android:id="@+id/mapOptions"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical" />
+        android:orientation="vertical"
+        android:paddingLeft="20dp"
+        android:paddingTop="14dp"
+        android:paddingRight="13dp"
+        android:paddingBottom="10dp">
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
-        android:layout_marginBottom="11dp"
-        android:text="右侧卡片：仪表盘另一侧的卡片内容。固定应用以手机侧密度独立成屏，点桌面图标可全屏；切换实时生效。"
-        android:textColor="#FF8E8E93"
-        android:textSize="12sp" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:layout_marginBottom="11dp"
+            android:text="仪表盘地图屏使用的地图应用，选中即生效。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
 
-    <LinearLayout
-        android:id="@+id/cardOptions"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical" />
-</LinearLayout>
+        <LinearLayout
+            android:id="@+id/mapOptions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="11dp"
+            android:text="右侧卡片：仪表盘另一侧的卡片内容。固定应用以手机侧密度独立成屏，点桌面图标可全屏；切换实时生效。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/cardOptions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="11dp"
+            android:text="左右卡片比例：自由 = 车机侧拖动分屏把手调整（现状）；固定 = 比例锁定，由下方拖动条控制，松手才生效（车机侧把手隐藏）。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_segment"
+            android:orientation="horizontal"
+            android:padding="3dp">
+
+            <TextView
+                android:id="@+id/btnRatioFree"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_segment_sel"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="自由"
+                android:textColor="#FFFFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnRatioFixed"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="2dp"
+                android:background="@drawable/bg_segment"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="固定"
+                android:textColor="#FF8E8E93"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/ratioSeekRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <SeekBar
+                android:id="@+id/ratioSeek"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="60" />
+
+            <TextView
+                android:id="@+id/ratioValue"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="8dp"
+                android:gravity="right"
+                android:textColor="#FF8E8E93"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/ratioNote"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="比例=左侧（地图）卡片占主轴的百分比，范围 20%~80%；拖动中只更新数字，松手才生效（车机立即 resize）。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>

@@ -77,6 +77,13 @@ class GridActivity : AppCompatActivity() {
         runOnUiThread { applyDashboardMode(dashboard) }
     }
 
+    /** 分屏几何变化（固定模式拖动条落定/模式切换）→ 重排仪表盘页（主线程）。 */
+    private var dashSplitRelayout: (() -> Unit)? = null
+
+    private val dashSplitListener = {
+        runOnUiThread { dashSplitRelayout?.invoke() }
+    }
+
     /** 媒体状态监听（MediaSessionsState 主线程回调）。 */
     private val mediaStateListener = {
         runOnUiThread { renderMediaCard() }
@@ -419,6 +426,7 @@ class GridActivity : AppCompatActivity() {
             VirtualLauncher.addDashboardListener(dashboardListener)
             VirtualLauncher.addMapLayoutListener(mapLayoutListener)
             VirtualLauncher.addPinnedCardListener(pinnedCardListener)
+            VirtualLauncher.addDashSplitListener(dashSplitListener)
             applyDashboardMode(VirtualLauncher.dashboardMode)
         }
 
@@ -721,6 +729,12 @@ class GridActivity : AppCompatActivity() {
         private fun bindSplitHandle(scale: Float) {
             val child = (itemView as? android.widget.FrameLayout)?.getChildAt(1) as? DashSplitHandle
             handle = child ?: return
+            // 固定模式：比例由面板拖动条控制——隐藏把手、不装拖拽回调（把手命中在
+            // VirtualLauncher.dashHandleHit 也被拦截，双保险）；面板 margin 照常按
+            // 固定比例摆放。实时重排经 dashSplitListener 走这里。
+            val fixedMode = DashSplitPrefs.fixedMode(this@GridActivity)
+            child.visibility = if (fixedMode) View.GONE else View.VISIBLE
+            dashSplitRelayout = { layoutSplit(VirtualLauncher.dashHandleCenterScreen(), scale) }
             val portrait = VirtualLauncher.dockAtBottom
             // 触达条比视觉中缝宽（DASH_HANDLE_TOUCH_PX > DASH_GAP_PX）：两侧各溢出
             // 一段压在卡片上扩大触控目标——地图侧溢出段被 tile 盖住不可见但可触摸
@@ -731,14 +745,16 @@ class GridActivity : AppCompatActivity() {
                         if (portrait) ViewGroup.LayoutParams.MATCH_PARENT else thickness,
                         if (portrait) thickness else ViewGroup.LayoutParams.MATCH_PARENT,
                     )
-            child.configure(portrait) { centerScreen, final ->
-                if (final) {
-                    // commit 内部钳制并真实 resize 地图屏；notifyMapLayout 会触发
-                    // 壁纸切片重切。commit 返回钳后值，据此校正 margin 防漂移。
-                    layoutSplit(VirtualLauncher.commitDashSplitScreen(centerScreen), scale)
-                } else {
-                    layoutSplit(centerScreen, scale)
-                    VirtualLauncher.previewDashSplitScreen(centerScreen)
+            if (!fixedMode) {
+                child.configure(portrait) { centerScreen, final ->
+                    if (final) {
+                        // commit 内部钳制并真实 resize 地图屏；notifyMapLayout 会触发
+                        // 壁纸切片重切。commit 返回钳后值，据此校正 margin 防漂移。
+                        layoutSplit(VirtualLauncher.commitDashSplitScreen(centerScreen), scale)
+                    } else {
+                        layoutSplit(centerScreen, scale)
+                        VirtualLauncher.previewDashSplitScreen(centerScreen)
+                    }
                 }
             }
             layoutSplit(VirtualLauncher.dashHandleCenterScreen(), scale)
@@ -894,6 +910,7 @@ class GridActivity : AppCompatActivity() {
         VirtualLauncher.removeDashboardListener(dashboardListener)
         VirtualLauncher.removeMapLayoutListener(mapLayoutListener)
         VirtualLauncher.removePinnedCardListener(pinnedCardListener)
+        VirtualLauncher.removeDashSplitListener(dashSplitListener)
         VirtualLauncher.removeOemListener(oemListener)
         MediaSessionsState
             .removeListener(mediaStateListener)

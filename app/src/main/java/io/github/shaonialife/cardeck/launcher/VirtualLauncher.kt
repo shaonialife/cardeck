@@ -246,7 +246,7 @@ object VirtualLauncher {
     private fun pinnedCardRectStream(): PinnedCardGeom? {
         if (appAreaWidth <= 0 || appAreaHeight <= 0 || dashSplitPos < 0) return null
         val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
-        val rect = pinnedCardRect(splitMainLen(), crossLen, dashSplitFraction, dockAtBottom)
+        val rect = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom)
         return if (dockAtBottom) {
             rect
         } else {
@@ -449,6 +449,19 @@ object VirtualLauncher {
     /** 当前生效的分屏比例（attach 从偏好恢复，commit 写回）。 */
     @Volatile
     private var dashSplitFraction = DASH_SPLIT_DEFAULT_FRACTION
+
+    // ---- 卡片比例固定模式（2026-11-20 车机设置→仪表盘）----
+    // 固定模式下比例由面板拖动条控制（松手生效），车机侧把手禁用（dashHandleHit
+    // 拦截 + GridActivity 隐藏把手）；自由模式行为不变（拖拽持久化旧键）。几何读点
+    // 统一走 effectiveSplitFraction()，两种模式的值各存各的偏好、互不覆盖。
+
+    @Volatile
+    private var splitFixedMode = false
+
+    @Volatile
+    private var splitFixedFraction = DashSplitPrefs.FIXED_FRACTION_DEFAULT
+
+    private fun effectiveSplitFraction(): Float = if (splitFixedMode) splitFixedFraction else dashSplitFraction
 
     /** 应用区尺寸（全屏形态的地图屏目标尺寸）。 */
     @Volatile
@@ -805,6 +818,10 @@ object VirtualLauncher {
                 .getSharedPreferences("settings", Context.MODE_PRIVATE)
                 .getFloat(PREF_KEY_DASH_SPLIT, DASH_SPLIT_DEFAULT_FRACTION)
                 .let(::clampDashSplitFraction)
+        // 固定模式缓存（几何读点经 effectiveSplitFraction()；面板变更经
+        // applyDashSplitMode / applyFixedDashSplitFraction 热更新）
+        splitFixedMode = DashSplitPrefs.fixedMode(context)
+        splitFixedFraction = DashSplitPrefs.fixedFraction(context)
         // 固定应用卡片（右侧卡片=指定应用时）：卡片矩形 = 音乐卡区域（随分屏比例），
         // 屏几何 = 卡片矩形 × 手机密度/各自基准（同地图屏换算——密度=手机侧）。
         // 所选应用已卸载时 resolve=null → 音乐卡片回退（DashCardPrefs）。
@@ -818,18 +835,18 @@ object VirtualLauncher {
             pinnedCardRect(
                 if (dockAtBottom) appHeightPx else appWidth,
                 if (dockAtBottom) appWidth else appHeightPx,
-                dashSplitFraction,
+                effectiveSplitFraction(),
                 dockAtBottom,
             )
         val pinnedGeom = mapDisplayGeometry(pinnedCard.width, pinnedCard.height, phoneDensityDpi, pinnedBaseline)
         pinnedDisplayDensity = pinnedGeom.densityDpi
         if (dockAtBottom) {
-            val geom = dashSplitGeom(appHeightPx, dashSplitFraction)
+            val geom = dashSplitGeom(appHeightPx, effectiveSplitFraction())
             mapTileWidth = appWidth - CARD_MARGIN_PX * 2
             mapTileHeight = geom.tileLen
             dashSplitPos = geom.splitCenter
         } else {
-            val geom = dashSplitGeom(appWidth, dashSplitFraction)
+            val geom = dashSplitGeom(appWidth, effectiveSplitFraction())
             mapTileWidth = geom.tileLen
             mapTileHeight = appHeightPx - CARD_MARGIN_PX * 2
             // 横屏应用区从 dock 右缘起（竖屏 x 原点即流原点，无偏移）
@@ -1650,7 +1667,7 @@ object VirtualLauncher {
             h = (appAreaHeight * scale).toInt()
         } else {
             val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
-            val card = pinnedCardRect(splitMainLen(), crossLen, dashSplitFraction, dockAtBottom)
+            val card = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom)
             w = (card.width * scale).toInt()
             h = (card.height * scale).toInt()
         }
@@ -1974,7 +1991,7 @@ object VirtualLauncher {
     private fun currentPinnedCardGeom(): DisplayGeometry? {
         if (appAreaWidth <= 0 || appAreaHeight <= 0) return null
         val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
-        val card = pinnedCardRect(splitMainLen(), crossLen, dashSplitFraction, dockAtBottom)
+        val card = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom)
         return mapDisplayGeometry(card.width, card.height, mapDisplayDensity)
     }
 
@@ -2059,13 +2076,81 @@ object VirtualLauncher {
         x: Float,
         y: Float,
     ): Boolean {
-        if (dashSplitPos < 0 || !dashboardMode || mapFullscreen) return false
+        // 固定模式：比例由面板拖动条控制，车机侧把手整体禁用（GridActivity 同步隐藏）
+        if (splitFixedMode || dashSplitPos < 0 || !dashboardMode || mapFullscreen) return false
         val half = DASH_HANDLE_TOUCH_PX / 2f
         return if (dockAtBottom) {
             y in dashSplitPos - half..dashSplitPos + half
         } else {
             x in dashSplitPos - half..dashSplitPos + half
         }
+    }
+
+    // ---- 卡片比例固定模式：面板应用入口与实时重排（2026-11-20）----
+
+    private val dashSplitListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /** 分屏几何变化（固定比例落定/模式切换）：GridActivity 重排把手与音乐卡 margin。 */
+    fun addDashSplitListener(listener: () -> Unit) {
+        dashSplitListeners.add(listener)
+    }
+
+    fun removeDashSplitListener(listener: () -> Unit) {
+        dashSplitListeners.remove(listener)
+    }
+
+    /** 固定/自由模式切换（面板分段按钮）：刷新缓存并即时重排。 */
+    fun applyDashSplitMode(context: Context) {
+        splitFixedMode = DashSplitPrefs.fixedMode(context)
+        splitFixedFraction = DashSplitPrefs.fixedFraction(context)
+        applyDashboardSplitGeometry()
+    }
+
+    /** 固定模式比例落定（拖动条 onStopTrackingTouch）：即时 resize 生效。 */
+    fun applyFixedDashSplitFraction(
+        context: Context,
+        fraction: Float,
+    ) {
+        splitFixedMode = true
+        splitFixedFraction = clampDashSplitFraction(fraction)
+        applyDashboardSplitGeometry()
+    }
+
+    /**
+     * 按当前生效比例重算 tile 尺寸与把手位置；仪表盘 SPLIT 时真实 resize 地图屏与
+     * 固定屏（与拖拽 commit 同一套收口）。非仪表盘态只更新派生值，回仪表盘时经
+     * syncDashboard 的既有 resize 生效。
+     */
+    private fun applyDashboardSplitGeometry() {
+        val main = splitMainLen()
+        if (main <= 0) return
+        val geom = dashSplitGeom(main, effectiveSplitFraction())
+        if (dockAtBottom) {
+            mapTileWidth = streamWidthPx - CARD_MARGIN_PX * 2
+            mapTileHeight = geom.tileLen
+            dashSplitPos = geom.splitCenter
+        } else {
+            mapTileWidth = geom.tileLen
+            mapTileHeight = appAreaHeight - CARD_MARGIN_PX * 2
+            dashSplitPos = geom.splitCenter + dockWidthPx
+        }
+        composer?.setTileEdgeOverride(dashSplitPos - DASH_GAP_PX / 2f)
+        // ⚠ 不能清 0：composer 的 SPLIT 绘制公式是硬编码 50% 中线，真实比例全靠
+        // tileEdgeOverride（把手位置）覆盖——清 0 会让两卡退回等宽（2026-11-20
+        // 用户实测：固定模式改比例回仪表盘变 50/50）
+        if (dashboardMode && !mapFullscreen) {
+            resizeMapDisplay(false)
+            resizePinnedDisplay(false)
+        }
+        dashSplitListeners.forEach { runCatching { it() } }
+        logSink?.invoke(
+            "LAUNCHER: 卡片比例 " +
+                (if (splitFixedMode) "固定 " else "自由 ") +
+                String.format("%.2f", effectiveSplitFraction()) +
+                "（" +
+                (if (dockAtBottom) "地图高=" + mapTileHeight else "地图宽=" + mapTileWidth) +
+                "px）",
+        )
     }
 
     /** 流坐标把手中心 → 应用区坐标系偏移（横屏减 dock 宽；竖屏 y 原点即流原点）。 */

@@ -13,6 +13,7 @@ import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.SessionController
 import io.github.shaonialife.cardeck.launcher.AppIcons
 import io.github.shaonialife.cardeck.launcher.DashCardPrefs
+import io.github.shaonialife.cardeck.launcher.DashSplitPrefs
 import io.github.shaonialife.cardeck.launcher.DefaultMapPrefs
 import io.github.shaonialife.cardeck.launcher.DesktopApps
 import io.github.shaonialife.cardeck.launcher.DockPrefs
@@ -467,6 +468,100 @@ class DashboardPanelFragment : SettingsPanelFragment() {
     override fun onViewCreated(view: View) {
         buildMapSection(view.findViewById(R.id.mapOptions))
         buildCardSection(view.findViewById(R.id.cardOptions))
+        buildRatioSection(view)
+    }
+
+    /**
+     * 左右卡片比例（2026-11-20）：自由（车机侧拖把手，现状）/ 固定（拖动条控制，
+     * 松手才生效）。固定范围 = 分屏拖拽同款 20%~80%（seek 0..60 ↔ 0.2..0.8，步进 1%）。
+     */
+    private fun buildRatioSection(view: View) {
+        val ctx = requireContext()
+        val freeBtn = view.findViewById<TextView>(R.id.btnRatioFree)
+        val fixedBtn = view.findViewById<TextView>(R.id.btnRatioFixed)
+        val seekRow = view.findViewById<View>(R.id.ratioSeekRow)
+        val seek = view.findViewById<SeekBar>(R.id.ratioSeek)
+        val value = view.findViewById<TextView>(R.id.ratioValue)
+        val note = view.findViewById<TextView>(R.id.ratioNote)
+
+        fun segmentStyle(selected: Boolean): Pair<Int, Int> =
+            if (selected) {
+                R.drawable.bg_segment_sel to 0xFFFFFFFF.toInt()
+            } else {
+                R.drawable.bg_segment to 0xFF8E8E93.toInt()
+            }
+
+        fun percentText(fraction: Float): String = "${(fraction * 100).toInt()}%"
+
+        fun refreshMode() {
+            val fixed = DashSplitPrefs.fixedMode(ctx)
+            val (bgFree, tcFree) = segmentStyle(!fixed)
+            freeBtn.setBackgroundResource(bgFree)
+            freeBtn.setTextColor(tcFree)
+            val (bgFixed, tcFixed) = segmentStyle(fixed)
+            fixedBtn.setBackgroundResource(bgFixed)
+            fixedBtn.setTextColor(tcFixed)
+            seekRow.visibility = if (fixed) View.VISIBLE else View.GONE
+            note.text =
+                if (fixed) {
+                    "比例=左侧（地图）卡片占主轴的百分比，范围 20%~80%；拖动中只更新数字，松手才生效（车机立即 resize）。"
+                } else {
+                    "自由模式：在车机仪表盘拖动分屏把手调整比例，松手落定并记住（下次连接沿用）。"
+                }
+        }
+
+        fun refreshSeek() {
+            val fraction = DashSplitPrefs.fixedFraction(ctx)
+            seek.progress =
+                ((fraction - VirtualLauncher.DASH_SPLIT_MIN_FRACTION) / 0.01f).toInt().coerceIn(0, seek.max)
+            value.text = percentText(fraction)
+        }
+
+        freeBtn.setOnClickListener {
+            if (!DashSplitPrefs.fixedMode(ctx)) return@setOnClickListener
+            DashSplitPrefs.setFixedMode(ctx, false)
+            VirtualLauncher.applyDashSplitMode(ctx)
+            refreshMode()
+            hostToast("卡片比例：自由（车机侧拖把手调整）")
+        }
+        fixedBtn.setOnClickListener {
+            if (DashSplitPrefs.fixedMode(ctx)) return@setOnClickListener
+            DashSplitPrefs.setFixedMode(ctx, true)
+            VirtualLauncher.applyDashSplitMode(ctx)
+            refreshMode()
+            refreshSeek()
+            hostToast("卡片比例：固定（拖动条控制，松手生效）")
+        }
+        seek.setOnSeekBarChangeListener(
+            object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(
+                    seekBar: SeekBar?,
+                    progress: Int,
+                    fromUser: Boolean,
+                ) {
+                    if (!fromUser) return
+                    value.text = percentText(VirtualLauncher.DASH_SPLIT_MIN_FRACTION + progress * 0.01f)
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    // 松手才落盘+生效（用户要求）；应用立即 resize（仪表盘可见时）
+                    val fraction =
+                        VirtualLauncher
+                            .clampDashSplitFraction(
+                                VirtualLauncher.DASH_SPLIT_MIN_FRACTION + seek.progress * 0.01f,
+                            )
+                    DashSplitPrefs.setFixedFraction(ctx, fraction)
+                    VirtualLauncher.applyFixedDashSplitFraction(ctx, fraction)
+                    value.text = percentText(fraction)
+                    hostToast("卡片比例 ${percentText(fraction)} 已生效")
+                }
+            },
+        )
+
+        refreshMode()
+        refreshSeek()
     }
 
     /** 默认地图单选（原 DefaultMapPanelFragment 逻辑原样搬移）。 */
