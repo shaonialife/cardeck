@@ -129,7 +129,11 @@ class AudioSender(
     // 发往我方 SETUP 声明的 controlPort）；重传包走接收端同一 processPacket
     // 路径（R14.3）⇒ **缓存包原样重发**（原 seq/ts 不改，不重新封包）。
     // 缓存窗口 = 512 包（fw: 接收端 9-bit 环绕窗口 @0x24552112c 对齐）。
-    private val resendCache = arrayOfNulls<ByteArray>(RESEND_CACHE_SIZE)
+    // ⚠ 0.1.28.171 曾用裸 sequence 做数组索引（键域 0..65535 vs 容量
+    // 512）→ sequence=512 越界，AAC ~47pps 下 11 秒必崩（音频静默死亡
+    // 五轮复现）——0.1.28.172 换 ResendCache（环形 + seq 精确匹配，
+    // JVM 单测 ResendCacheTest 回归钉）。
+    private val resendCache = ResendCache(RESEND_CACHE_SIZE)
 
     private var retransmitHits = 0
 
@@ -387,7 +391,7 @@ class AudioSender(
         if (running.get()) return true
         stopped.set(false)
         // 重传缓存/计数复位（新会话旧包无意义）
-        resendCache.fill(null)
+        resendCache.clear()
         retransmitHits = 0
         retransmitMisses = 0
         return try {
@@ -486,7 +490,7 @@ class AudioSender(
         syncSocket = null
         syncThread = null
         thread = null
-        resendCache.fill(null)
+        resendCache.clear()
         if (!wasSubmix) restorePhoneMedia()
         // 宿主收口（submix 模式释放 UserService 侧 AudioRecord，媒体路由随之恢复）；
         // 即使回调丢失，泵线程检测到读端关闭也会自愈
@@ -757,7 +761,7 @@ class AudioSender(
         markerPending = false
         lastPacketAt = now
         // 重传缓存入窗（键 = 本包 seq；[resend] 原样重发）
-        resendCache[sequence] = wire
+        resendCache.store(sequence, wire)
         sequence = (sequence + 1) and 0xFFFF
         timestamp += samplesPerPacket
         nonceCounter++
@@ -786,7 +790,7 @@ class AudioSender(
      *  窗口外 miss 只记账（fw 接收端对「要不到的包」有 PLC 兜底渐弱帧，
      *  R13.3——不发占位包，那不是固件形）。 */
     fun resend(seq: Int) {
-        val wire = resendCache[seq and 0xFFFF]
+        val wire = resendCache.get(seq)
         if (wire == null) {
             retransmitMisses++
             if (retransmitMisses == 1 || retransmitMisses % 50 == 0) {
