@@ -40,20 +40,60 @@ object ConnectingBanner {
     private var polling = false
     private var dismissedByUser = false
 
+    /** 状态行锁定文案（非空时轮询不再覆盖——投屏授权提示等一次性说明用）。 */
+    @Volatile
+    private var heldStatus: String? = null
+
     /** 连接触发时调用：后台 + 悬浮窗权限满足才弹；已显示则仅刷新状态。 */
     fun maybeShow(context: Context?) {
         val ctx = context?.applicationContext ?: return
-        if (banner != null || dismissedByUser) return
-        if (SenderApp.foregroundActivities > 0) return // 前台：首页英雄卡已展示状态
-        if (!Settings.canDrawOverlays(ctx)) return
+        val fg = SenderApp.foregroundActivities > 0
+        val overlayOk = Settings.canDrawOverlays(ctx)
+        // ✕ 关闭的抑制：只对**当前协商尝试**有效（sessionStarting=true 期间）。
+        // 旧条件「!isSessionRunning && !sessionStarting」永不释放（2026-11-20 实测：
+        // 关一次 ✕ 后续所有触发都被拦）——协商结束即视为新尝试，标记自动失效。
+        if (dismissedByUser && !SessionController.sessionStarting.get()) {
+            dismissedByUser = false
+        }
+        val reason =
+            when {
+                banner != null -> "已在展示"
+                dismissedByUser -> "用户已手动关闭（本次会话内不再弹出）"
+                fg -> "应用在前台（首页英雄卡已展示状态）"
+                !overlayOk -> "无悬浮窗权限"
+                else -> null
+            }
+        if (reason != null) {
+            log(ctx, "不弹出：$reason")
+            return
+        }
+        log(ctx, "弹出（后台触发）")
         appCtx = ctx
         main.post { showInternal(ctx) }
+    }
+
+    private fun log(
+        ctx: Context,
+        msg: String,
+    ) {
+        val line = "BANNER: $msg"
+        android.util.Log.i("ConnectingBanner", line)
+        runCatching {
+            io.github.shaonialife.cardeck.util.DebugFileLog
+                .append(ctx, line)
+        }
     }
 
     /** 连接结束（断开/取消）时调用：立即收起，并重置「本次已手动关闭」标记。 */
     fun dismiss() {
         dismissedByUser = false
         main.post { hideInternal() }
+    }
+
+    /** 状态行锁定文案（显示期间不被 phaseHint 轮询覆盖；收起时清除）。 */
+    fun holdStatus(text: String) {
+        heldStatus = text
+        main.post { if (banner != null) statusText?.text = text }
     }
 
     private fun showInternal(ctx: Context) {
@@ -190,7 +230,7 @@ object ConnectingBanner {
                     polling = false
                     return
                 }
-                statusText?.text = SessionController.phaseHint ?: "正在连接…"
+                statusText?.text = heldStatus ?: (SessionController.phaseHint ?: "正在连接…")
                 val age = SystemClock.uptimeMillis() - shownAtMs
                 when {
                     // 连接成功：推流已运行 → 收起（用户要求）
@@ -199,7 +239,7 @@ object ConnectingBanner {
                         return
                     }
                     // 展示满 3s 后仍未在连接流程（失败/取消/未真正开始）→ 收起
-                    age > 3_000 &&
+                    age > 30_000 &&
                         !SessionController.isSessionRunning() &&
                         !SessionController.sessionStarting.get() -> {
                         hideInternal()
@@ -218,6 +258,7 @@ object ConnectingBanner {
     private fun hideInternal() {
         polling = false
         main.removeCallbacks(poll)
+        heldStatus = null
         val box = banner ?: return
         banner = null
         statusText = null

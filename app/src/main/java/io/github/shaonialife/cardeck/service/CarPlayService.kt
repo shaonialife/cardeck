@@ -11,8 +11,10 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import io.github.shaonialife.cardeck.MainActivity
 import io.github.shaonialife.cardeck.SessionController
+import io.github.shaonialife.cardeck.audio.AudioPref
 import io.github.shaonialife.cardeck.audio.SilentProjectionActivity
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
+import io.github.shaonialife.cardeck.ui.ConnectingBanner
 import io.github.shaonialife.cardeck.util.Bg
 import io.github.shaonialife.cardeck.util.DebugFileLog
 
@@ -120,19 +122,24 @@ class CarPlayService : Service() {
                 // 自动连接默认带声音（先静默领取投屏令牌；失败退回只推视频）——
                 // 但用户在「启动连接」弹窗里明确选过「仅视频」时尊重其选择
                 // （2026-10-25 测试者反馈：选仅视频后被自动连接覆盖成带声音）
-                val prefs = app.getSharedPreferences("settings", MODE_PRIVATE)
-                val userDeclinedAudio =
-                    prefs.getBoolean("audio_user_pref_set", false) &&
-                        !prefs.getBoolean("audio_user_pref", true)
-                if (userDeclinedAudio) {
-                    fileLog("AUTO: 用户偏好仅推视频——本次自动连接不带声音")
+                // 音频开关（hero 面板，2026-11-20）：自动连接按开关走，不再单独判断
+                val wantAudio = AudioPref.enabled(app)
+                if (!wantAudio) {
+                    fileLog("AUTO: 音频开关关闭——本次自动连接仅推视频")
                     SessionController.audioEnabledForSession = false
                 } else if (DisplayPrefs.audioCapturePreferSubmix(app)) {
-                    // 采集首选 REMOTE_SUBMIX（2026-11-20）：投影令牌仅播放捕获兜底需要，
-                    // 跳过静默领取；submix 不可用 → 音频通道不启动（日志有提示）
+                    // 采集首选 REMOTE_SUBMIX：投影令牌仅播放捕获兜底需要，跳过静默领取；
+                    // submix 不可用 → 音频通道不启动（日志有提示）
                     fileLog("AUTO: 采集首选 REMOTE_SUBMIX——跳过静默投屏领取")
                     SessionController.audioEnabledForSession = true
                 } else {
+                    // 提示先行（2026-11-20 用户要求）：后台自动连接要弹投屏授权窗，
+                    // 通知条/英雄卡先说明原因，避免用户疑惑
+                    if (mediaProjection == null) {
+                        val hint = "车机声音需要投屏授权——请在弹出的窗口点「立即开始」"
+                        SessionController.phaseHint = hint
+                        ConnectingBanner.holdStatus(hint)
+                    }
                     SessionController.audioEnabledForSession = acquireProjectionSilently()
                 }
                 SessionController.startConnection(app)

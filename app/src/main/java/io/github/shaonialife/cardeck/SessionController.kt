@@ -536,9 +536,17 @@ object SessionController {
     }
 
     /** 会话是否活跃（推出流进程或 BT 任一在跑）。 */
+
+    /**
+     * 会话是否进行中（正在协商/正在推流/正在主动连车机）。
+     *
+     * ⚠️ **不含 bluetoothServer 的「监听中」**（2026-11-20 修正）：保留态恢复会启动
+     * 回连监听（bluetoothServer.start，进程存活期间常驻）——若把它算进「运行中」，
+     * 首页英雄卡会在重启后永远显示「正在连接」、ConnectingBanner 永不自动收起。
+     * 监听只是被动等待，车机侧连接时由 RFCOMM accept 进入会话。
+     */
     fun isSessionRunning(): Boolean =
         videoSender?.isRunning == true ||
-            bluetoothServer?.isRunning == true ||
             bluetoothClient?.isRunning == true
 
     /**
@@ -860,7 +868,12 @@ object SessionController {
             displayRetentionActive.set(true)
             retentionFailures = 0
             startRetentionTimer()
-            appendLog("SESSION: 进程重启——按快照恢复保留态，等待重连复用")
+            // 补启动回连监听面（2026-11-20 实测缺口）：bluetoothServer.start 只在
+            // startConnection 里调，恢复保留态后没人监听 → DiPlay 主动连接无人应答，
+            // 3 分钟窗口空转后销毁。accept 回连路径不受此影响（ACL → 服务 → 重走
+            // startConnection 本就会启动监听）
+            runCatching { bluetoothServer?.start() }
+                .onSuccess { appendLog("SESSION: 保留态回连监听已就绪（bluetoothServer.start）") }
         }
         return restored
     }
@@ -1961,6 +1974,12 @@ object SessionController {
         host: String?,
         preNegotiated: Pair<AudioProfile, AirPlayLink.AudioStreamInfo>? = null,
     ): Boolean {
+        // 通知条触发补口（2026-11-20）：DiPlay 台回连走 **BT 服务端 accept**，不经过
+        // startConnection——真实会话协商开始（音频通道启动）必然到这里，在此兜底弹出
+        // （isSessionRunning 时是会话中补启音频，不弹）
+        if (!SessionController.isSessionRunning()) {
+            ConnectingBanner.maybeShow(context)
+        }
         if (!audioEnabledForSession) {
             appendLog("AUDIO: 本次连接未开启车机侧声音（「启动连接」弹窗选择）——仅推视频")
             return false

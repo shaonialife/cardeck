@@ -564,8 +564,9 @@
                     android:layout_marginStart="54dp"
                     android:background="#5A394444" />
 
-                <!-- 车机侧声音 -->
+                <!-- 车机侧声音（仅未连接时显示；开关=连接是否带声音，2026-11-20 起连接不再弹询问） -->
                 <LinearLayout
+                    android:id="@+id/rowAudio"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:gravity="center_vertical"
@@ -612,20 +613,13 @@
                             android:textSize="12sp" />
                     </LinearLayout>
 
-                    <TextView
-                        android:id="@+id/btnAudio"
+                    <androidx.appcompat.widget.SwitchCompat
+                        android:id="@+id/switchAudio"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:background="@drawable/bg_tbtn"
-                        android:gravity="center"
-                        android:paddingStart="12dp"
-                        android:paddingTop="9dp"
-                        android:paddingEnd="12dp"
-                        android:paddingBottom="9dp"
-                        android:text="授权"
-                        android:textColor="@color/m3_primary"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
+                        android:thumb="@drawable/sw_thumb"
+                        app:track="@drawable/sw_track"
+                        xmlns:app="http://schemas.android.com/apk/res-auto" />
                 </LinearLayout>
             </LinearLayout>
 

@@ -25,6 +25,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
+import io.github.shaonialife.cardeck.audio.AudioPref
 import io.github.shaonialife.cardeck.bt.BtProfiles
 import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.input.TouchRouter
@@ -85,7 +86,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btBadge: TextView
     private lateinit var btnPickTarget: TextView
     private lateinit var audioDesc: TextView
-    private lateinit var btnAudio: TextView
+    private lateinit var rowAudio: View
+    private lateinit var switchAudio: androidx.appcompat.widget.SwitchCompat
     private lateinit var switchAlwaysOn: androidx.appcompat.widget.SwitchCompat
     private lateinit var advBody: View
     private lateinit var advChevron: ImageView
@@ -166,7 +168,7 @@ class MainActivity : AppCompatActivity() {
             log("BLUETOOTH_CONNECT 授权: $granted")
             if (granted && pendingStartAfterBtPermission.compareAndSet(true, false)) {
                 // 授权期间 Shizuku 可能被停掉：这里同样走前置检查
-                ensureShizukuReady { showAudioChoiceDialog() }
+                ensureShizukuReady { beginConnect() }
             }
         }
 
@@ -225,32 +227,10 @@ class MainActivity : AppCompatActivity() {
      * 三个选项竖排（横排会挤爆窄屏）：推荐项「仅视频」放第一位并用实心强调
      * ——与正文「以看视频为主时建议暂不开启」一致；取消在最下。
      */
-    private fun showAudioChoiceDialog() {
-        // 默认档 = 高质量媒体通路（type=102 + AAC-LC，真 iPhone 走这条）；
-        // 「兼容档」= 强制只走 PCM 旧通路（type=100），AAC 被车机直接拒掉时的人工退路。
-        // 按钮竖排每个约 36dp：横屏屏高只有 ~300dp，再多一个「取消」就会顶出屏幕，
-        // 因此横屏省略「取消」（弹窗默认可返回键/点外部关闭）。
-        val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        val actions =
-            buildList {
-                add(
-                    DarkMessageDialog.Action(
-                        "仅视频（更流畅）",
-                        DarkMessageDialog.Emphasis.PRIMARY,
-                    ) { beginWithAudio(enabled = false) },
-                )
-                add(DarkMessageDialog.Action("开启声音") { beginWithAudio(enabled = true) })
-                if (!landscape) add(DarkMessageDialog.Action("取消") {})
-            }
-        DarkMessageDialog.show(
-            activity = this,
-            title = "是否在车机侧播放声音？",
-            message =
-                "开启后手机媒体/导航声音投到车机播放、手机本机静音（不开启则车上无声）。\n" +
-                    "音视频同时传会增加负载，以看视频为主时可先不开启。\n" +
-                    "开启声音需要「投屏」权限，会一并申请。",
-            actions = actions,
-        )
+
+    /** 「启动连接」入口（2026-11-20 起不再弹音频询问：hero 面板开关即偏好）。 */
+    private fun beginConnect() {
+        beginWithAudio(AudioPref.enabled(this))
     }
 
     /** 「取消连接」确认弹窗（防误触）：中止当前连接尝试并断开蓝牙/WiFi 链路。 */
@@ -379,7 +359,7 @@ class MainActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             log("ACCESS_FINE_LOCATION 授权: $granted")
             if (granted && pendingStartAfterLocationPermission.compareAndSet(true, false)) {
-                ensureShizukuReady { showAudioChoiceDialog() }
+                ensureShizukuReady { beginConnect() }
             }
         }
 
@@ -453,7 +433,7 @@ class MainActivity : AppCompatActivity() {
         actions += DarkMessageDialog.Action("取消") {}
         actions +=
             DarkMessageDialog.Action("重试检查") {
-                ensureShizukuReady { showAudioChoiceDialog() }
+                ensureShizukuReady { beginConnect() }
             }
         when (state) {
             ShizukuGate.State.NOT_RUNNING ->
@@ -489,14 +469,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun beginWithAudio(enabled: Boolean) {
         SessionController.audioEnabledForSession = enabled
-        // 用户偏好持久化：「上车自动连接」要尊重它（2026-10-25 测试者反馈：选了
-        // 仅视频，自动连接重连后又自动带声音，UI 显示「车机侧声音：开启」）。
-        // null 从未手动选过 → 自动连接维持默认带声音。
-        getSharedPreferences("settings", MODE_PRIVATE)
-            .edit()
-            .putBoolean("audio_user_pref", enabled)
-            .putBoolean("audio_user_pref_set", true)
-            .apply()
+        AudioPref.set(this, enabled)
         // 声音只剩一个模式：通路协商（AAC-LC 优先，不行自动退 PCM）在会话内自动完成，
         // 不再有「兼容档」这种人工分支。
         if (!enabled) {
@@ -592,7 +565,8 @@ class MainActivity : AppCompatActivity() {
         btBadge = findViewById(R.id.btBadge)
         btnPickTarget = findViewById(R.id.btnPickTarget)
         audioDesc = findViewById(R.id.audioDesc)
-        btnAudio = findViewById(R.id.btnAudio)
+        rowAudio = findViewById(R.id.rowAudio)
+        switchAudio = findViewById(R.id.switchAudio)
         switchAlwaysOn = findViewById(R.id.switchAlwaysOn)
         advBody = findViewById(R.id.advBody)
         advChevron = findViewById(R.id.advChevron)
@@ -676,7 +650,7 @@ class MainActivity : AppCompatActivity() {
                         }
                         if (granted && pendingShizukuThenConnect) {
                             pendingShizukuThenConnect = false
-                            ensureShizukuReady { showAudioChoiceDialog() }
+                            ensureShizukuReady { beginConnect() }
                         } else if (!granted) {
                             snack("未获得 Shizuku 授权——连接仍不可用")
                         }
@@ -846,7 +820,7 @@ class MainActivity : AppCompatActivity() {
             when (heroState) {
                 HeroState.CONNECTED -> promptDisconnect()
                 // 前置检查：Shizuku（硬性依赖）→ 蓝牙权限/开关 → 音频选择
-                HeroState.IDLE -> ensureShizukuReady { ensureBluetoothReady { showAudioChoiceDialog() } }
+                HeroState.IDLE -> ensureShizukuReady { ensureBluetoothReady { beginConnect() } }
                 // 连接中可取消：卡在错误网络/等待回连时用户主动脱身（弹窗防误触）
                 HeroState.CONNECTING -> promptCancelConnecting()
                 null -> {}
@@ -881,15 +855,13 @@ class MainActivity : AppCompatActivity() {
         btnPickTarget.setOnClickListener { showTargetPicker() }
 
         // 车机侧声音授权（原「申请投屏权限」）：RECORD_AUDIO + MediaProjection 一起请求
-        btnAudio.setOnClickListener {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
-                PackageManager.PERMISSION_GRANTED
-            ) {
-                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            }
-            val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
-            projectionLauncher.launch(manager.createScreenCaptureIntent())
+        // 音频开关（2026-11-20 起 hero 面板直接控制，连接不再弹询问）：
+        // 权限申请挪到连接流程内（beginWithAudio）按需发起
+        switchAudio.setOnCheckedChangeListener { _, checked ->
+            AudioPref.set(this, checked)
+            refreshAudioSwitch()
         }
+        refreshAudioSwitch()
 
         // ---- 车机显示 ----
         findViewById<LinearLayout>(R.id.rowDim).setOnClickListener {
@@ -1060,7 +1032,14 @@ class MainActivity : AppCompatActivity() {
             "$fps/${SessionController.activeTargetFps} fps"
     }
 
+    /** 「车机侧声音」行刷新：开关状态回显（描述与常亮行同为静态文案）。 */
+    private fun refreshAudioSwitch() {
+        switchAudio.isChecked = AudioPref.enabled(this)
+    }
+
     private fun applyHeroState(s: HeroState) {
+        // 「车机侧声音」开关仅未连接时显示（2026-11-20：连接不再弹音频询问）
+        rowAudio.visibility = if (s == HeroState.IDLE) View.VISIBLE else View.GONE
         signalWaves.setState(
             when (s) {
                 HeroState.IDLE -> SignalWavesView.State.IDLE
@@ -1262,17 +1241,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             btnPickTarget.visibility = View.GONE
         }
-        val projectionReady =
-            CarPlayService.mediaProjection != null
-        if (projectionReady) {
-            btnAudio.text = "已授权"
-            btnAudio.setTextColor(getColor(R.color.m3_ok))
-            audioDesc.text = "投屏权限已就绪 · 连接时可选开启"
-        } else {
-            btnAudio.text = "授权"
-            btnAudio.setTextColor(getColor(R.color.m3_primary))
-            audioDesc.text = "需要「投屏」权限，可选 · 关闭时车机无声音"
-        }
+        refreshAudioSwitch()
         readyCount.text = "$ready/4"
     }
 
