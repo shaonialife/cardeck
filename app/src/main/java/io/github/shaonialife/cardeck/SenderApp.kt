@@ -1,10 +1,12 @@
 package io.github.shaonialife.cardeck
 
+import android.app.Activity
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Bundle
 import android.util.Log
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.util.DebugFileLog
@@ -18,6 +20,34 @@ import io.github.shaonialife.cardeck.util.DebugFileLog
 open class SenderApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        // 前后台追踪：自动连接的「正在连接」通知条只在后台弹出（前台有首页英雄卡）
+        registerActivityLifecycleCallbacks(
+            object : ActivityLifecycleCallbacks {
+                override fun onActivityStarted(activity: Activity) {
+                    foregroundActivities++
+                }
+
+                override fun onActivityStopped(activity: Activity) {
+                    foregroundActivities = (foregroundActivities - 1).coerceAtLeast(0)
+                }
+
+                override fun onActivityCreated(
+                    activity: Activity,
+                    savedInstanceState: Bundle?,
+                ) = Unit
+
+                override fun onActivityResumed(activity: Activity) = Unit
+
+                override fun onActivityPaused(activity: Activity) = Unit
+
+                override fun onActivitySaveInstanceState(
+                    activity: Activity,
+                    outState: Bundle,
+                ) = Unit
+
+                override fun onActivityDestroyed(activity: Activity) = Unit
+            },
+        )
         // 会话日志起点标记：日志文件跨进程累积（2MB 上限），导出默认只取本次启动
         // 之后的部分。必须在这里写（Application 是进程最早入口），晚于任何业务日志
         // 都会让它被算进「历史」。
@@ -122,5 +152,10 @@ open class SenderApp : Application() {
 
     companion object {
         private const val TAG = "CarPlaySender"
+
+        /** 已进入 STARTED 状态的 Activity 计数（>0 = 应用前台；ConnectingBanner 用）。 */
+        @JvmStatic
+        var foregroundActivities = 0
+            private set
     }
 }

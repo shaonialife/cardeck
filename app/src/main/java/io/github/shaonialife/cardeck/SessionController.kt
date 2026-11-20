@@ -38,6 +38,7 @@ import io.github.shaonialife.cardeck.service.CarPlayService
 import io.github.shaonialife.cardeck.shizuku.CarInputClient
 import io.github.shaonialife.cardeck.shizuku.Shell
 import io.github.shaonialife.cardeck.shizuku.ShizukuGate
+import io.github.shaonialife.cardeck.ui.ConnectingBanner
 import io.github.shaonialife.cardeck.ui.ScreenDimmer
 import io.github.shaonialife.cardeck.util.Bg
 import io.github.shaonialife.cardeck.util.DebugFileLog
@@ -546,6 +547,9 @@ object SessionController {
      */
     fun startConnection(context: Context) {
         connectCancelled = false
+        // 自动连接且应用在后台 → 弹「正在连接 CarPlay」通知条（实时阶段状态，
+        // 成功/失败自动收起；前台时跳过——首页英雄卡已展示状态）
+        ConnectingBanner.maybeShow(context)
         phaseHint = "蓝牙就绪，等待车机回连…"
         when (
             ShizukuGate
@@ -606,6 +610,7 @@ object SessionController {
         userInitiated: Boolean = false,
     ) {
         val hadProjection = CarPlayService.mediaProjection != null
+        ConnectingBanner.dismiss()
         if (userInitiated) {
             autoConnectSuppressedUntil = SystemClock.uptimeMillis() + AUTO_CONNECT_COOLDOWN_MS
             appendLog("SESSION: 手动断开——自动重连冷却 ${AUTO_CONNECT_COOLDOWN_MS / 60_000} 分钟（ACL 抖动不再自动拉起）")
