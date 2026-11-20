@@ -17,7 +17,6 @@ import androidx.viewpager2.widget.ViewPager2
 import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.media.MediaSessionsState
 import io.github.shaonialife.cardeck.render.CARD_MARGIN_PX
-import io.github.shaonialife.cardeck.render.DASH_GAP_PX
 import io.github.shaonialife.cardeck.render.DASH_HANDLE_TOUCH_PX
 import io.github.shaonialife.cardeck.ui.WallpaperStore
 import io.github.shaonialife.cardeck.util.Bg
@@ -774,7 +773,8 @@ class GridActivity : AppCompatActivity() {
                     ((if (portrait) VirtualLauncher.appAreaHeight else VirtualLauncher.appAreaWidth) / 2f) * scale
                 }
             // 音乐卡让位按视觉缝；把手按触达宽居中（比缝宽、压在两侧卡片上）
-            val halfGap = DASH_GAP_PX / 2f * scale
+            // 中缝随模式：固定模式无把手，缝宽 = 一侧 margin（2026-11-20）
+            val halfGap = VirtualLauncher.dashMiddleGapPx() / 2f * scale
             val halfTouch = DASH_HANDLE_TOUCH_PX / 2f * scale
             (panel.layoutParams as? android.widget.FrameLayout.LayoutParams)?.let { lp ->
                 if (portrait) {

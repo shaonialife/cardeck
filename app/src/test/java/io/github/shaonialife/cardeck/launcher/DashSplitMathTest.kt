@@ -101,4 +101,21 @@ class DashSplitMathTest {
             assert(rect.height > 0) { "height<=0 at $f" }
         }
     }
+
+    @Test
+    fun narrowGapShrinksMiddleSeam() {
+        // 固定模式：中缝无把手 → 一侧 margin（16px）；resize 尺寸与绘制矩形
+        // 必须按同一 gap 推导（VirtualLauncher.dashMiddleGapPx 的值域即 16/24）
+        val gap = 16f
+        val g = VirtualLauncher.dashSplitGeom(appLen, 0.5f, gap)
+        val usable = appLen - CARD_MARGIN_PX * 2 - gap.toInt()
+        assertEquals((0.5f * usable).toInt(), g.tileLen)
+        assertEquals(CARD_MARGIN_PX + g.tileLen + gap / 2f, g.splitCenter, 0.001f)
+        assertEquals(CARD_MARGIN_PX + g.tileLen + gap, g.otherStart, 0.5f)
+        // 固定 50% 且中缝收窄 → 两卡等宽但缝隙小于自由模式
+        val rect = VirtualLauncher.pinnedCardRect(appLen, crossLen, 0.5f, dockAtBottom = false, gapPx = gap)
+        assertEquals(g.otherStart.toInt(), rect.left)
+        // 默认 gap（24）的 otherStart 更靠右（缝隙更宽）
+        assert(VirtualLauncher.dashSplitGeom(appLen, 0.5f).otherStart > g.otherStart)
+    }
 }

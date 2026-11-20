@@ -182,8 +182,9 @@ object VirtualLauncher {
     fun dashSplitGeom(
         appMainLen: Int,
         fraction: Float,
+        gapPx: Float = DASH_GAP_PX,
     ): DashSplitGeom {
-        val usable = (appMainLen - CARD_MARGIN_PX * 2 - DASH_GAP_PX.toInt()).coerceAtLeast(1)
+        val usable = (appMainLen - CARD_MARGIN_PX * 2 - gapPx.toInt()).coerceAtLeast(1)
         val clamped = clampDashSplitFraction(fraction)
         val tileLen = (clamped * usable).toInt()
         val edge = CARD_MARGIN_PX + tileLen
@@ -191,8 +192,8 @@ object VirtualLauncher {
             fraction = clamped,
             tileLen = tileLen,
             tileEdge = edge.toFloat(),
-            splitCenter = edge + DASH_GAP_PX / 2f,
-            otherStart = edge + DASH_GAP_PX,
+            splitCenter = edge + gapPx / 2f,
+            otherStart = edge + gapPx,
         )
     }
 
@@ -221,8 +222,9 @@ object VirtualLauncher {
         appCrossLen: Int,
         fraction: Float,
         dockAtBottom: Boolean,
+        gapPx: Float = DASH_GAP_PX,
     ): PinnedCardGeom {
-        val otherStart = dashSplitGeom(appMainLen, fraction).otherStart.toInt()
+        val otherStart = dashSplitGeom(appMainLen, fraction, gapPx).otherStart.toInt()
         return if (dockAtBottom) {
             // 竖屏：主轴=纵向（地图上、卡片下），x 全宽留边距
             PinnedCardGeom(
@@ -246,7 +248,7 @@ object VirtualLauncher {
     private fun pinnedCardRectStream(): PinnedCardGeom? {
         if (appAreaWidth <= 0 || appAreaHeight <= 0 || dashSplitPos < 0) return null
         val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
-        val rect = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom)
+        val rect = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom, dashMiddleGapPx())
         return if (dockAtBottom) {
             rect
         } else {
@@ -462,6 +464,14 @@ object VirtualLauncher {
     private var splitFixedFraction = DashSplitPrefs.FIXED_FRACTION_DEFAULT
 
     private fun effectiveSplitFraction(): Float = if (splitFixedMode) splitFixedFraction else dashSplitFraction
+
+    /**
+     * 中缝视觉宽（流像素）：自由模式 = DASH_GAP_PX（缝内画把手）；固定模式无把手，
+     * 只留一侧 margin（2026-11-20 用户反馈：缝里没把手后两倍 margin 观感太宽）。
+     * composer 两卡绘制、GridActivity 音乐卡 margin/壁纸切片统一取这里——几何
+     * （resize 尺寸）仍按 DASH_GAP 推导，绘制差 ≤8px 的整幅拉伸不可感知。
+     */
+    fun dashMiddleGapPx(): Float = if (splitFixedMode) CARD_MARGIN_PX.toFloat() else DASH_GAP_PX
 
     /** 应用区尺寸（全屏形态的地图屏目标尺寸）。 */
     @Volatile
@@ -837,16 +847,17 @@ object VirtualLauncher {
                 if (dockAtBottom) appWidth else appHeightPx,
                 effectiveSplitFraction(),
                 dockAtBottom,
+                dashMiddleGapPx(),
             )
         val pinnedGeom = mapDisplayGeometry(pinnedCard.width, pinnedCard.height, phoneDensityDpi, pinnedBaseline)
         pinnedDisplayDensity = pinnedGeom.densityDpi
         if (dockAtBottom) {
-            val geom = dashSplitGeom(appHeightPx, effectiveSplitFraction())
+            val geom = dashSplitGeom(appHeightPx, effectiveSplitFraction(), dashMiddleGapPx())
             mapTileWidth = appWidth - CARD_MARGIN_PX * 2
             mapTileHeight = geom.tileLen
             dashSplitPos = geom.splitCenter
         } else {
-            val geom = dashSplitGeom(appWidth, effectiveSplitFraction())
+            val geom = dashSplitGeom(appWidth, effectiveSplitFraction(), dashMiddleGapPx())
             mapTileWidth = geom.tileLen
             mapTileHeight = appHeightPx - CARD_MARGIN_PX * 2
             // 横屏应用区从 dock 右缘起（竖屏 x 原点即流原点，无偏移）
@@ -1667,7 +1678,7 @@ object VirtualLauncher {
             h = (appAreaHeight * scale).toInt()
         } else {
             val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
-            val card = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom)
+            val card = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom, dashMiddleGapPx())
             w = (card.width * scale).toInt()
             h = (card.height * scale).toInt()
         }
@@ -1991,7 +2002,7 @@ object VirtualLauncher {
     private fun currentPinnedCardGeom(): DisplayGeometry? {
         if (appAreaWidth <= 0 || appAreaHeight <= 0) return null
         val crossLen = if (dockAtBottom) appAreaWidth else appAreaHeight
-        val card = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom)
+        val card = pinnedCardRect(splitMainLen(), crossLen, effectiveSplitFraction(), dockAtBottom, dashMiddleGapPx())
         return mapDisplayGeometry(card.width, card.height, mapDisplayDensity)
     }
 
@@ -2018,7 +2029,8 @@ object VirtualLauncher {
         val geom =
             dashSplitGeom(
                 splitMainLen(),
-                (clamped - splitMainOffset() - CARD_MARGIN_PX - DASH_GAP_PX / 2f) / splitUsableLen(),
+                (clamped - splitMainOffset() - CARD_MARGIN_PX - dashMiddleGapPx() / 2f) / splitUsableLen(dashMiddleGapPx()),
+                dashMiddleGapPx(),
             )
         dashSplitPos = clamped
         dashSplitFraction = geom.fraction
@@ -2052,7 +2064,7 @@ object VirtualLauncher {
         if (dashSplitPos < 0) {
             -1
         } else {
-            ((dashSplitPos - splitMainOffset() + DASH_GAP_PX / 2f) * gridScale()).toInt()
+            ((dashSplitPos - splitMainOffset() + dashMiddleGapPx() / 2f) * gridScale()).toInt()
         }
 
     /** [previewDashSplit] 的应用屏像素入参版（把手拖动直调，内部换回流像素）。 */
@@ -2124,7 +2136,7 @@ object VirtualLauncher {
     private fun applyDashboardSplitGeometry() {
         val main = splitMainLen()
         if (main <= 0) return
-        val geom = dashSplitGeom(main, effectiveSplitFraction())
+        val geom = dashSplitGeom(main, effectiveSplitFraction(), dashMiddleGapPx())
         if (dockAtBottom) {
             mapTileWidth = streamWidthPx - CARD_MARGIN_PX * 2
             mapTileHeight = geom.tileLen
@@ -2157,7 +2169,8 @@ object VirtualLauncher {
     private fun splitMainOffset(): Float = if (dockAtBottom) 0f else dockWidthPx.toFloat()
 
     /** 主轴可用长度 = 应用区主轴 − 两端边距 − 中缝宽（与 dashSplitGeom 同式）。 */
-    private fun splitUsableLen(): Int = (if (dockAtBottom) appAreaHeight else appAreaWidth) - CARD_MARGIN_PX * 2 - DASH_GAP_PX.toInt()
+    private fun splitUsableLen(gapPx: Float = DASH_GAP_PX): Int =
+        (if (dockAtBottom) appAreaHeight else appAreaWidth) - CARD_MARGIN_PX * 2 - gapPx.toInt()
 
     /**
      * 钳制流坐标把手中心；未 attach 返回 null。
@@ -2165,7 +2178,7 @@ object VirtualLauncher {
      * 比例 [0,1]，卡片能被拉成一条线（2026-10-22 用户实测「拉到 0」根因）。
      */
     private fun clampDashSplitStream(streamPos: Float): Float? {
-        val usable = splitUsableLen()
+        val usable = splitUsableLen(dashMiddleGapPx())
         if (usable <= 0) return null
         val base = splitMainOffset() + CARD_MARGIN_PX + DASH_GAP_PX / 2f
         val min = base + DASH_SPLIT_MIN_FRACTION * usable

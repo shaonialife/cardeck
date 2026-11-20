@@ -683,7 +683,7 @@ class DualDisplayComposer(
                         val handleEdge =
                             if (tileEdgeOverride > 0f) tileEdgeOverride else CARD_MARGIN_PX + tileH
                         val slide = tileSlideFraction * outWidth
-                        val cardTop = handleEdge + DASH_GAP_PX
+                        val cardTop = handleEdge + VirtualLauncher.dashMiddleGapPx()
                         val cardBottom = (outHeight - dockH - CARD_MARGIN_PX).toFloat()
                         drawInputUV(
                             pinnedInput!!,
@@ -746,7 +746,7 @@ class DualDisplayComposer(
                         val slide = tileSlideFraction * (outWidth - dockW)
                         drawInputUV(
                             pinnedInput!!,
-                            tileEdge + DASH_GAP_PX - slide,
+                            tileEdge + VirtualLauncher.dashMiddleGapPx() - slide,
                             outWidth - CARD_MARGIN_PX - slide,
                             CARD_MARGIN_PX.toFloat(),
                             (outHeight - CARD_MARGIN_PX).toFloat(),
