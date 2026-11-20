@@ -417,5 +417,62 @@
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 
+        <!-- 音频采集首选链路（2026-11-20）：播放捕获（默认，0.1.10 真车有声形态）
+             ↔ REMOTE_SUBMIX（shell 管道直采）；首选不可用自动落另一条，下次连接生效 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="音频采集首选链路"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_segment"
+            android:orientation="horizontal"
+            android:padding="3dp">
+
+            <TextView
+                android:id="@+id/btnAudioCapProjection"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_segment_sel"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="播放捕获"
+                android:textColor="#FFFFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnAudioCapSubmix"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="2dp"
+                android:background="@drawable/bg_segment"
+                android:paddingLeft="18dp"
+                android:paddingTop="6dp"
+                android:paddingRight="18dp"
+                android:paddingBottom="6dp"
+                android:text="REMOTE_SUBMIX"
+                android:textColor="#FF8E8E93"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/audioCapNote"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="播放捕获（默认）：走 MediaProjection 投屏授权。REMOTE_SUBMIX：shell 管道直采（需 Shizuku 在场），会接管手机媒体路由、手机本地静音。首选不可用时自动落到另一条；下次连接生效。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
     </LinearLayout>
 </ScrollView>

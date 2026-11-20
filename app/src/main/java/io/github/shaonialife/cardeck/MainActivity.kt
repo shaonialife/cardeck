@@ -30,6 +30,7 @@ import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
+import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.legal.DisclaimerDialog
 import io.github.shaonialife.cardeck.legal.DisclaimerPrefs
 import io.github.shaonialife.cardeck.legal.needsDisclaimerAtLaunch
@@ -505,6 +506,14 @@ class MainActivity : AppCompatActivity() {
         }
         if (CarPlayService.mediaProjection != null) {
             log("MODE: 已选择开启声音（投屏权限已就绪）")
+            startConnectionNow()
+            return
+        }
+        // 采集首选 REMOTE_SUBMIX（2026-11-20 车机设置→杂项）：投影令牌只有播放捕获
+        // 兜底才需要——跳过投屏授权申请直接连接；submix 不可用时音频通道不启动
+        // （日志提示可经「车机侧声音授权」补投影后即时补启）
+        if (DisplayPrefs.audioCapturePreferSubmix(this)) {
+            log("MODE: 采集首选 REMOTE_SUBMIX——跳过投屏授权申请（投影仅播放捕获兜底需要）")
             startConnectionNow()
             return
         }

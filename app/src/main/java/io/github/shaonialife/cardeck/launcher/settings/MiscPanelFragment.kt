@@ -298,6 +298,54 @@ class MiscPanelFragment : SettingsPanelFragment() {
         keepOriOn.setOnClickListener { applyKeepOri(true) }
         keepOriOff.setOnClickListener { applyKeepOri(false) }
 
+        // 音频采集首选链路（默认播放捕获，2026-11-20）：播放捕获（MediaProjection，
+        // 0.1.10 真车有声形态）↔ REMOTE_SUBMIX（shell 管道直采，接管手机媒体路由）。
+        // 首选不可用自动落另一条；下次连接生效（采集在连接时启动）。
+        val capProjection = view.findViewById<TextView>(R.id.btnAudioCapProjection)
+        val capSubmix = view.findViewById<TextView>(R.id.btnAudioCapSubmix)
+        val capNote = view.findViewById<TextView>(R.id.audioCapNote)
+
+        fun refreshAudioCap(preferSubmix: Boolean) {
+            capProjection.setBackgroundResource(
+                if (preferSubmix) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            capProjection.setTextColor(
+                if (preferSubmix) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt(),
+            )
+            capSubmix.setBackgroundResource(
+                if (preferSubmix) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            capSubmix.setTextColor(
+                if (preferSubmix) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt(),
+            )
+            capNote.text =
+                if (preferSubmix) {
+                    "REMOTE_SUBMIX：shell 管道直采（需 Shizuku 在场），接管手机媒体路由、" +
+                        "手机本地静音；不可用时自动回退播放捕获。下次连接生效。"
+                } else {
+                    "播放捕获（默认）：走 MediaProjection 投屏授权；" +
+                        "无投屏权限时自动回退 REMOTE_SUBMIX。下次连接生效。"
+                }
+        }
+
+        val savedCap = DisplayPrefs.audioCapturePreferSubmix(ctx)
+        refreshAudioCap(savedCap)
+
+        fun applyAudioCap(preferSubmix: Boolean) {
+            if (preferSubmix == DisplayPrefs.audioCapturePreferSubmix(ctx)) return
+            DisplayPrefs.setAudioCapturePreferSubmix(ctx, preferSubmix)
+            refreshAudioCap(preferSubmix)
+            hostToast(
+                if (preferSubmix) {
+                    "音频采集首选：REMOTE_SUBMIX（下次连接生效）"
+                } else {
+                    "音频采集首选：播放捕获（下次连接生效）"
+                },
+            )
+        }
+        capProjection.setOnClickListener { applyAudioCap(false) }
+        capSubmix.setOnClickListener { applyAudioCap(true) }
+
         // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
     }
 }

@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import io.github.shaonialife.cardeck.MainActivity
 import io.github.shaonialife.cardeck.SessionController
 import io.github.shaonialife.cardeck.audio.SilentProjectionActivity
+import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.util.Bg
 import io.github.shaonialife.cardeck.util.DebugFileLog
 
@@ -126,6 +127,11 @@ class CarPlayService : Service() {
                 if (userDeclinedAudio) {
                     fileLog("AUTO: 用户偏好仅推视频——本次自动连接不带声音")
                     SessionController.audioEnabledForSession = false
+                } else if (DisplayPrefs.audioCapturePreferSubmix(app)) {
+                    // 采集首选 REMOTE_SUBMIX（2026-11-20）：投影令牌仅播放捕获兜底需要，
+                    // 跳过静默领取；submix 不可用 → 音频通道不启动（日志有提示）
+                    fileLog("AUTO: 采集首选 REMOTE_SUBMIX——跳过静默投屏领取")
+                    SessionController.audioEnabledForSession = true
                 } else {
                     SessionController.audioEnabledForSession = acquireProjectionSilently()
                 }

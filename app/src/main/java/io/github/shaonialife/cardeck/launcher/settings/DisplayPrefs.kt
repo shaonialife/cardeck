@@ -48,6 +48,9 @@ object DisplayPrefs {
     /** 断开后保留活动应用的横屏覆盖（默认开）。 */
     const val KEEP_ORIENTATION_ALIVE_DEFAULT = true
 
+    /** 音频采集首选链路：false=播放捕获（MediaProjection，默认），true=REMOTE_SUBMIX。 */
+    const val AUDIO_CAPTURE_PREFER_SUBMIX_DEFAULT = false
+
     /** 保留期重试窗口数（每窗 60s）：连续 N 窗未恢复即销毁虚拟屏。 */
     const val RETENTION_RETRIES_DEFAULT = 3
     const val RETENTION_RETRIES_MIN = 1
@@ -138,6 +141,7 @@ object DisplayPrefs {
     private const val KEY_AUDIO_ROUTE_RECLAIM = "audio_route_reclaim"
     private const val KEY_KEEP_DISPLAYS = "keep_displays_on_disconnect"
     private const val KEY_KEEP_ORIENTATION_ALIVE = "keep_orientation_alive_on_teardown"
+    private const val KEY_AUDIO_CAPTURE_PREFER_SUBMIX = "audio_capture_prefer_submix"
     private const val KEY_RETENTION_RETRIES = "display_retention_retries"
 
     /**
@@ -223,6 +227,27 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_KEEP_ORIENTATION_ALIVE, enabled)
+            .apply()
+    }
+
+    /**
+     * 音频采集首选链路（默认播放捕获，2026-11-20 车机设置→杂项可选）：false=播放捕获
+     * （MediaProjection，0.1.10 真车有声形态），true=REMOTE_SUBMIX（shell 管道直采，
+     * 接管手机媒体路由/手机静音）。首选不可用时自动落到另一条；下次连接生效。
+     */
+    fun audioCapturePreferSubmix(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUDIO_CAPTURE_PREFER_SUBMIX, AUDIO_CAPTURE_PREFER_SUBMIX_DEFAULT)
+
+    fun setAudioCapturePreferSubmix(
+        context: Context,
+        preferSubmix: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUDIO_CAPTURE_PREFER_SUBMIX, preferSubmix)
             .apply()
     }
 

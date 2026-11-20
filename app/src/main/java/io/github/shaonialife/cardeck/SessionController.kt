@@ -1983,26 +1983,37 @@ object SessionController {
                 appendLog("AUDIO: 无预协商音频流——本次仅推视频")
                 return false
             }
-            // **采集源：优先播放捕获（MediaProjection）**，REMOTE_SUBMIX 退为兜底。
-            // 2026-11-18：回溯 0.1.10 有声版 `3d23b3bf`——该版本**只有播放捕获**
-            // （`AudioRecord.Builder.setAudioPlaybackCaptureConfig`），且真车出声。
-            // 本机 0.1.28.x 系列改用 REMOTE_SUBMIX（shell UserService 管道）后
-            // 全程无声；两者的 AudioFlinger policy 挂点不同（submix 在音量应用点
-            // 之前凭空接管媒体路由，播放捕获走系统标准 capture 路径），是本轮
-            // 已核对的**最后一处形态差异**。先按有声版走播放捕获。
-            val submixService = CarInputClient.service
-            val projection0 = CarPlayService.mediaProjection
-            val submixFd =
-                if (projection0 != null) {
-                    appendLog("AUDIO: 采集走播放捕获（MediaProjection，0.1.10 有声形态）")
-                    null
+            // **采集源首选链路（车机设置→杂项，2026-11-20 用户可选；默认=播放捕获）**：
+            // 播放捕获（MediaProjection，默认首选）与 REMOTE_SUBMIX（shell
+            // UserService 管道直采）互为兜底——首选不可用（无投屏权限 / Shizuku 侧
+            // submix 启动失败）自动落到另一条。两者的 AudioFlinger policy 挂点不同
+            // （submix 在音量应用点之前凭空接管媒体路由、播放捕获走系统标准 capture
+            // 路径），0.1.10 真车验证过播放捕获有声，故默认首选它。下次连接生效。
+            val preferSubmix = DisplayPrefs.audioCapturePreferSubmix(context)
+
+            fun startSubmixFd(): android.os.ParcelFileDescriptor? =
+                CarInputClient.service?.let { service ->
+                    runCatching { service.startSubmixAudio(audio.sampleRate) }
+                        .onFailure { appendLog("AUDIO: REMOTE_SUBMIX 启动异常：${it.message}") }
+                        .getOrNull()
+                }
+
+            val submixFd: android.os.ParcelFileDescriptor? =
+                if (preferSubmix) {
+                    startSubmixFd()?.also {
+                        appendLog("AUDIO: 采集走 REMOTE_SUBMIX（设置首选）")
+                    } ?: run {
+                        appendLog("AUDIO: REMOTE_SUBMIX 不可用——回退播放捕获（MediaProjection）")
+                        null
+                    }
                 } else {
-                    submixService
-                        ?.let { service ->
-                            runCatching { service.startSubmixAudio(audio.sampleRate) }
-                                .onFailure { appendLog("AUDIO: REMOTE_SUBMIX 启动异常：${it.message}") }
-                                .getOrNull()
-                        }?.also { appendLog("AUDIO: 无投屏权限——回退 REMOTE_SUBMIX") }
+                    if (CarPlayService.mediaProjection != null) {
+                        appendLog("AUDIO: 采集走播放捕获（MediaProjection，默认首选）")
+                        null
+                    } else {
+                        appendLog("AUDIO: 无投屏权限——回退 REMOTE_SUBMIX")
+                        startSubmixFd()
+                    }
                 }
             val sender =
                 AudioSender(
@@ -2077,7 +2088,7 @@ object SessionController {
             if (!started) {
                 audioSender = null
                 // 未成功进入采集循环也显式收口（stop 已触发 onStopped，此处幂等兜底）
-                runCatching { submixService?.stopSubmixAudio() }
+                runCatching { CarInputClient.service?.stopSubmixAudio() }
                 false
             } else {
                 true

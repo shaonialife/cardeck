@@ -151,3 +151,11 @@
   BridgeOverlay），改 main 公共 API 时 `grep -rn "SessionController\." app/src/remote`
   过一遍即可。0.1.28.171 修复：BridgeCommands.get_state 改用 `phaseHint`（英雄卡
   副标题同源）。
+- **连接后手机自动旋转开关被打开 = 地图应用写的，不是我们（2026-11-20 排查）**：
+  全量 grep 主源码 + Shizuku UserService + remote 桥，没有任何 accelerometer_rotation
+  /user_rotation 写操作（settings put 仅常亮的 screen_off_timeout）。触发链：连接 →
+  仪表盘 → 默认地图（高德）自动启动 → 高德持 WRITE_SETTINGS（修改系统设置权限），
+  启动/导航时自动开启系统自动旋转（全局设置，虚拟屏实例照样改手机开关），断开不
+  还原。用户选择不处理（导航期间手机跟随转向反而有用）。若日后要治：会话级快照
+  还原（同 screen_off_timeout 备份/恢复模式）或 `appops set <地图包> WRITE_SETTINGS
+  ignore`（可能影响地图功能，慎用）。
