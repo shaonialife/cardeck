@@ -613,3 +613,24 @@
   dumpsys 仍见该 flag——疑似 VDM 对虚拟设备屏强制补挂（同屏还自动补了
   ALWAYS_UNLOCKED）。注意：DESTROY 在屏释放时的实际行为（销毁 vs reparent）与此
   flag 的关系在本 ROM 上未定谳——断开保留/reparent 存活已实测成立，别急着下结论。
+- **触摸注入 v3：per-slot 会话 + 多指支持（2026-11-21，三轮实机打回后定型）**：
+  ① 注入事件走**专用单线程队列**（touch-inject）——cached 池并发派发触点会乱序/
+  竞态状态机，派发器直接拒收；② 队列**合并规则**：`Contact.down=true` 同时涵盖
+  「按下」与「移动」，队列里该 slot 的**第一条 down 条目是 DOWN、其余是 MOVE**——
+  DOWN 已在队列 → 新事件替换最后一条 down（最新坐标）；UP → 保留第一条 DOWN（点击
+  位置）删除其后 MOVE 再追加。**教训：首版「UP 替换队尾 down 条目」把快速点击的
+  DOWN 吞了 → 点击全部丢失、滑动却正常**；③ MOVE 注入走 **ASYNC 模式（0）**——
+  WAIT_FOR_FINISHED 每条阻塞到被消费，高频拖拽积压=滞后根因；④ **per-slot 独立会话**
+  （服务端 slotDrags map + AIDL slot 首参）：每个槽位各自的 downTime/displayId——
+  旧全局单套变量在双指下互踩；⑤ 服务端「吸收 + 流断自愈」：无会话的 MOVE/UP
+  吸收返回 true（scrcpy 同款）；MOVE 失败自动重发 DOWN 重建流（display resize 会
+  重置派发器跟踪）；⑥ **多指（buildMulti）三轮修复**：IntArray obtain 的
+  toolType=UNKNOWN → 应用忽略（PointerProperties 版显式 FINGER）；**source 必须用
+  `setSource()` setter**——obtain 位置参数在荣耀 ROM 上 edgeFlags/source 区段错位
+  （dump 实证 source=0x0、TOUCHSCREEN 值跑进 edgeFlags），Float 版有效正因用了
+  setter；**pointerUp 先构建后移除**——remove 先行让抬起事件缺本指（主指抬起变成
+  其它指的 UP、本指卡死 → 后续点击失效）；多指流中抬指一律 buildMulti（Float 单指
+  UP 只带 id0，id1 卡死污染流）；⑦ 触摸诊断日志开关 `TOUCH_DIAG_LOG`（默认关，
+  事件 dump 写 carinput_svc.log）；⑧ **AIDL 接口变更 = 必须杀 `:car_input` 进程再测**
+  ——Shizuku 复用旧进程跑旧 AIDL，新事务码参数错位（触摸全灭/事件打歪），app 内
+  自清机制不够及时；⑨ 触摸注入节流已移除（队列合并替代，设置项删除）。

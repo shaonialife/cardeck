@@ -432,7 +432,30 @@ object TouchRouter {
             // 单指手势逻辑；已有活动指时的其它 slot 事件整段忽略（Float obtain 单指流
             // pointerId 固定 0，一次只支持一指；双指缩放待多指针构建修好后恢复）。
             val known = pressedSlots.containsKey(contact.slot)
-            if (!known && (!contact.down || pressedSlots.isNotEmpty())) return // 副指/未知槽 UP：忽略
+            if (!known) {
+                // 未知槽：UP 忽略；副指按下→直注（服务端多指分支聚合，2026-11-21 恢复）；
+                // 副指异屏忽略（双指缩放两指必同屏）
+                if (!contact.down) return
+                if (pressedSlots.isEmpty()) { // 首指：落到下方主指逻辑
+                } else {
+                    val anchorDisplay = pressedSlots.values.first()
+                    if (targetDisplay != anchorDisplay) return
+                    val ok = svc.pointerDown(contact.slot, targetDisplay, localX, localY)
+                    if (ok) pressedSlots[contact.slot] = targetDisplay
+                    return
+                }
+            } else if (contact.slot != pressedSlot) {
+                // 副指 MOVE/UP：直注本指流
+                val prev = pressedSlots[contact.slot] ?: return
+                if (!contact.down) {
+                    svc.pointerUp(contact.slot, prev, localX, localY)
+                    pressedSlots.remove(contact.slot)
+                    return
+                }
+                if (targetDisplay != prev) return // 副指跨屏忽略
+                svc.pointerMove(contact.slot, targetDisplay, localX, localY)
+                return
+            }
             val ok: Boolean =
                 when {
                     contact.down && !pressed -> {

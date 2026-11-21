@@ -1260,14 +1260,28 @@ class CarInputServiceImpl(
     // 待 buildMulti（多指针事件构建）修好后恢复。
 
     private class SlotDrag(
+        val slot: Int,
         var downTime: Long, // 自愈重建流时会重置（MOVE 的 downTime 必须与 DOWN 一致）
         var displayId: Int,
+        var x: Float,
+        var y: Float,
     )
 
     private val slotDrags = java.util.HashMap<Int, SlotDrag>()
 
     /** 注入流断自愈计数（诊断用）。 */
     private var resyncCount = 0
+
+    /**
+     * 触摸注入诊断日志开关（默认关）：每次 DOWN/POINTER_DOWN/UP 打一条事件 dump
+     * 到 carinput_svc.log——排查多点触控问题用，平时关闭避免日志膨胀。
+     */
+    private var touchDiagLog = false
+
+    private var multiMoveCount = 0
+
+    /** 本流曾包含 ≥2 指针（多指流中抬指必须用 buildMulti——Float 单指 UP 会卡死其它指针）。 */
+    private var multiStreamActive = false
 
     override fun pointerDown(
         slot: Int,
@@ -1278,9 +1292,25 @@ class CarInputServiceImpl(
         // 双 DOWN 吸收（该 slot 已在拖拽中——状态脱节/跨队列边界）
         if (slotDrags.containsKey(slot)) return true
         val now = SystemClock.uptimeMillis()
+        val secondFinger = slotDrags.isNotEmpty()
+        if (secondFinger) {
+            // 第二指按下 → 切多指流：注入「全部指针 + POINTER_DOWN(slot)」事件
+            // （应用识别缩放手势的前提 = 同一事件流携带多个指针；两个独立单指流不行）
+            slotDrags[slot] = SlotDrag(slot, now, displayId, x.toFloat(), y.toFloat())
+            multiStreamActive = true
+            val ev =
+                buildMulti(displayId, now, MotionEvent.ACTION_POINTER_DOWN, slot) ?: run {
+                    fileLog("TOUCH-DIAG: slot=$slot P_DOWN buildMulti=null")
+                    return false
+                }
+            val ok = inject(ev, displayId, 2)
+            if (touchDiagLog) fileLog("TOUCH-DIAG: slot=$slot P_DOWN disp=$displayId n=${slotDrags.size} ok=$ok ev=$ev")
+            return ok
+        }
         val down = build(now, now, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat()) ?: return false
         val ok = inject(down, displayId, 2)
-        if (ok) slotDrags[slot] = SlotDrag(now, displayId)
+        if (ok) slotDrags[slot] = SlotDrag(slot, now, displayId, x.toFloat(), y.toFloat())
+        if (touchDiagLog) fileLog("TOUCH-DIAG: slot=$slot DOWN disp=$displayId ok=$ok")
         return ok
     }
 
@@ -1293,6 +1323,18 @@ class CarInputServiceImpl(
         val drag = slotDrags[slot] ?: return true // 吸收：无会话的 MOVE 是过期残留
         if (drag.displayId != displayId) return true // 异屏 MOVE：吸收
         val now = SystemClock.uptimeMillis()
+        drag.x = x.toFloat()
+        drag.y = y.toFloat()
+        if (slotDrags.size >= 2) {
+            // 多指流：MOVE 事件携带全部活动指针的最新坐标
+            val ev = buildMulti(displayId, now, MotionEvent.ACTION_MOVE, slot) ?: return false
+            val ok = inject(ev, displayId, 0)
+            multiMoveCount += 1
+            if (multiMoveCount % 120 == 1) {
+                fileLog("TOUCH-DIAG: slot=$slot MOVE-MULTI disp=$displayId n=${slotDrags.size} ok=$ok cnt=$multiMoveCount ev=$ev")
+            }
+            return ok
+        }
         val move = build(drag.downTime, now, MotionEvent.ACTION_MOVE, x.toFloat(), y.toFloat()) ?: return false
         // MOVE 走 ASYNC 模式（2026-11-20）：WAIT_FOR_FINISHED 每条阻塞到被完整消费，
         // 高频拖拽时注入耗时 > 事件到达间隔 → 队列积压 → 注入位置落后手指（滞后根因）。
@@ -1317,11 +1359,90 @@ class CarInputServiceImpl(
         x: Int,
         y: Int,
     ): Boolean {
-        val drag = slotDrags.remove(slot) ?: return true // 吸收：无会话的 UP
+        // ⚠ **先取不移除**：UP 事件必须携带全部指针（含本指）——remove 先行会让事件
+        // 缺本指（主指抬起变成其它指的 UP、本指卡死 → 后续点击全失效，2026-11-21 实测）。
+        val drag = slotDrags[slot] ?: return true // 吸收：无会话的 UP
         if (drag.displayId != displayId) return true // 异屏 UP：吸收
         val now = SystemClock.uptimeMillis()
-        val up = build(drag.downTime, now, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat()) ?: return false
-        return inject(up, displayId, 2)
+        drag.x = x.toFloat()
+        drag.y = y.toFloat()
+        val remaining = slotDrags.size - 1
+        // ⚠ 抬指构建器按流形态选：**multiStreamActive 时必须走 buildMulti**（事件携带
+        // 表内全部指针）——Float 单指 UP 只带 pointerId=0，多指流中会卡死其它指针
+        // （id1 永不抬起 → 流被污染 → 缩放全废，2026-11-21 诊断实锤）。表清空后退出
+        // 多指流形态。
+        val up =
+            if (multiStreamActive || remaining >= 1) {
+                buildMulti(displayId, now, if (remaining >= 1) MotionEvent.ACTION_POINTER_UP else MotionEvent.ACTION_UP, slot)
+                    ?: return false
+            } else {
+                build(drag.downTime, now, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat()) ?: return false
+            }
+        val ok = inject(up, displayId, 2)
+        if (touchDiagLog) fileLog("TOUCH-DIAG: slot=$slot UP disp=$displayId remaining=$remaining ok=$ok multi=$multiStreamActive")
+        if (ok) slotDrags.remove(slot)
+        if (slotDrags.isEmpty()) multiStreamActive = false
+        return ok
+    }
+
+    /**
+     * 构建多指针 MotionEvent（slotDrags 全表，slot 排序 → pointerIndex 稳定）。
+     * PointerCoords 补齐 toolMajor/contactMajor 等接触面积字段（全 0 会被部分应用
+     * 忽略）；toolType=FINGER（IntArray 版 obtain 的 UNKNOWN toolType 是上版
+     * 「注入 OK 但应用无响应」根因）；pointerId=slot；displayId 走重载尾参。
+     */
+    private fun buildMulti(
+        displayId: Int,
+        now: Long,
+        action: Int,
+        actionSlot: Int,
+    ): MotionEvent? {
+        val entries = slotDrags.entries.sortedBy { it.key }
+        val n = entries.size
+        if (n == 0) return null
+        val props = Array(n) { MotionEvent.PointerProperties() }
+        val coords = Array(n) { MotionEvent.PointerCoords() }
+        var slotIndex = -1
+        entries.forEachIndexed { i, (slot, drag) ->
+            props[i].id = slot
+            props[i].toolType = MotionEvent.TOOL_TYPE_FINGER
+            coords[i].x = drag.x
+            coords[i].y = drag.y
+            coords[i].pressure = 1f
+            coords[i].size = 1f
+            coords[i].toolMajor = 40f
+            coords[i].toolMinor = 40f
+            coords[i].touchMajor = 40f
+            coords[i].touchMinor = 40f
+            if (slot == actionSlot) slotIndex = i
+        }
+        val downTime = entries.minOf { it.value.downTime }
+        val actionFinal =
+            when {
+                action == MotionEvent.ACTION_POINTER_DOWN || action == MotionEvent.ACTION_POINTER_UP ->
+                    action or (slotIndex.coerceAtLeast(0) shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
+                else -> action
+            }
+        // ⚠ obtain 位置参数在这台 ROM 上 edgeFlags/source/flags 区段不可信（实机 dump：
+        // source=0x0、edgeFlags=0x1002——恰好是我传的 source 值错位进了 edgeFlags 槽）。
+        // 有效的旧 Float 版用 **setSource setter**——这里 obtain 后同样显式补设。
+        return MotionEvent
+            .obtain(
+                downTime,
+                now,
+                actionFinal,
+                n,
+                props,
+                coords,
+                0, // metaState
+                0, // buttonState
+                0f,
+                0f, // xPrecision / yPrecision
+                0, // edgeFlags
+                android.view.InputDevice.SOURCE_TOUCHSCREEN,
+                0, // flags
+                displayId, // displayId 重载尾参
+            ).apply { setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN) }
     }
 
     // ---- 受信虚拟屏 ----
