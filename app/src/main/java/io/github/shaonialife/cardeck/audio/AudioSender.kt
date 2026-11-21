@@ -812,13 +812,25 @@ class AudioSender(
 
     /** pacer 补位用的一帧静音载荷：AAC = 编码全零帧（保编码器状态连续），
      *  PCM = 全零帧。编码器不可用 → null（调用方按链路故障收口）。 */
+
+    /** 最近一次编出的静音帧缓存——编码器 lookahead 期（喂了零输入但尚未
+     *  吐帧）回退复用：AAC 对全零输入的输出帧恒定，复用即合法静音。 */
+    private var lastSilenceFrame: ByteArray? = null
+
+    /**
+     * pacer 补位用的一帧静音载荷。AAC = 编码全零帧（保编码器状态连续），
+     * **空输出 ≠ 故障**——MediaCodec 有 1~2 帧 lookahead（AacLcEncoder.encode
+     * 文档明载），lookahead 期回退复用 [lastSilenceFrame]；PCM = 全零帧。
+     * 编码器不可用且无缓存 → null（调用方按未就绪处理，不收口）。
+     */
     private fun silencePayload(): ByteArray? {
-        val pcm = ByteArray(framePcmBytes)
-        return if (codec == AudioCodec.AAC_LC) {
-            aacEncoder?.encode(pcm, framePcmBytes)?.firstOrNull()
-        } else {
-            pcm
+        if (codec != AudioCodec.AAC_LC) return ByteArray(framePcmBytes)
+        val frames = aacEncoder?.encode(ByteArray(framePcmBytes), framePcmBytes)
+        frames?.firstOrNull()?.let {
+            lastSilenceFrame = it
+            return it
         }
+        return lastSilenceFrame
     }
 
     /**
@@ -828,9 +840,30 @@ class AudioSender(
      * 发送失败/异常 → [stop] 收口（与旧采集循环同契约）。
      */
     private fun runPacerLoop(tickNanos: Long) {
-        var nextTick = System.nanoTime() + tickNanos
+        // 时间表从**首个可发帧**起算（预热门）：MediaCodec AAC 有 1~2 帧
+        // lookahead，start 后首批 encode() 返回空属正常（AacLcEncoder.encode
+        // 文档明载）。旧版首帧未就绪即到点、把「空输出」当编码器不可用
+        // → 开机 ~90ms 即收口 → 无声（0.1.28.181 真机实测）。
+        var nextTick = -1L
         var lastLogAt = 0L
+        var warmupSkips = 0
         while (running.get()) {
+            if (nextTick == -1L) {
+                // 预热门：等首个可发帧（队列内容或静音帧）再建立时间表
+                val first = sendQueue.poll() ?: silencePayload()
+                if (first == null) {
+                    warmupSkips++
+                    if (warmupSkips == 1 || warmupSkips % 250 == 0) {
+                        log("AUDIO: pacer 预热等待编码器首帧（$warmupSkips 轮）")
+                    }
+                    java.util.concurrent.locks.LockSupport
+                        .parkNanos(2_000_000)
+                    continue
+                }
+                if (!sendPayload(first)) break
+                nextTick = System.nanoTime() + tickNanos
+                continue
+            }
             val now = System.nanoTime()
             if (now < nextTick) {
                 // 睡到 tick（parkNanos 精度优于 Thread.sleep 的 ms 取整；
@@ -868,8 +901,11 @@ class AudioSender(
                     } else {
                         val silence = silencePayload()
                         if (silence == null) {
-                            log("AUDIO: 补静音失败（编码器不可用）——收口")
-                            fatal = true
+                            // 编码器吐不出静音且无缓存：不收口——重试（时间表
+                            // 与 ts 均不推进；编码器真损坏时采集线程会先异常
+                            // 退出 → stop 兜底）。旧版在此 fatal = 开机秒死根因。
+                            java.util.concurrent.locks.LockSupport
+                                .parkNanos(2_000_000)
                             break
                         }
                         silenceFilledPackets++

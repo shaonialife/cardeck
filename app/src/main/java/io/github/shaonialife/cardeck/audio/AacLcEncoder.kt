@@ -157,7 +157,12 @@ class AacLcEncoder(
      *
      * 编码器内部有延迟（首帧通常要喂 1~2 帧才吐第一包），所以返回值可能为空，
      * 调用方按「拿到的帧逐个发包」处理即可。
+     *
+     * ⚠ MediaCodec 非线程安全：采集线程（内容帧）与 pacer（静音帧，延迟
+     * 台阶修复 2026-11-21 起）会并发调用，方法级锁保护 codec 会话与
+     * presentationUs 游标。
      */
+    @Synchronized
     fun encode(
         pcm: ByteArray,
         size: Int,
