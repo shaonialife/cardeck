@@ -97,6 +97,18 @@ class AudioSender(
          *  超限丢最旧（车机重传/PLC 兜底）——生产持续快于标称不应发生。 */
         const val SEND_QUEUE_CAP = 16
 
+        /** pacer 自身停顿的 resync 阈值（落后时长）：超过即跳过积压对齐
+         *  重启——迟到包被接收端 R3 discardLate 丢弃，补发无意义。 */
+        const val RESYNC_BEHIND_NANOS = 1_000_000_000L
+
+        /** resync 跳包数（纯函数，JVM 可测）：落后 ≤ 阈值 → 0（走追赶补发）；
+         *  超 → 跳过的包数（seq/ts/nonce 同步前进，队列内容重获新 ts）。 */
+        internal fun resyncSkipPackets(
+            behindNanos: Long,
+            tickNanos: Long,
+            thresholdNanos: Long,
+        ): Long = if (behindNanos <= thresholdNanos || tickNanos <= 0) 0 else behindNanos / tickNanos
+
         /**
          * 0xD4 同步锚（纯函数，JVM 可测）：pacing 下 ts↔墙钟严格线性——
          * 锚 = 最近一次实际发送的 (ts, 墙钟) + 按标称采样率外推
@@ -188,6 +200,8 @@ class AudioSender(
     private var silenceFilledPackets = 0
 
     private var queueDroppedPackets = 0
+
+    private var resyncCount = 0
 
     /**
      * 采集诊断发现全零时的嫌疑回调（宿主侧核「确有应用在播」后再断开蓝牙音频
@@ -491,6 +505,12 @@ class AudioSender(
             // pacer 线程（墙钟节拍）先于采集起：采集入队即可，无初始积压
             Thread(
                 {
+                    // 音频高优先级：pacer 卡顿 = 到达空窗（发送者停了没人能替）
+                    runCatching {
+                        android.os.Process.setThreadPriority(
+                            android.os.Process.THREAD_PRIORITY_URGENT_AUDIO,
+                        )
+                    }
                     try {
                         runPacerLoop(samplesPerPacket * 1_000_000_000L / sampleRate)
                     } catch (error: Throwable) {
@@ -818,6 +838,24 @@ class AudioSender(
                 java.util.concurrent.locks.LockSupport
                     .parkNanos(nextTick - now)
                 continue
+            }
+            // 到点（或滞后）：**长卡顿 resync 前置**——落后超阈值时跳过积压
+            // 对齐重启。理由：迟到包会被接收端 R3 discardLate 丢弃（迟到补发
+            // ≈ 丢弃但更脏——车机还要消化迟到包、可能空转重传请求）；发送端
+            // 跳过 = 车机见 seq/ts 空洞 → PLC 填充，ts↔墙钟立即重对齐，
+            // 不产生永久延迟台阶。resendCache 不补洞（miss→PLC 兜底）。
+            val behind = now - nextTick
+            val skip = resyncSkipPackets(behind, tickNanos, RESYNC_BEHIND_NANOS)
+            if (skip > 0) {
+                sequence = (sequence + skip.toInt()) and 0xFFFF
+                timestamp += skip * samplesPerPacket
+                nonceCounter += skip
+                nextTick += skip * tickNanos
+                resyncCount++
+                log(
+                    "AUDIO: pacer 停顿 ${behind / 1_000_000}ms 超阈——resync 跳过 " +
+                        "$skip 包（seq=$sequence ts=$timestamp，累计 resync=$resyncCount）",
+                )
             }
             // 到点（或滞后）：真内容优先，空则补静音；追赶上限 12 包
             var fatal = false
