@@ -97,6 +97,10 @@ class AudioSender(
          *  超限丢最旧（车机重传/PLC 兜底）——生产持续快于标称不应发生。 */
         const val SEND_QUEUE_CAP = 16
 
+        /** pacer 队列目标水位（包）：超此深度每 tick 多排一包衰减回来
+         *  （深度衰减，2026-11-21）——深队列吃车机 jitter 余量。 */
+        const val QUEUE_TARGET = 2
+
         /** pacer 自身停顿的 resync 阈值（落后时长）：超过即跳过积压对齐
          *  重启——迟到包被接收端 R3 discardLate 丢弃，补发无意义。 */
         const val RESYNC_BEHIND_NANOS = 1_000_000_000L
@@ -920,6 +924,21 @@ class AudioSender(
                 }
                 nextTick += tickNanos
                 burst++
+            }
+            if (fatal || !running.get()) break
+            // **深度衰减**：队列超目标水位时每 tick 多排一包真内容，把突发
+            // 堆积拉回目标。pacer 恰好按标称排水 → 突发堆上的深度是随机
+            // 游走、永不回落（11-21 实测恒挂 12 包）→ 到达时刻 ≈ 车机排播
+            // 时刻，吃光车机 jitter 余量（实测 290ms 缓冲中 ~40ms 即此类
+            // 自适应）。车机按 ts/锚排播，早到只是提前进它的 jitter buffer。
+            var drained = 0
+            while (running.get() && sendQueue.size > QUEUE_TARGET && drained < 2) {
+                val extra = sendQueue.poll() ?: break
+                if (!sendPayload(extra)) {
+                    fatal = true
+                    break
+                }
+                drained++
             }
             if (fatal || !running.get()) break
             val now2 = System.nanoTime()
