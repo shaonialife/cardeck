@@ -469,6 +469,7 @@ class DashboardPanelFragment : SettingsPanelFragment() {
         buildMapSection(view.findViewById(R.id.mapOptions))
         buildCardSection(view.findViewById(R.id.cardOptions))
         buildRatioSection(view)
+        buildTapSection(view)
     }
 
     /**
@@ -562,6 +563,47 @@ class DashboardPanelFragment : SettingsPanelFragment() {
 
         refreshMode()
         refreshSeek()
+    }
+
+    /**
+     * 点击地图卡片是否进入全屏（2026-11-21）：是（默认）=轻点地图卡片进入全屏地图
+     * （现状）；否=轻点不切全屏，仅操作卡片内地图（平移/缩放不受影响）。
+     */
+    private fun buildTapSection(view: View) {
+        val ctx = requireContext()
+        val yesBtn = view.findViewById<TextView>(R.id.btnTapFullYes)
+        val noBtn = view.findViewById<TextView>(R.id.btnTapFullNo)
+
+        fun segmentStyle(selected: Boolean): Pair<Int, Int> =
+            if (selected) {
+                R.drawable.bg_segment_sel to 0xFFFFFFFF.toInt()
+            } else {
+                R.drawable.bg_segment to 0xFF8E8E93.toInt()
+            }
+
+        fun refresh() {
+            val on = DashSplitPrefs.tapMapCardFullscreen(ctx)
+            val (bgYes, tcYes) = segmentStyle(on)
+            yesBtn.setBackgroundResource(bgYes)
+            yesBtn.setTextColor(tcYes)
+            val (bgNo, tcNo) = segmentStyle(!on)
+            noBtn.setBackgroundResource(bgNo)
+            noBtn.setTextColor(tcNo)
+        }
+
+        yesBtn.setOnClickListener {
+            if (DashSplitPrefs.tapMapCardFullscreen(ctx)) return@setOnClickListener
+            DashSplitPrefs.setTapMapCardFullscreen(ctx, true)
+            refresh()
+            hostToast("点击地图卡片：进入全屏地图")
+        }
+        noBtn.setOnClickListener {
+            if (!DashSplitPrefs.tapMapCardFullscreen(ctx)) return@setOnClickListener
+            DashSplitPrefs.setTapMapCardFullscreen(ctx, false)
+            refresh()
+            hostToast("点击地图卡片：不切全屏（仅操作卡片内地图）")
+        }
+        refresh()
     }
 
     /** 默认地图单选（原 DefaultMapPanelFragment 逻辑原样搬移）。 */

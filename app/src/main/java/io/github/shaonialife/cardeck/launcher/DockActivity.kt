@@ -122,6 +122,8 @@ class DockActivity : AppCompatActivity() {
         }
 
         VirtualLauncher.addRunningAppsListener(refreshListener)
+        // 右侧卡片固定应用切换 → 常驻项即时刷新（默认地图变化由 3s 轮询兜底）
+        VirtualLauncher.addPinnedCardListener(refreshListener)
         pollHandler.postDelayed(pollRunnable, 3_000)
         clockHandler.post(clockTicker)
         // 字号按「设计 px × designScale」设置（不进 XML：荣耀 ROM 上 autoSize 对窄 dock
@@ -144,6 +146,7 @@ class DockActivity : AppCompatActivity() {
     override fun onDestroy() {
         if (current === this) current = null
         VirtualLauncher.removeRunningAppsListener(refreshListener)
+        VirtualLauncher.removePinnedCardListener(refreshListener)
         pollHandler.removeCallbacksAndMessages(null)
         clockHandler.removeCallbacks(clockTicker)
         WallpaperStore
@@ -289,19 +292,29 @@ class DockActivity : AppCompatActivity() {
 
     private fun refresh() {
         val container = appsContainer ?: return
-        val current =
-            synchronized(VirtualLauncher.runningApps) {
-                VirtualLauncher.runningApps.map { it.flattenToString() }
+        val apps = synchronized(VirtualLauncher.runningApps) { VirtualLauncher.runningApps.toList() }
+        // 常驻项（2026-11-21）：地图卡片对应的默认地图 + 右侧卡片固定应用（选了才上）。
+        // 自动拉起路径不登记 runningApps（见 launchPinnedAppFresh/ensureMapTask 注释），
+        // 这两个图标只在这里补——点击走 launchApp 既有分流（地图→地图屏全屏、
+        // 固定应用→固定屏全屏）。地图屏未建（无会话）不查。
+        val mapComponent =
+            if (VirtualLauncher.mapDisplayId >= 0) VirtualLauncher.defaultMapComponent(this) else null
+        val pinnedComponent = VirtualLauncher.pinnedComponent
+        val ordered =
+            buildList {
+                mapComponent?.let(::add)
+                if (pinnedComponent != null && pinnedComponent != mapComponent) add(pinnedComponent)
+                apps.forEach { if (it != mapComponent && it != pinnedComponent) add(it) }
             }
+        val current = ordered.map { it.flattenToString() }
         if (current == lastRendered) return
         lastRendered = current
         container.removeAllViews()
         val density = resources.displayMetrics.density
         val iconPx = ((if (barForm) 32 else 30) * density).toInt()
         val pad = (6 * density).toInt()
-        val apps = synchronized(VirtualLauncher.runningApps) { VirtualLauncher.runningApps.toList() }
         val iconCache = VirtualLauncher.iconCache
-        apps.forEach { component ->
+        ordered.forEach { component ->
             val drawable = iconCache[component] ?: packageManager.defaultActivityIcon
             // 位图化渲染（与桌面网格同一路径）：直接 setImageDrawable 会让 ImageView
             // 长期持有共享 Drawable 实例，其 bounds 被网格重绑改写后渲染错位

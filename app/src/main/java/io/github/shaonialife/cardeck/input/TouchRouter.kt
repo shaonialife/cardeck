@@ -2,6 +2,7 @@ package io.github.shaonialife.cardeck.input
 
 import android.content.Context
 import io.github.shaonialife.cardeck.launcher.CardGesture
+import io.github.shaonialife.cardeck.launcher.DashSplitPrefs
 import io.github.shaonialife.cardeck.launcher.LetterboxHintController
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.resolveCardGesture
@@ -519,6 +520,7 @@ object TouchRouter {
                 launcher.dashboardMode &&
                 !launcher.mapFullscreen
         updateMapTileTap(
+            context.applicationContext,
             launcher,
             contact,
             tileHit,
@@ -544,6 +546,7 @@ object TouchRouter {
     // ---- 仪表盘地图 tile「快速点按 → 全屏地图」检测 ----
     // 点按判定：按下→抬起 ≤400ms 且位移 ≤30px；抬起后 300ms 内无第二次按下
     // （确认窗规避地图双击缩放误触）。拖动/拖出 tile/双指等地图手势不触发。
+    // 触发与否受 车机设置→仪表盘「点击地图卡片进全屏」开关控制（关=仅操作卡片内地图）。
     private const val TAP_MAX_MS = 400L
     private const val TAP_MAX_MOVE_PX = 30
     private const val TAP_CONFIRM_MS = 300L
@@ -559,6 +562,7 @@ object TouchRouter {
     private var tapConfirm: Runnable? = null
 
     private fun updateMapTileTap(
+        context: Context,
         launcher: VirtualLauncher,
         contact: Contact,
         inTile: Boolean,
@@ -605,7 +609,10 @@ object TouchRouter {
                     tapConfirm =
                         Runnable {
                             tapConfirm = null
-                            if (launcher.dashboardMode && !launcher.mapFullscreen) {
+                            if (launcher.dashboardMode &&
+                                !launcher.mapFullscreen &&
+                                DashSplitPrefs.tapMapCardFullscreen(context)
+                            ) {
                                 logSink?.invoke("LAUNCHER: 地图卡片点按 → 全屏地图")
                                 launcher.setMapFullscreen(true)
                             }
