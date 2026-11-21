@@ -631,22 +631,26 @@ class AudioSender(
                     var refusedStreak = 0
                     while (running.get() && !client.isClosed) {
                         try {
-                            // **锚 = pacer 发送节拍时刻**（2026-11-21 重基——延迟
-                            // 台阶修复后 ts↔墙钟严格线性，[paceAnchorNanosOf]
-                            // 按 lastSent 基点外推 = 精确；旧「采集时刻锚」在
-                            // stall+静音填充下跨洞外推失真，退役为回退）。
-                            // RTP ts 本身只是样本计数，赋予它绝对意义的只有
-                            // 这个 0xD4 锚。
+                            // **锚 = 该 RTP ts 的采集时刻**（cfa36f2 音画同步
+                            // 语义恢复——2026-11-21 真机测量定谳：车机按
+                            // ts/锚排播（车机缓冲 289ms 恒定、与队列深度无关），
+                            // 锚基准错多少延迟就多多少。pacer 化时误改成
+                            // 「发送时刻」基准 → 我方管线深度（队列+lookahead
+                            // ≈350ms）被整体带进车机排播时间表 = 体感 +1s）。
+                            // pacer 下 ts↔墙钟严格线性 → 采集锚的标称外推
+                            // **跨静音洞也精确**（洞时长 = ts 空档 = 墙钟空档），
+                            // 当初「跨洞失真」的顾虑已被 pacing 消除。
+                            // [paceAnchorNanosOf]（发送时刻）降为回退。
                             val next = timestamp
                             val current = (next - samplesPerPacket).coerceAtLeast(0L)
                             val anchorNanos =
-                                paceAnchorNanosOf(
-                                    next,
-                                    lastSentTs,
-                                    lastSentNanos,
-                                    sampleRate,
-                                )
-                                    ?: captureTimeOf(next)
+                                captureTimeOf(next)
+                                    ?: paceAnchorNanosOf(
+                                        next,
+                                        lastSentTs,
+                                        lastSentNanos,
+                                        sampleRate,
+                                    )
                                     ?: System.nanoTime()
                             val packet =
                                 NativeBridge.nativeAirplayAudioSyncPacket(
