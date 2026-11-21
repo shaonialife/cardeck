@@ -93,6 +93,29 @@ class AudioSender(
          *  @0x24552112c 对齐，超出窗口的请求必然 miss（PLC 兜底）。 */
         const val RESEND_CACHE_SIZE = 512
 
+        /** pacer 发送队列深度上限（包）。正常稳态 ∈ [0..2]（突发缓冲用）；
+         *  超限丢最旧（车机重传/PLC 兜底）——生产持续快于标称不应发生。 */
+        const val SEND_QUEUE_CAP = 16
+
+        /**
+         * 0xD4 同步锚（纯函数，JVM 可测）：pacing 下 ts↔墙钟严格线性——
+         * 锚 = 最近一次实际发送的 (ts, 墙钟) + 按标称采样率外推
+         * （Δts 是**样本数**，每样本 = 1e9/sampleRate ns；勿乘
+         * samplesPerPacket——曾双乘，单测钉住）。无发送基点（会话刚开始）
+         * → null（调用方回退 captureTimeOf/now）。
+         */
+        internal fun paceAnchorNanosOf(
+            sampleTs: Long,
+            lastSentTs: Long,
+            lastSentNanos: Long,
+            sampleRate: Int,
+        ): Long? =
+            if (lastSentTs >= 0 && lastSentNanos > 0) {
+                lastSentNanos + (sampleTs - lastSentTs) * 1_000_000_000L / sampleRate
+            } else {
+                null
+            }
+
         private const val READ_TIMEOUT_QUIET_MILLIS = 500L
 
         /** 静音前媒体音量的持久化键（进程被杀也不丢恢复目标）。 */
@@ -138,6 +161,33 @@ class AudioSender(
     private var retransmitHits = 0
 
     private var retransmitMisses = 0
+
+    // ---- 发送端恒定节拍（pacer）——延迟台阶修复（2026-11-21，待办#2 兑现）----
+    // 病根（真车日志逐窗口定谳）：采集/编码 stall（亚秒级，REMOTE_SUBMIX
+    // 管道源/编码器/系统负载均可触发）期间无内容产出，ts 按内容计数推进
+    // → ts 永久落后墙钟一个 stall 时长 → 接收端按标称速率排播 → 延迟
+    // 台阶式累积（11-21 实测：5 分钟会话内一次 0.4s 内容洞，稳态窗口
+    // 逐窗 48002/s 零漂移——亏速集中在孤立 stall，非稳态速率偏差）。
+    // 修复 = 采集/编码只入队，pacer 按墙钟 tick（samplesPerPacket/
+    // sampleRate，AAC@48k = 21.33ms）发送：ts↔墙钟严格线性；队列空
+    // （stall）补一帧编码静音——stall 表现为瞬时静音而非永久延迟台阶。
+    // fw 对照：AirPlaySender 的 sendOneAudioDataMessage 由音频管线时钟
+    // 驱动（管线为实时域）；Android 采集管线非实时 → pacer = 固件形的
+    // 平台等价实现（发送侧 jitter buffer，代价 = 固定 1-2 包队列延迟）。
+    private val sendQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+
+    /** pacer 最近一次实际发送的 (ts, 墙钟)——0xD4 同步锚的线性基
+     *  （pacing 下锚 = lastSentNanos + (ts−lastSentTs)×tick，见
+     *  [paceAnchorNanosOf]）。 */
+    @Volatile private var lastSentTs = -1L
+
+    @Volatile private var lastSentNanos = 0L
+
+    private var pacerThread: Thread? = null
+
+    private var silenceFilledPackets = 0
+
+    private var queueDroppedPackets = 0
 
     /**
      * 采集诊断发现全零时的嫌疑回调（宿主侧核「确有应用在播」后再断开蓝牙音频
@@ -244,10 +294,9 @@ class AudioSender(
     private val samplesPerPacket: Long
         get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.FRAME_SAMPLES.toLong() else SAMPLES_PER_PACKET.toLong()
 
-    /** 采集+推流统计（日志限流用）。 */
+    /** 采集+推流统计（pacer 线程独占写）。 */
     private var packetsSent = 0L
     private var bytesSent = 0L
-    private var lastLogAt = 0L
     private var readFailures = 0
 
     val isRunning: Boolean get() = running.get()
@@ -439,6 +488,24 @@ class AudioSender(
             // 同步包线程先起：锚点越早建立，接收端越早能排播
             startSyncLoop()
 
+            // pacer 线程（墙钟节拍）先于采集起：采集入队即可，无初始积压
+            Thread(
+                {
+                    try {
+                        runPacerLoop(samplesPerPacket * 1_000_000_000L / sampleRate)
+                    } catch (error: Throwable) {
+                        // 后台线程未捕获异常会杀死整个进程
+                        log("AUDIO: 发送节拍线程异常退出 - ${error.message}")
+                        stop()
+                    }
+                },
+                "audio-pacer",
+            ).apply {
+                isDaemon = true
+                start()
+                pacerThread = this
+            }
+
             Thread(
                 {
                     if (record != null) {
@@ -490,6 +557,8 @@ class AudioSender(
         syncSocket = null
         syncThread = null
         thread = null
+        pacerThread = null
+        sendQueue.clear()
         resendCache.clear()
         if (!wasSubmix) restorePhoneMedia()
         // 宿主收口（submix 模式释放 UserService 侧 AudioRecord，媒体路由随之恢复）；
@@ -543,16 +612,23 @@ class AudioSender(
                     var refusedStreak = 0
                     while (running.get() && !client.isClosed) {
                         try {
-                            // **锚 = 该 RTP ts 的采集时刻，不是发包时刻**
-                            // （2026-11-18 音画不同步修正）：RTP ts 本身只是样本
-                            // 计数，赋予它绝对意义的只有这个 0xD4 锚。
-                            // [syncAnchorTs]/[syncAnchorNanos] 是采集循环在「读满
-                            // 一帧」时成对写下的样本序号↔采集时刻；用相邻锚点线性
-                            // 外推到当前 ts，避免受 AAC 编码器批量出帧的抖动影响。
+                            // **锚 = pacer 发送节拍时刻**（2026-11-21 重基——延迟
+                            // 台阶修复后 ts↔墙钟严格线性，[paceAnchorNanosOf]
+                            // 按 lastSent 基点外推 = 精确；旧「采集时刻锚」在
+                            // stall+静音填充下跨洞外推失真，退役为回退）。
+                            // RTP ts 本身只是样本计数，赋予它绝对意义的只有
+                            // 这个 0xD4 锚。
                             val next = timestamp
                             val current = (next - samplesPerPacket).coerceAtLeast(0L)
                             val anchorNanos =
-                                captureTimeOf(next) ?: System.nanoTime()
+                                paceAnchorNanosOf(
+                                    next,
+                                    lastSentTs,
+                                    lastSentNanos,
+                                    sampleRate,
+                                )
+                                    ?: captureTimeOf(next)
+                                    ?: System.nanoTime()
                             val packet =
                                 NativeBridge.nativeAirplayAudioSyncPacket(
                                     syncSequence,
@@ -571,7 +647,7 @@ class AudioSender(
                                 val lagMs = (System.nanoTime() - anchorNanos) / 1_000_000
                                 log(
                                     "AUDIO: 首个同步包已发出（X 位=1）ts=$current→$next " +
-                                        "锚=采集时刻（滞后 ${lagMs}ms 已扣除）" +
+                                        "锚=发送节拍（pacer 基，滞后 ${lagMs}ms）" +
                                         "——车机若仍无声，说明它没在等这个锚点",
                                 )
                             }
@@ -696,21 +772,14 @@ class AudioSender(
                     verifyEncodedFrame(payloads.first())
                 }
 
-                var sendFailed = false
                 for (payload in payloads) {
-                    if (!sendPayload(payload)) {
-                        sendFailed = true
-                        break
+                    // 只入队不发送——节拍由 pacer 按墙钟统一驱动（延迟台阶
+                    // 修复，见 [sendQueue] 注）；超限丢最旧
+                    if (sendQueue.size >= SEND_QUEUE_CAP) {
+                        sendQueue.poll()
+                        queueDroppedPackets++
                     }
-                }
-                if (sendFailed) break
-                val now = android.os.SystemClock.uptimeMillis()
-                if (now - lastLogAt >= 30_000L) {
-                    lastLogAt = now
-                    log(
-                        "AUDIO: 推流中（累计 $packetsSent 包，${bytesSent / 1024}KB，" +
-                            "seq=$sequence ts=$timestamp）",
-                    )
+                    sendQueue.offer(payload)
                 }
             }
         } catch (error: Throwable) {
@@ -718,6 +787,73 @@ class AudioSender(
             log("AUDIO: 采集线程异常退出 - ${error.message}")
         } finally {
             stop()
+        }
+    }
+
+    /** pacer 补位用的一帧静音载荷：AAC = 编码全零帧（保编码器状态连续），
+     *  PCM = 全零帧。编码器不可用 → null（调用方按链路故障收口）。 */
+    private fun silencePayload(): ByteArray? {
+        val pcm = ByteArray(framePcmBytes)
+        return if (codec == AudioCodec.AAC_LC) {
+            aacEncoder?.encode(pcm, framePcmBytes)?.firstOrNull()
+        } else {
+            pcm
+        }
+    }
+
+    /**
+     * 发送节拍线程（墙钟 tick 驱动）：每 tick 发一包——队列有真内容发真
+     * 内容，空（采集 stall）则补静音，ts↔墙钟严格线性；自身滞后（GC/
+     * 挂起）按追赶上限补发，不快进基点（快进 = 重新引入 ts 落后）。
+     * 发送失败/异常 → [stop] 收口（与旧采集循环同契约）。
+     */
+    private fun runPacerLoop(tickNanos: Long) {
+        var nextTick = System.nanoTime() + tickNanos
+        var lastLogAt = 0L
+        while (running.get()) {
+            val now = System.nanoTime()
+            if (now < nextTick) {
+                // 睡到 tick（parkNanos 精度优于 Thread.sleep 的 ms 取整；
+                // 上限留出 stop 响应窗）
+                java.util.concurrent.locks.LockSupport
+                    .parkNanos(nextTick - now)
+                continue
+            }
+            // 到点（或滞后）：真内容优先，空则补静音；追赶上限 12 包
+            var fatal = false
+            var burst = 0
+            while (running.get() && System.nanoTime() >= nextTick && burst < 12) {
+                val payload = sendQueue.poll()
+                val actual =
+                    if (payload != null) {
+                        payload
+                    } else {
+                        val silence = silencePayload()
+                        if (silence == null) {
+                            log("AUDIO: 补静音失败（编码器不可用）——收口")
+                            fatal = true
+                            break
+                        }
+                        silenceFilledPackets++
+                        silence
+                    }
+                if (!sendPayload(actual)) {
+                    fatal = true
+                    break
+                }
+                nextTick += tickNanos
+                burst++
+            }
+            if (fatal || !running.get()) break
+            val now2 = System.nanoTime()
+            if (now2 - lastLogAt >= 30_000_000_000L) {
+                lastLogAt = now2
+                log(
+                    "AUDIO: 推流中（累计 $packetsSent 包，${bytesSent / 1024}KB，" +
+                        "seq=$sequence ts=$timestamp，队列=${sendQueue.size} " +
+                        "补静音=$silenceFilledPackets 丢帧=$queueDroppedPackets）",
+                )
+            }
         }
     }
 
@@ -760,6 +896,8 @@ class AudioSender(
         val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
         markerPending = false
         lastPacketAt = now
+        // pacer 基点记账（0xD4 同步锚用）：本包 ts ↔ 实际发送完成时刻
+        lastSentTs = timestamp
         // 重传缓存入窗（键 = 本包 seq；[resend] 原样重发）
         resendCache.store(sequence, wire)
         sequence = (sequence + 1) and 0xFFFF
@@ -778,6 +916,7 @@ class AudioSender(
             client.send(DatagramPacket(wire, wire.size))
             packetsSent++
             bytesSent += wire.size
+            lastSentNanos = System.nanoTime()
             true
         } catch (error: IOException) {
             log("AUDIO: UDP 发送失败 - ${error.message}")
