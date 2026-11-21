@@ -225,7 +225,6 @@ class AudioSender(
     /** 首个音频包标记（打完就清）；AAC 自检只跑一次。 */
     private var markerPending = true
 
-    /** 车机相位锚是否已接合（首锚跳变置 marker 一次）。 */
     /** 相位锚可用性只记录一次（诊断；**不影响 ts**——ts 零基自增）。 */
     @Volatile private var phaseAnchorChecked = false
 
@@ -922,10 +921,23 @@ class AudioSender(
             val now2 = System.nanoTime()
             if (now2 - lastLogAt >= 30_000_000_000L) {
                 lastLogAt = now2
+                // 车机排播缓冲直接测量：我们已发的 ts − 车机相位（feedback
+                // sampleTime 读回，R7 相位锚同源）= 在途样本数。发送管线
+                // 队列恒 ≤4 包已排除，延迟若在此值 = 车机侧缓冲/锚偏移；
+                // ≈0 则延迟在车机排播决策内部（不进 wire、我方不可控）。
+                val carPhase = phaseTsProvider()
+                val bufferTail =
+                    if (carPhase > 0) {
+                        "，车机相位=$carPhase " +
+                            "车机缓冲≈${(timestamp - carPhase) * 1000L / sampleRate}ms"
+                    } else {
+                        ""
+                    }
                 log(
                     "AUDIO: 推流中（累计 $packetsSent 包，${bytesSent / 1024}KB，" +
                         "seq=$sequence ts=$timestamp，队列=${sendQueue.size} " +
-                        "补静音=$silenceFilledPackets 丢帧=$queueDroppedPackets）",
+                        "补静音=$silenceFilledPackets 丢帧=$queueDroppedPackets" +
+                        "$bufferTail）",
                 )
             }
         }
