@@ -215,6 +215,98 @@ class MiscPanelFragment : SettingsPanelFragment() {
             },
         )
 
-        // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
+        // 断开后保留活动应用横屏（默认开）：teardown 复原（resetAll）对仍在运行的
+        // 应用跳过 am compat disable——该命令会立即杀进程，正在导航的应用被打断
+        // （2026-11-19 用户要求）。已退出的应用照常复原。
+        // （2026-11-21 回归修复：0.1.28.178 移除节流段时脚本误删了本段接线，XML 按钮无监听器）
+        val keepOriOn = view.findViewById<TextView>(R.id.btnKeepOriOn)
+        val keepOriOff = view.findViewById<TextView>(R.id.btnKeepOriOff)
+        val keepOriNote = view.findViewById<TextView>(R.id.keepOriNote)
+
+        fun refreshKeepOri(enabled: Boolean) {
+            keepOriOn.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            keepOriOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+            keepOriOff.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            keepOriOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
+            keepOriNote.text =
+                if (enabled) {
+                    "断开会话时，屏上应用（如导航）会自动挪回手机继续运行——不退出、页面状态保留，" +
+                        "名单内应用不撤销横屏覆盖、不重启；已退出的应用照常复原。" +
+                        "在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
+                } else {
+                    "已关闭：断开时撤销名单内所有应用的横屏覆盖（仍在运行的会被重启）；" +
+                        "应用本身仍会挪回手机继续运行。"
+                }
+        }
+
+        val savedKeepOri = DisplayPrefs.keepOrientationForAliveApps(ctx)
+        refreshKeepOri(savedKeepOri)
+
+        fun applyKeepOri(enabled: Boolean) {
+            if (enabled == DisplayPrefs.keepOrientationForAliveApps(ctx)) return
+            DisplayPrefs.setKeepOrientationForAliveApps(ctx, enabled)
+            refreshKeepOri(enabled)
+            hostToast(
+                if (enabled) {
+                    "已开启：断开后仍在运行的应用保留横屏（不重启）"
+                } else {
+                    "已关闭：断开时复原全部应用横屏（运行中的应用会重启）"
+                },
+            )
+        }
+        keepOriOn.setOnClickListener { applyKeepOri(true) }
+        keepOriOff.setOnClickListener { applyKeepOri(false) }
+
+        // 音频采集首选链路（默认播放捕获，2026-11-20）：播放捕获（MediaProjection）
+        // ↔ REMOTE_SUBMIX（shell 管道直采，接管手机媒体路由）。
+        // 首选不可用自动落另一条；下次连接生效（采集在连接时启动）。
+        val capProjection = view.findViewById<TextView>(R.id.btnAudioCapProjection)
+        val capSubmix = view.findViewById<TextView>(R.id.btnAudioCapSubmix)
+        val capNote = view.findViewById<TextView>(R.id.audioCapNote)
+
+        fun refreshAudioCap(preferSubmix: Boolean) {
+            capProjection.setBackgroundResource(
+                if (preferSubmix) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            capProjection.setTextColor(
+                if (preferSubmix) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt(),
+            )
+            capSubmix.setBackgroundResource(
+                if (preferSubmix) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            capSubmix.setTextColor(
+                if (preferSubmix) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt(),
+            )
+            capNote.text =
+                if (preferSubmix) {
+                    "REMOTE_SUBMIX：shell 管道直采（需 Shizuku 在场），接管手机媒体路由、" +
+                        "手机本地静音；不可用时自动回退播放捕获。下次连接生效。"
+                } else {
+                    "播放捕获（默认）：走 MediaProjection 投屏授权；" +
+                        "无投屏权限时自动回退 REMOTE_SUBMIX。下次连接生效。"
+                }
+        }
+
+        val savedCap = DisplayPrefs.audioCapturePreferSubmix(ctx)
+        refreshAudioCap(savedCap)
+
+        fun applyAudioCap(preferSubmix: Boolean) {
+            if (preferSubmix == DisplayPrefs.audioCapturePreferSubmix(ctx)) return
+            DisplayPrefs.setAudioCapturePreferSubmix(ctx, preferSubmix)
+            refreshAudioCap(preferSubmix)
+            hostToast(
+                if (preferSubmix) {
+                    "音频采集首选：REMOTE_SUBMIX（下次连接生效）"
+                } else {
+                    "音频采集首选：播放捕获（下次连接生效）"
+                },
+            )
+        }
+        capProjection.setOnClickListener { applyAudioCap(false) }
+        capSubmix.setOnClickListener { applyAudioCap(true) }
     }
 }

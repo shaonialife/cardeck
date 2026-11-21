@@ -64,3 +64,12 @@
   路径、每次 bind 现算（~150² 像素扫描，量级可忽略）；iconCache 里的 Drawable 是
   共享实例，渲染必须走 constantState.newDrawable().mutate() 副本（bounds 污染坑
   见 AppIcons 头注释）。
+
+- **设置面板「XML 段在、Kotlin 接线被删」回归**（2026-11-21）：0.1.28.178 用脚本
+  按 marker 删「触摸注入节流」段时，MiscPanelFragment.kt 删除范围越过了节流段，
+  把相邻的「断开后保留应用横屏」「音频采集首选链路」两段接线一并删掉，而
+  fragment_panel_misc.xml 的段与 id 都还在——按钮照常渲染但点击无反应，编译/
+  lint/单测全绿（findViewById 的 listener 没人挂不算任何工具能查的问题），只有
+  实机点设置才暴露。教训：**设置面板的 XML 段与 Fragment 接线是两份必须成对维护
+  的状态**，脚本删段后必须核对「XML 里每个交互 id 在 Kotlin 里都有 findViewById」
+  （grep id 即可）；净差异审查用「与加段前的提交 diff」比「肉眼看」可靠。
