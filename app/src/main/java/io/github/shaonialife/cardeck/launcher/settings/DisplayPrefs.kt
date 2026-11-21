@@ -134,7 +134,6 @@ object DisplayPrefs {
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_FPS = "display_fps"
-    private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
     private const val KEY_HID_RAW_LOG = "hid_raw_log"
     private const val KEY_TOUCH_FULL_LOG = "touch_full_log"
@@ -343,24 +342,6 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putInt(KEY_FPS, if (fps >= 60) 60 else 30)
-            .apply()
-    }
-
-    /** 触摸 move 注入节流（ms；0=关闭）。 */
-    fun moveThrottleMs(context: Context): Int =
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getInt(KEY_MOVE_THROTTLE, MOVE_THROTTLE_DEFAULT)
-            .coerceIn(0, MOVE_THROTTLE_MAX)
-
-    fun setMoveThrottleMs(
-        context: Context,
-        ms: Int,
-    ) {
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putInt(KEY_MOVE_THROTTLE, ms.coerceIn(0, MOVE_THROTTLE_MAX))
             .apply()
     }
 }

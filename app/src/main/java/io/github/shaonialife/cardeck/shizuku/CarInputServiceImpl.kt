@@ -1132,6 +1132,8 @@ class CarInputServiceImpl(
     private fun inject(
         event: InputEvent,
         displayId: Int,
+        // 注入模式（AOSP InputManager：ASYNC=0，WAIT_FOR_RESULT=1，WAIT_FOR_FINISHED=2）
+        mode: Int = 2,
     ): Boolean {
         val inj = injector
         if (inj == null) {
@@ -1143,9 +1145,9 @@ class CarInputServiceImpl(
             val m = inj.method
             val result: Boolean =
                 when {
-                    m.parameterTypes.size == 2 -> m.invoke(inj.receiver, event, 2) as Boolean
-                    m.parameterTypes[2] == java.lang.Long.TYPE -> m.invoke(inj.receiver, event, 2, 0L) as Boolean
-                    else -> m.invoke(inj.receiver, event, 2, displayId) as Boolean
+                    m.parameterTypes.size == 2 -> m.invoke(inj.receiver, event, mode) as Boolean
+                    m.parameterTypes[2] == java.lang.Long.TYPE -> m.invoke(inj.receiver, event, mode, 0L) as Boolean
+                    else -> m.invoke(inj.receiver, event, mode, displayId) as Boolean
                 }
             if (!result && !injectFailLogged) {
                 injectFailLogged = true
@@ -1250,42 +1252,76 @@ class CarInputServiceImpl(
         return inject(up, displayId)
     }
 
-    private var dragDownTime = 0L
-    private var dragDisplay = -1
+    // ---- 触摸注入：per-slot 独立会话（2026-11-21 v2）----
+    // 每个 slot 各自一套拖拽会话（downTime/displayId），互不干扰；构建用 Float
+    // obtain 单指形态（source=0）——多点改造前的已验证实现，滑动流畅的基线。
+    // Float obtain 的 pointerId 固定 0 → 同时只支持一指：第二指的 DOWN 会被派发器
+    // 按流一致性拒绝（返回 false），应用侧副指整段忽略（TouchRouter）——双指缩放
+    // 待 buildMulti（多指针事件构建）修好后恢复。
+
+    private class SlotDrag(
+        var downTime: Long, // 自愈重建流时会重置（MOVE 的 downTime 必须与 DOWN 一致）
+        var displayId: Int,
+    )
+
+    private val slotDrags = java.util.HashMap<Int, SlotDrag>()
+
+    /** 注入流断自愈计数（诊断用）。 */
+    private var resyncCount = 0
 
     override fun pointerDown(
+        slot: Int,
         displayId: Int,
         x: Int,
         y: Int,
     ): Boolean {
+        // 双 DOWN 吸收（该 slot 已在拖拽中——状态脱节/跨队列边界）
+        if (slotDrags.containsKey(slot)) return true
         val now = SystemClock.uptimeMillis()
-        dragDownTime = now
-        dragDisplay = displayId
         val down = build(now, now, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat()) ?: return false
-        return inject(down, displayId)
+        val ok = inject(down, displayId, 2)
+        if (ok) slotDrags[slot] = SlotDrag(now, displayId)
+        return ok
     }
 
     override fun pointerMove(
+        slot: Int,
         displayId: Int,
         x: Int,
         y: Int,
     ): Boolean {
-        if (dragDisplay != displayId) return false
+        val drag = slotDrags[slot] ?: return true // 吸收：无会话的 MOVE 是过期残留
+        if (drag.displayId != displayId) return true // 异屏 MOVE：吸收
         val now = SystemClock.uptimeMillis()
-        val move = build(dragDownTime, now, MotionEvent.ACTION_MOVE, x.toFloat(), y.toFloat()) ?: return false
-        return inject(move, displayId)
+        val move = build(drag.downTime, now, MotionEvent.ACTION_MOVE, x.toFloat(), y.toFloat()) ?: return false
+        // MOVE 走 ASYNC 模式（2026-11-20）：WAIT_FOR_FINISHED 每条阻塞到被完整消费，
+        // 高频拖拽时注入耗时 > 事件到达间隔 → 队列积压 → 注入位置落后手指（滞后根因）。
+        val ok = inject(move, displayId, 0)
+        if (ok) return true
+        // 流断自愈：显示配置变更（地图 resize/letterbox 重启等）会重置派发器内该屏的
+        // 注入指针跟踪——之后的 MOVE 因「无 DOWN 可配对」被一致性拒绝，整段断流。
+        // 自动重发 DOWN（当前位置）重建流再补 MOVE，用户无感、拖拽继续。
+        val down = build(now, now, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat()) ?: return false
+        if (!inject(down, displayId, 2)) return false
+        drag.downTime = now
+        val move2 = build(now, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, x.toFloat(), y.toFloat()) ?: return false
+        inject(move2, displayId, 0)
+        resyncCount += 1
+        fileLog("TOUCH: 注入流断——已自动重发 DOWN 重建（第 $resyncCount 次）")
+        return true
     }
 
     override fun pointerUp(
+        slot: Int,
         displayId: Int,
         x: Int,
         y: Int,
     ): Boolean {
-        if (dragDisplay != displayId) return false
-        dragDisplay = -1
+        val drag = slotDrags.remove(slot) ?: return true // 吸收：无会话的 UP
+        if (drag.displayId != displayId) return true // 异屏 UP：吸收
         val now = SystemClock.uptimeMillis()
-        val up = build(dragDownTime, now, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat()) ?: return false
-        return inject(up, displayId)
+        val up = build(drag.downTime, now, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat()) ?: return false
+        return inject(up, displayId, 2)
     }
 
     // ---- 受信虚拟屏 ----

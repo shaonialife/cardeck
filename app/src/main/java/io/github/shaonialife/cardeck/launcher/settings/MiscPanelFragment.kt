@@ -8,12 +8,10 @@ import android.widget.SeekBar
 import android.widget.TextView
 import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.bt.AutoConnectPrefs
-import io.github.shaonialife.cardeck.input.TouchRouter
 
 /**
  * 「杂项设置」面板：不属于任何主题域的开关。2026-10-26 从「显示」面板拆出
  * （「上车自动连接」「HID 原始日志」与显示毫无关系，挤在一起误导归类）；
- * 2026-11-18「触摸注入节流」自「显示」面板移入（调试调优类）。
  * 偏好存储位置不变（AutoConnectPrefs / DisplayPrefs），只是入口换了地方。
  */
 class MiscPanelFragment : SettingsPanelFragment() {
@@ -216,135 +214,6 @@ class MiscPanelFragment : SettingsPanelFragment() {
                 }
             },
         )
-
-        // 触摸注入节流（0=关闭，步进 8ms）：缓解「交互滞后但帧率正常」的事件堆积。
-        // 2026-11-18 自「显示」面板移入（调试调优类），偏好键与即时生效行为不变。
-        val throttleSeek = view.findViewById<SeekBar>(R.id.throttleSeek)
-        val throttleValue = view.findViewById<TextView>(R.id.throttleValue)
-
-        fun throttleText(ms: Int) = if (ms <= 0) "关闭" else "${ms}ms"
-
-        val savedThrottle = DisplayPrefs.moveThrottleMs(ctx)
-        throttleSeek.progress = savedThrottle / 8
-        throttleValue.text = throttleText(savedThrottle)
-        TouchRouter.moveThrottleMs = savedThrottle.toLong()
-
-        throttleSeek.setOnSeekBarChangeListener(
-            object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(
-                    seekBar: SeekBar?,
-                    progress: Int,
-                    fromUser: Boolean,
-                ) {
-                    if (!fromUser) return
-                    val ms = progress * 8
-                    throttleValue.text = throttleText(ms)
-                    DisplayPrefs.setMoveThrottleMs(ctx, ms)
-                    TouchRouter.moveThrottleMs = ms.toLong()
-                }
-
-                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    hostToast(
-                        "触摸节流 " + throttleText(DisplayPrefs.moveThrottleMs(ctx)),
-                    )
-                }
-            },
-        )
-
-        // 断开后保留活动应用横屏（默认开）：teardown 复原（resetAll）对仍在运行的
-        // 应用跳过 am compat disable——该命令会立即杀进程，正在导航的应用被打断
-        // （2026-11-19 用户要求）。已退出的应用照常复原。
-        val keepOriOn = view.findViewById<TextView>(R.id.btnKeepOriOn)
-        val keepOriOff = view.findViewById<TextView>(R.id.btnKeepOriOff)
-        val keepOriNote = view.findViewById<TextView>(R.id.keepOriNote)
-
-        fun refreshKeepOri(enabled: Boolean) {
-            keepOriOn.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
-            )
-            keepOriOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
-            keepOriOff.setBackgroundResource(
-                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
-            )
-            keepOriOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
-            keepOriNote.text =
-                if (enabled) {
-                    "断开会话时，屏上应用（如导航）会自动挪回手机继续运行——不退出、页面状态保留，" +
-                        "名单内应用不撤销横屏覆盖、不重启；已退出的应用照常复原。" +
-                        "在「管理桌面应用」里手动关闭某应用横屏仍会立即生效（应用会重启）。"
-                } else {
-                    "已关闭：断开时撤销名单内所有应用的横屏覆盖（仍在运行的会被重启）；" +
-                        "应用本身仍会挪回手机继续运行。"
-                }
-        }
-
-        val savedKeepOri = DisplayPrefs.keepOrientationForAliveApps(ctx)
-        refreshKeepOri(savedKeepOri)
-
-        fun applyKeepOri(enabled: Boolean) {
-            if (enabled == DisplayPrefs.keepOrientationForAliveApps(ctx)) return
-            DisplayPrefs.setKeepOrientationForAliveApps(ctx, enabled)
-            refreshKeepOri(enabled)
-            hostToast(
-                if (enabled) {
-                    "已开启：断开后仍在运行的应用保留横屏（不重启）"
-                } else {
-                    "已关闭：断开时复原全部应用横屏（运行中的应用会重启）"
-                },
-            )
-        }
-        keepOriOn.setOnClickListener { applyKeepOri(true) }
-        keepOriOff.setOnClickListener { applyKeepOri(false) }
-
-        // 音频采集首选链路（默认播放捕获，2026-11-20）：播放捕获（MediaProjection，
-        // 0.1.10 真车有声形态）↔ REMOTE_SUBMIX（shell 管道直采，接管手机媒体路由）。
-        // 首选不可用自动落另一条；下次连接生效（采集在连接时启动）。
-        val capProjection = view.findViewById<TextView>(R.id.btnAudioCapProjection)
-        val capSubmix = view.findViewById<TextView>(R.id.btnAudioCapSubmix)
-        val capNote = view.findViewById<TextView>(R.id.audioCapNote)
-
-        fun refreshAudioCap(preferSubmix: Boolean) {
-            capProjection.setBackgroundResource(
-                if (preferSubmix) R.drawable.bg_segment else R.drawable.bg_segment_sel,
-            )
-            capProjection.setTextColor(
-                if (preferSubmix) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt(),
-            )
-            capSubmix.setBackgroundResource(
-                if (preferSubmix) R.drawable.bg_segment_sel else R.drawable.bg_segment,
-            )
-            capSubmix.setTextColor(
-                if (preferSubmix) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt(),
-            )
-            capNote.text =
-                if (preferSubmix) {
-                    "REMOTE_SUBMIX：shell 管道直采（需 Shizuku 在场），接管手机媒体路由、" +
-                        "手机本地静音；不可用时自动回退播放捕获。下次连接生效。"
-                } else {
-                    "播放捕获（默认）：走 MediaProjection 投屏授权；" +
-                        "无投屏权限时自动回退 REMOTE_SUBMIX。下次连接生效。"
-                }
-        }
-
-        val savedCap = DisplayPrefs.audioCapturePreferSubmix(ctx)
-        refreshAudioCap(savedCap)
-
-        fun applyAudioCap(preferSubmix: Boolean) {
-            if (preferSubmix == DisplayPrefs.audioCapturePreferSubmix(ctx)) return
-            DisplayPrefs.setAudioCapturePreferSubmix(ctx, preferSubmix)
-            refreshAudioCap(preferSubmix)
-            hostToast(
-                if (preferSubmix) {
-                    "音频采集首选：REMOTE_SUBMIX（下次连接生效）"
-                } else {
-                    "音频采集首选：播放捕获（下次连接生效）"
-                },
-            )
-        }
-        capProjection.setOnClickListener { applyAudioCap(false) }
-        capSubmix.setOnClickListener { applyAudioCap(true) }
 
         // 车机壁纸（自首页迁入）：更换走 Photo Picker；恢复默认即时生效
     }

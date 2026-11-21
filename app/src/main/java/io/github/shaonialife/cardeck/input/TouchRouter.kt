@@ -5,10 +5,10 @@ import io.github.shaonialife.cardeck.launcher.CardGesture
 import io.github.shaonialife.cardeck.launcher.LetterboxHintController
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.resolveCardGesture
-import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.render.CARD_MARGIN_PX
 import io.github.shaonialife.cardeck.shizuku.CarInputClient
 import io.github.shaonialife.cardeck.util.Bg
+import java.util.concurrent.Executors
 
 /** 触点（字节解析在 Rust fw::airplay::hid——A6 下沉，本类只做路由注入）。 */
 data class Contact(
@@ -47,6 +47,12 @@ object TouchRouter {
     // 误路由），不加热路径锁（注入路径 Shell.exec 至多 3s 会卡 retire）。
     private var pressed = false
 
+    /** 主指（首指）slot：双指缩放时副指直通聚合注入，主指保留全部单指手势逻辑。 */
+    private var pressedSlot = -1
+
+    /** per-slot 会话表（slot → displayId）：每个槽位各自独立的拖拽会话。 */
+    private val pressedSlots = HashMap<Int, Int>()
+
     @Volatile
     private var pressedDisplay = -1
     private var failStreak = 0
@@ -81,21 +87,6 @@ object TouchRouter {
     @Volatile
     private var mapPullPressed = false
 
-    /**
-     * MOVE 注入节流：0 = 关闭；>0 时距上次注入不足该毫秒数的 move
-     * 直接合并丢弃（down/up 边界事件与跨屏切换永不节流，最终位置由 up 携带）。
-     * 症状：交互滞后但帧率正常（事件派发堆积）。设置「显示」面板可调，默认 24ms。
-     */
-    @Volatile
-    var moveThrottleMs: Long = 24L
-
-    @Volatile
-    private var throttleInited = false
-
-    private var lastInjectAt = 0L
-    private var throttledCount = 0
-    private var lastThrottleLogAt = 0L
-
     // 车机触摸坐标（通告视图坐标系，如 1160×540）→ 流坐标（缩放后 1450×674）的换算系数。
     // 分辨率缩放 ≠100% 时流比视图大，不换算会导致点击整体向右下漂移（dock 分流也错位）。
     @Volatile
@@ -113,6 +104,87 @@ object TouchRouter {
     ) {
         coordScaleX = if (viewW > 0) streamW.toFloat() / viewW else 1f
         coordScaleY = if (viewH > 0) streamH.toFloat() / viewH else 1f
+    }
+
+    /**
+     * 触点投递的专用串行队列（2026-11-20）：onContact 是**状态机**（pressed/pressedDisplay），
+     * 且 injectInputEvent mode=WAIT_FOR_FINISHED 同一时间只允许一个 sync 注入在途——
+     * 用 cached 池并发派发会乱序/竞态（UP 抢在 MOVE 前、双 DOWN、MOVE after UP），
+     * 派发器直接拒收（「注入被拒」）。单线程队列保序，同时把注入的 binder 往返从
+     * 事件读取线程解耦出去（滑动流畅的关键）。
+     */
+    private val touchExecutor =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "touch-inject") }
+
+    private val queueLock = Any()
+    private val queue = ArrayDeque<Contact>()
+    private var draining = false
+
+    /**
+     * 异步投递触点（串行保序 + **MOVE 合并**；调用方线程立即返回）。
+     *
+     * 合并是拖拽滞后的根治：注入吞吐 < 事件到达率时旧 MOVE 排队只会让注入位置
+     * 落后手指——同 slot 连续 MOVE 只保留最新（队列长度≈1），旧位置对拖拽无意义。
+     * DOWN/UP 不合并（流完整性）；MOVE 注入走 ASYNC 模式（服务端），单条成本极低。
+     */
+    fun onContactAsync(
+        context: Context,
+        contact: Contact,
+    ) {
+        // 空闲槽占位在**入口**丢弃（DiPlay 每帧恒发 #0/#1 两槽，#1 恒 (0,0) 未按下）。
+        // 注意 Contact.down=true 同时涵盖「按下」与「移动」——队列里该 slot 的**第一条
+        // down 条目是 DOWN，其余是 MOVE**，合并规则必须按此区分（2026-11-21 教训：
+        // 首版「UP 替换队尾 down 条目」把快速点击的 DOWN 也吞了——队列只剩孤立 UP
+        // 被服务端吸收 → 点击全部丢失、滑动却正常，正是用户观察到的症状）。
+        if (!contact.down && contact.xPixels == 0 && contact.yPixels == 0) return
+        val ctx = context.applicationContext
+        synchronized(queueLock) {
+            var firstDownIdx = -1
+            var lastDownIdx = -1
+            for ((i, c) in queue.withIndex()) {
+                if (c.slot == contact.slot && c.down) {
+                    if (firstDownIdx < 0) firstDownIdx = i
+                    lastDownIdx = i
+                }
+            }
+            if (contact.down) {
+                if (firstDownIdx >= 0) {
+                    // DOWN 已在队列：本条是 MOVE → 用最新坐标替换最后一条 down
+                    queue[lastDownIdx] = contact
+                } else {
+                    queue.addLast(contact) // 该 slot 无 pending DOWN → 本条就是按下
+                }
+            } else {
+                // UP：保留第一条 DOWN（点击位置），删除其后同 slot 的 MOVE，再追加 UP
+                if (firstDownIdx >= 0) {
+                    for (i in queue.size - 1 downTo firstDownIdx + 1) {
+                        if (queue[i].slot == contact.slot && queue[i].down) queue.removeAt(i)
+                    }
+                }
+                queue.addLast(contact)
+            }
+            if (!draining) {
+                draining = true
+                touchExecutor.execute { drain(ctx) }
+            }
+        }
+    }
+
+    private fun drain(ctx: Context) {
+        while (true) {
+            val c =
+                synchronized(queueLock) {
+                    queue.removeFirstOrNull() ?: run {
+                        draining = false
+                        null
+                    }
+                } ?: return
+            try {
+                onContact(ctx, c)
+            } catch (t: Throwable) {
+                logSink?.invoke("TOUCH: onContact 异常 ${t.message}")
+            }
+        }
     }
 
     fun onContact(
@@ -353,53 +425,42 @@ object TouchRouter {
         // MOVE 节流：同屏的连续 move 间隔不足时合并丢弃（状态机不动，最新位置
         // 由后续 move/up 携带）。down/up/跨屏切换不节流。
         val nowMs = android.os.SystemClock.uptimeMillis()
-        if (!throttleInited) {
-            throttleInited = true
-            moveThrottleMs =
-                DisplayPrefs
-                    .moveThrottleMs(context)
-                    .toLong()
-        }
-        if (moveThrottleMs > 0 &&
-            contact.down &&
-            pressed &&
-            pressedDisplay == targetDisplay &&
-            nowMs - lastInjectAt < moveThrottleMs
-        ) {
-            throttledCount++
-            if (nowMs - lastThrottleLogAt > 5_000) {
-                logSink?.invoke(
-                    "TOUCH: move 节流 ${moveThrottleMs}ms 生效——累计合并 $throttledCount 次",
-                )
-                throttledCount = 0
-                lastThrottleLogAt = nowMs
-            }
-            return
-        }
         try {
+            // ---- per-slot 分派（2026-11-21 v2）----
+            // 每个 slot 独立会话（服务端 per-slot 拖拽会话 + 本地 pressedSlots 表）。
+            // **首指**（按下时无任何活动 slot）保留 overlay 卡/把手/pinned 拉回等全部
+            // 单指手势逻辑；已有活动指时的其它 slot 事件整段忽略（Float obtain 单指流
+            // pointerId 固定 0，一次只支持一指；双指缩放待多指针构建修好后恢复）。
+            val known = pressedSlots.containsKey(contact.slot)
+            if (!known && (!contact.down || pressedSlots.isNotEmpty())) return // 副指/未知槽 UP：忽略
             val ok: Boolean =
                 when {
                     contact.down && !pressed -> {
                         pressed = true
+                        pressedSlot = contact.slot
+                        pressedSlots[contact.slot] = targetDisplay
                         pressedDisplay = targetDisplay
-                        svc.pointerDown(targetDisplay, localX, localY)
+                        svc.pointerDown(contact.slot, targetDisplay, localX, localY)
                     }
 
                     contact.down && pressedDisplay != targetDisplay -> {
-                        // 跨屏拖动：先在旧屏收笔，再在新屏按下
-                        runCatching { svc.pointerUp(pressedDisplay, 0, 0) }
+                        // 跨屏拖动（该 slot 自己的流）：先在旧屏收笔，再在新屏按下
+                        runCatching { svc.pointerUp(contact.slot, pressedDisplay, 0, 0) }
+                        pressedSlots[contact.slot] = targetDisplay
                         pressedDisplay = targetDisplay
-                        svc.pointerDown(targetDisplay, localX, localY)
+                        svc.pointerDown(contact.slot, targetDisplay, localX, localY)
                     }
 
-                    contact.down -> svc.pointerMove(targetDisplay, localX, localY)
+                    contact.down -> svc.pointerMove(contact.slot, targetDisplay, localX, localY)
 
                     else -> {
                         pressed = false
-                        svc.pointerUp(pressedDisplay, localX, localY)
+                        pressedSlot = -1
+                        val prev = pressedSlots.remove(contact.slot)
+                        pressedDisplay = -1
+                        if (prev != null) svc.pointerUp(contact.slot, prev, localX, localY) else true
                     }
                 }
-            if (ok) lastInjectAt = nowMs
             if (!ok) {
                 diag(
                     "注入被拒 disp=$targetDisplay ($localX,$localY) " +
@@ -444,7 +505,9 @@ object TouchRouter {
 
     fun reset() {
         pressed = false
+        pressedSlot = -1
         pressedDisplay = -1
+        pressedSlots.clear()
         overlayPressed = false
         splitHandlePressed = false
         pinnedPullPressed = false

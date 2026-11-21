@@ -9,11 +9,13 @@ interface ICarInput {
     boolean tap(int displayId, int x, int y);
     boolean swipe(int displayId, int startX, int startY, int endX, int endY, int durationMs);
 
-    // 连续拖拽原语：整段滑动共用一次 DOWN，MOVE 逐事件直注（真实时间戳），
-    // 应用侧速度跟踪器才能算出正确的滚动惯性。一次只支持单指。
-    boolean pointerDown(int displayId, int x, int y);
-    boolean pointerMove(int displayId, int x, int y);
-    boolean pointerUp(int displayId, int x, int y);
+    // 连续拖拽原语（2026-11-21 v2 per-slot 化）：**slot 首参**——每个槽位各自独立的
+    // 拖拽会话（downTime/displayId），互不干扰；构建用 Float obtain 单指形态（历史上
+    // 已验证的流畅基线）。一次只支持一指（Float obtain pointerId 固定 0，第二指的
+    // DOWN 会被派发器按流一致性拒绝）；双指缩放待多指针事件构建修好后恢复。
+    boolean pointerDown(int slot, int displayId, int x, int y);
+    boolean pointerMove(int slot, int displayId, int x, int y);
+    boolean pointerUp(int slot, int displayId, int x, int y);
 
     // 按键注入（iDrive 旋钮 → 方向键/确认键）：与触摸同一条 injectInputEvent 通路，
     // KeyEvent 带 targetDisplayId 直注虚拟屏，毫秒级、不碰手机主屏。

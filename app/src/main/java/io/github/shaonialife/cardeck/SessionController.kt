@@ -2658,9 +2658,13 @@ object SessionController {
                                                     touchSummaryAt = now
                                                 }
                                             }
+                                            // 逐条串行异步投递（TouchRouter.onContactAsync：
+                                            // 单线程队列保序——状态机与 WAIT_FOR_FINISHED 注入
+                                            // 都不容乱序/并发；恢复全 contacts 循环，多指帧的
+                                            // slot1+ 不再被丢弃）
                                             for (i in 0 until contacts.length()) {
                                                 val c = contacts.getJSONObject(i)
-                                                TouchRouter.onContact(
+                                                TouchRouter.onContactAsync(
                                                     context.applicationContext,
                                                     Contact(
                                                         slot = c.getInt("slot"),

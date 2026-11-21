@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 车机/手机共用的「显示」面板。外层 ScrollView：车机侧内容区只有约 200dp 高，
      多段内容（真息屏 / 分辨率 / 帧率 / 密度基准 / 壁纸）必须能滚动，否则最后一段被裁掉。
-     「触摸注入节流」2026-11-18 移入「杂项设置」（调试调优类）。 -->
+ -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
