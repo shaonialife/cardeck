@@ -29,9 +29,13 @@ while read -r local_ref local_sha remote_ref remote_sha || [ -n "${local_ref:-}"
         label="增量"
     fi
 
-    # 作者与提交者邮箱都要查（GitHub 两个都展示）
+    # 作者与提交者邮箱都要查（GitHub 两个都展示）。
+    # --not --remotes：排除远端已可达的提交——新分支/新 tag（remote_sha=ZERO）会扫
+    # 整条历史，而历史里早已公开在 origin 上的旧提交并不是「即将离开本机的对象」；
+    # 排除后防护语义更准：真正首次出本机的提交一个不漏（2026-11-22 发 v0.1.29 新
+    # 分支被 2026-10 已公开的历史邮箱拦死，据此修正）。
     bad=$(
-        git log --format='%ae%n%ce' $range 2>/dev/null |
+        git log --format='%ae%n%ce' $range --not --remotes 2>/dev/null |
             grep -v "@${ALLOWED_DOMAIN}$" |
             grep -v '^$' |
             sort -u || true
