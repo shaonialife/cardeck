@@ -1011,6 +1011,56 @@ class AirPlayLink(
         return sent
     }
 
+    /** OEM 屏交接 FSM 状态镜像（2026-11-21 五轮定谳）：screen 是否已归
+     *  iPhone（Controller=1）。翻转源 = [modesScreen] 发送成功
+     *  （toIos=true 起步重申 / toIos=false 退出交还）；车机入站 Request UI
+     *  也是触发器（激活/返回同一命令 → 宿主 oemReturn）。DiPlay 台架
+     *  从不发入站 Request UI 且无起步重申路径时恒 false → OEM 点击恒
+     *  requestUI 单发——真机对台架的同款行为。事件线程写、Bg 线程读。 */
+    @Volatile
+    var screenOwnedByIos: Boolean = false
+        private set
+
+    /**
+     * OEM 屏交接 modesChanged 双态单发（**2026-11-21 五轮定谳值**，
+     * 真机 FSM dump + Audi /info.modes 定谳）：toIos=true（激活/返回）=
+     * screen→iOS [1,1] + mainAudio [1,1]（= 起步单发恒等重申）；
+     * toIos=false（OEM 退出）= screen→Car [2,2] + mainAudio→Car/iOS [2,1]
+     * （"screen Car (permanent: Car), mainAudio Car (permanent: iOS)"）。
+     * wire 体在 Rust `send_modes_screen_handover`。
+     */
+    fun modesScreen(toIos: Boolean): Boolean {
+        val result = NativeBridge.nativeAirplayModesScreen(controlSessionHandle, if (toIos) 1 else 0)
+        val sent = result.isNullOrEmpty() || !result.contains("\"type\":\"error\"")
+        if (!sent) log("EVENT: modesScreen 发送失败(rust) - $result")
+        val out = NativeBridge.nativeAirplayTakeOutbound(controlSessionHandle)
+        val n = out?.size ?: 0
+        if (out != null && n > 0) {
+            synchronized(rtspWriteLock) {
+                runCatching {
+                    socket?.getOutputStream()?.apply {
+                        write(out)
+                        flush()
+                    }
+                }.onFailure { log("AIRPLAY: modesScreen 写网失败 - ${it.message}") }
+            }
+        }
+        if (sent) screenOwnedByIos = toIos
+        log(
+            "AIRPLAY: modesScreen（screen→${if (toIos) "iOS [1,1]" else "Car [2,2]+[2,1]"}）[控制通道] " +
+                "ok=$sent drained=${n}B screenOwnedByIos=$screenOwnedByIos",
+        )
+        return sent
+    }
+
+    /**
+     * 车机入站 requestUI（Request UI）→ 返回/激活序列（真机 16:48:03
+     * CarPlay 激活与 16:48:09 返回是同一入站命令）：modesChanged
+     * screen→iOS [1,1]（起步重申）+ screenOwnedByIos 翻转。屏流恢复由
+     * SessionController 随后执行（挂起中才需要）。
+     */
+    fun oemReturn(): Boolean = modesScreen(true)
+
     /**
      * /info 的 OEM 图标域 → 车机桌面「返回车机」块
      * （DiPlay 实测 {label "BYD", PNG 192², visible:true}；fw: copyOEMIcons

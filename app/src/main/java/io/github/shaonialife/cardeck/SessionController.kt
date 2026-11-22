@@ -305,12 +305,20 @@ object SessionController {
     var currentClient: AirPlayLink? = null
 
     /**
-     * 车机桌面「OEM 图标」块点击（用户令 2026-11-04）：发 requestUI——
-     * **会话保持不断**，车机切回原界面（用户在原界面的 CarPlay 入口点回来，
-     * 屏幕流全程保持）。fw 真身 = _carEndpoint_RequestCarUI @0x2277e8ab8
-     * → requestUI 命令；modesChanged 资源释放路线已撤（真机实测与资源
-     * 重申调度器互相打架，且非固件真身）。任意线程可调（内部转 Bg——
-     * 事件通道出站是 socket 写）。
+     * 车机桌面「OEM 图标」块点击（用户令 2026-11-04）：**退出序列（FSM
+     * 条件化，2026-11-21 五轮值定谳）**——requestUI 恒发；modesChanged
+     * screen→Car [2,2]+[2,1] **仅当屏已归 iPhone**（client.screenOwnedByIos
+     * ——起步 modesScreen(true) 重申成功即翻转，Audi 无入站 requestUI
+     * 也能成立）。真机双形实证：Audi（CarPlay 显示中点击）= 组合拳
+     * （requestUI + modes screen→Car + 屏流挂起）；DiPlay 台架（无激活）
+     * = requestUI 单发——无条件组合拳在台架上是 186 教训。任意线程可调。
+     *
+     * wire 值（五轮定谳，真机 FSM dump "screen Car (permanent: Car),
+     * mainAudio Car (permanent: iOS)"）：退出 = screen [2,2] + mainAudio
+     * [2,1]——在 Rust `send_modes_screen_handover(to_ios=false)`。
+     *
+     * 返回路径 = 车机入站 requestUI（connectEventChannel 的 "requestUI"
+     * 分支）→ [oemReturn]（modes screen→iOS [1,1] 起步重申）。
      */
     fun requestCarUi() {
         val client =
@@ -319,7 +327,35 @@ object SessionController {
                 return
             }
         Bg.run("request-car-ui") {
+            // 真机 16:48:06 实录顺序：requestUI 先、modesChanged screen→Car
+            // [2,2]+[2,1] 后。**屏流暂不挂起**（v7a 最小可测组合——真机 #3
+            // 屏流销毁的挂起/恢复机制在 Audi 首验后再决定是否补；v5 的
+            // 停帧挂起未单独定谳过，避免多变量混测）。
             client.requestCarUi()
+            if (client.screenOwnedByIos) {
+                client.modesScreen(false)
+                appendLog("OEM: 退出序列（requestUI + modes screen→Car [2,2]+[2,1]）")
+            } else {
+                appendLog("OEM: requestUI 单发（屏未归 iPhone——台架形）")
+            }
+        }
+    }
+
+    /**
+     * 车机入站 requestUI（Request UI）→ **返回/激活序列**（真机 16:48:03
+     * CarPlay 激活与 16:48:09 返回同一命令）：modesChanged screen→iOS
+     * [1,1]（= 起步单发恒等重申）+ 屏流恢复（挂起中才需要；缓存 dataPort
+     * 裸 TCP 重连，零重协商）。
+     */
+    fun oemReturn() {
+        val client =
+            currentClient ?: run {
+                appendLog("OEMRETURN: 无活动会话——忽略")
+                return
+            }
+        Bg.run("oem-return") {
+            client.oemReturn()
+            appendLog("OEM: 返回/激活序列（modes screen→iOS [1,1]，屏流全程未断）")
         }
     }
 
@@ -2498,6 +2534,15 @@ object SessionController {
                                     if (!created.cancelled && created.assertModes()) {
                                         appendLog("AIRPLAY: 起流——modesChanged 宣告完成（固件事件驱动）")
                                     }
+                                    // 起步 ×2 同构（2026-11-21 五轮定谳）：真机起步
+                                    // 单发 modesChanged **两次**（S1.2「启动×2」）——
+                                    // assertModes + modesScreen(true) 两次恒等 body
+                                    // = 同构；且 modesScreen(true) 成功即翻转
+                                    // screenOwnedByIos（Audi 无入站 requestUI，
+                                    // OEM 退出的组合拳前置由此建立）。
+                                    if (!created.cancelled && created.modesScreen(true)) {
+                                        appendLog("AIRPLAY: 起流重申——modesChanged screen→iOS [1,1]（起步×2 同构）")
+                                    }
                                 }
                             }
                             // ② 车机归还资源（UNBORROW/UNTAKE）= 模式状态变更事件，即时补发
@@ -2676,6 +2721,15 @@ object SessionController {
                                             }
                                         }
                                     }
+                                }
+
+                                "requestUI" -> {
+                                    // 车机入站 Request UI = screen 归属翻转触发器
+                                    // （真机 16:48:03 CarPlay 激活与 16:48:09 返回
+                                    // 同一命令）→ modes screen→iOS [1,1]（起步
+                                    // 重申）+ 屏流恢复（挂起中才需要）
+                                    appendLog("EVENT: 车机 Request UI 入站 → modes screen→iOS [1,1] + 屏流恢复")
+                                    oemReturn()
                                 }
 
                                 "forceKeyFrame" -> {

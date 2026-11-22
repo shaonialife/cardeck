@@ -594,6 +594,17 @@ object NativeBridge {
      *  返回 "" 或错误 JSON。 */
     external fun nativeAirplayRequestCarUi(handle: Long): String?
 
+    /** OEM 屏交接 modesChanged 双态单发（2026-11-21 二轮，catplay 枚举直切）：
+     *  [toIos] true = screen→Accessory/Accessory [2,2]（CarPlay 激活/车机
+     *  Request UI 返回——同一入站命令）；false = screen→Controller/Controller
+     *  [1,1]（OEM 退出交还）。**仅 screen 归属翻转时调**（FSM 门
+     *  takeActionOnModeChanges.cold.1 @0x227895eec——真机对 DiPlay 台架
+     *  点击只发 requestUI，无条件发 modes 会被台架 reset）。返回 "" 或错误。 */
+    external fun nativeAirplayModesScreen(
+        handle: Long,
+        toIos: Int,
+    ): String?
+
     /** D7 音频候选（从会话 'info' 存档选择——fw::airplay::session
      *  InfoReply::audio_candidates）。返回 JSON 数组，空 = 基线回退。
      *  **Int 约定（jboolean ABI 加固）**：0/1 显式传值。 */
