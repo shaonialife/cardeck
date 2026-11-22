@@ -101,6 +101,17 @@ class AudioSender(
          *  （深度衰减，2026-11-21）——深队列吃车机 jitter 余量。 */
         const val QUEUE_TARGET = 2
 
+        /** tick 自适应校准的钳制半径（±%，2026-11-22）：发送节拍跟随采集
+         *  喂入实测速率（REMOTE_SUBMIX 内容钟实测快于声明采样率 ~1.4%，
+         *  真车数据），钳制防测量毛刺把节拍拉飞。 */
+        const val TICK_ADJUST_PERCENT_MAX = 3L
+
+        /** tick 校准窗口（纳秒）：喂入速率以该窗实测。**10s 而非 30s**——
+         *  会话启动到首次校准之间发送按标称节拍（46.875pps）而喂入
+         *  ~47.5pps，净积压 ~0.6pps；30s 首窗积 ~18 帧 → 触碰队列上限
+         *  丢帧（真车 0.1.28.194「开头杂音」）→ 10s 窗净积 ~6 帧无害。 */
+        const val TICK_CALIB_WINDOW_NANOS = 10_000_000_000L
+
         /** pacer 自身停顿的 resync 阈值（落后时长）：超过即跳过积压对齐
          *  重启——迟到包被接收端 R3 discardLate 丢弃，补发无意义。 */
         const val RESYNC_BEHIND_NANOS = 1_000_000_000L
@@ -206,6 +217,13 @@ class AudioSender(
     private var queueDroppedPackets = 0
 
     private var resyncCount = 0
+
+    /** 采集喂入计数（帧，含全零帧）：pacer tick 校准的输入（2026-11-22
+     *  定谳——REMOTE_SUBMIX 内容钟快于声明采样率 ~1.4%，发送节拍必须
+     *  跟随实测喂入速率，否则 ts↔墙钟失配 → 车机缓冲棘轮）。 */
+    private val captureFedFrames =
+        java.util.concurrent.atomic
+            .AtomicLong(0)
 
     /**
      * 采集诊断发现全零时的嫌疑回调（宿主侧核「确有应用在播」后再断开蓝牙音频
@@ -805,8 +823,18 @@ class AudioSender(
                     if (sendQueue.size >= SEND_QUEUE_CAP) {
                         sendQueue.poll()
                         queueDroppedPackets++
+                        // 丢帧即刻日志（节流 1/50）：丢帧 = 内容空洞 → 车机
+                        // PLC 兜底 = 杂音——出现即说明喂入/发送速率失配，
+                        // 是 tick 校准必须介入的直接信号
+                        if (queueDroppedPackets == 1 || queueDroppedPackets % 50 == 0) {
+                            log(
+                                "AUDIO: ⚠ 队列满丢最旧帧（累计 $queueDroppedPackets，" +
+                                    "队列=${sendQueue.size}）——喂入快于发送节拍",
+                            )
+                        }
                     }
                     sendQueue.offer(payload)
+                    captureFedFrames.incrementAndGet()
                 }
             }
         } catch (error: Throwable) {
@@ -845,6 +873,14 @@ class AudioSender(
      * 内容，空（采集 stall）则补静音，ts↔墙钟严格线性；自身滞后（GC/
      * 挂起）按追赶上限补发，不快进基点（快进 = 重新引入 ts 落后）。
      * 发送失败/异常 → [stop] 收口（与旧采集循环同契约）。
+     *
+     * **tick 自适应（2026-11-22 真车定谳）**：REMOTE_SUBMIX 内容钟实测
+     * 快于声明采样率 ~1.4%（喂入 47.4~48.1pps vs 标称 46.875）——发送
+     * 若按标称 tick 排水消化堆积（旧版排水帧不占时间表），每排一包 =
+     * ts 超前墙钟 21.33ms → 车机按 ts 排播相对真实时间变慢 → 缓冲棘轮
+     * （30s +500ms、暂停/恢复后不回退 = 用户报的「延迟越来越严重」）
+     * → jitter buffer 溢出 = 杂音卡顿。修复 = ①排水帧占用未来 tick
+     * （速率守恒）②节拍跟随实测喂入速率（clamp ±3%）。
      */
     private fun runPacerLoop(tickNanos: Long) {
         // 时间表从**首个可发帧**起算（预热门）：MediaCodec AAC 有 1~2 帧
@@ -854,6 +890,11 @@ class AudioSender(
         var nextTick = -1L
         var lastLogAt = 0L
         var warmupSkips = 0
+        // tick 自适应（见函数注）：以校准窗内实测喂入帧率重定节拍
+        var effectiveTick = tickNanos
+        var calibStartNanos = 0L
+        var calibFedFrames = 0L
+        var calibSentFrames = 0L
         while (running.get()) {
             if (nextTick == -1L) {
                 // 预热门：等首个可发帧（队列内容或静音帧）再建立时间表
@@ -868,7 +909,10 @@ class AudioSender(
                     continue
                 }
                 if (!sendPayload(first)) break
-                nextTick = System.nanoTime() + tickNanos
+                nextTick = System.nanoTime() + effectiveTick
+                calibStartNanos = nextTick
+                calibFedFrames = captureFedFrames.get()
+                calibSentFrames = 1
                 continue
             }
             val now = System.nanoTime()
@@ -885,12 +929,12 @@ class AudioSender(
             // 跳过 = 车机见 seq/ts 空洞 → PLC 填充，ts↔墙钟立即重对齐，
             // 不产生永久延迟台阶。resendCache 不补洞（miss→PLC 兜底）。
             val behind = now - nextTick
-            val skip = resyncSkipPackets(behind, tickNanos, RESYNC_BEHIND_NANOS)
+            val skip = resyncSkipPackets(behind, effectiveTick, RESYNC_BEHIND_NANOS)
             if (skip > 0) {
                 sequence = (sequence + skip.toInt()) and 0xFFFF
                 timestamp += skip * samplesPerPacket
                 nonceCounter += skip
-                nextTick += skip * tickNanos
+                nextTick += skip * effectiveTick
                 resyncCount++
                 log(
                     "AUDIO: pacer 停顿 ${behind / 1_000_000}ms 超阈——resync 跳过 " +
@@ -922,15 +966,24 @@ class AudioSender(
                     fatal = true
                     break
                 }
-                nextTick += tickNanos
+                nextTick += effectiveTick
                 burst++
+                calibSentFrames++
             }
             if (fatal || !running.get()) break
-            // **深度衰减**：队列超目标水位时每 tick 多排一包真内容，把突发
+            // **深度衰减**：队列超目标水位时每 tick 多排真内容，把突发
             // 堆积拉回目标。pacer 恰好按标称排水 → 突发堆上的深度是随机
             // 游走、永不回落（11-21 实测恒挂 12 包）→ 到达时刻 ≈ 车机排播
             // 时刻，吃光车机 jitter 余量（实测 290ms 缓冲中 ~40ms 即此类
             // 自适应）。车机按 ts/锚排播，早到只是提前进它的 jitter buffer。
+            //
+            // **排水帧必须占用未来 tick（nextTick += effectiveTick，
+            // 2026-11-22 真车定谳）**：旧版排水不占时间表——「提前发未来
+            // 内容」= 每排一包 ts 超前墙钟 21.33ms。真车数据：发送 47.6pps
+            // vs tick 46.875（+1.5%），ts 增速 48700 samples/s → 车机相位
+            // 恒 48025/s（实时）→ 缓冲 +15ms/s 棘轮且不回退（暂停/恢复
+            // 显性化）→ jitter buffer 溢出杂音卡顿。占 tick 后速率守恒，
+            // 堆积消化由 tick 自适应（跟随喂入速率）承接。
             var drained = 0
             while (running.get() && sendQueue.size > QUEUE_TARGET && drained < 2) {
                 val extra = sendQueue.poll() ?: break
@@ -938,12 +991,40 @@ class AudioSender(
                     fatal = true
                     break
                 }
+                nextTick += effectiveTick
                 drained++
+                calibSentFrames++
             }
             if (fatal || !running.get()) break
             val now2 = System.nanoTime()
+            // **tick 自适应校准（独立 10s 窗，先于 30s 诊断行）**：喂入帧率
+            // = 内容钟实测速率——REMOTE_SUBMIX 内容钟快于声明采样率 ~1.4%
+            // （真车 2026-11-22：喂入 47.4~48.1pps vs 标称 46.875）。发送
+            // 节拍跟随它 = 队列水位稳态、零丢帧；钳制 ±3% 防毛刺（喂入
+            // 瞬时为 0/爆冲不动表）。窗长短于 30s 的理由见常量注——首窗
+            // 净积压期压短到 ~6 帧内，不触碰队列上限。
+            if (calibStartNanos > 0 && now2 - calibStartNanos >= TICK_CALIB_WINDOW_NANOS) {
+                val fedNow = captureFedFrames.get()
+                val fedInWindow = fedNow - calibFedFrames
+                if (fedInWindow > 0 && now2 > calibStartNanos) {
+                    val windowNanos = now2 - calibStartNanos
+                    val targetTick = windowNanos / fedInWindow
+                    val lo = tickNanos * (100 - TICK_ADJUST_PERCENT_MAX) / 100
+                    val hi = tickNanos * (100 + TICK_ADJUST_PERCENT_MAX) / 100
+                    effectiveTick = targetTick.coerceIn(lo, hi)
+                }
+                calibStartNanos = now2
+                calibFedFrames = fedNow
+            }
             if (now2 - lastLogAt >= 30_000_000_000L) {
+                val logWindowNanos = (now2 - lastLogAt).coerceAtLeast(1)
                 lastLogAt = now2
+                val sentInWindow = calibSentFrames
+                calibSentFrames = 0
+                val sentPpsX10 = sentInWindow * 10_000_000_000L / logWindowNanos
+                val calibText =
+                    "，发送=${sentPpsX10 / 10}.${sentPpsX10 % 10}pps " +
+                        "tick=${effectiveTick / 1_000_000}ms"
                 // 车机排播缓冲直接测量：我们已发的 ts − 车机相位（feedback
                 // sampleTime 读回，R7 相位锚同源）= 在途样本数。发送管线
                 // 队列恒 ≤4 包已排除，延迟若在此值 = 车机侧缓冲/锚偏移；
@@ -960,7 +1041,7 @@ class AudioSender(
                     "AUDIO: 推流中（累计 $packetsSent 包，${bytesSent / 1024}KB，" +
                         "seq=$sequence ts=$timestamp，队列=${sendQueue.size} " +
                         "补静音=$silenceFilledPackets 丢帧=$queueDroppedPackets" +
-                        "$bufferTail）",
+                        calibText + bufferTail + "）",
                 )
             }
         }
