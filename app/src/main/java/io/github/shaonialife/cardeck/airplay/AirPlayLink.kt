@@ -969,6 +969,70 @@ class AirPlayLink(
         return true
     }
 
+    // ---- 电源状态注入（0xAE01，fw: `_iap2_power_sendPowerUpdate` 直切）----
+    // type 语义 = 固件 powerUpdateTypeStr 表（2026-11-23 实读定谳，26.6
+    // accessoryd @0x10021b7a0 逐项）：1=IsDeviceBatteryCharging（U8）
+    // 4=isExternalChargerConnected（U8） 5=BatteryChargingState（U8）
+    // 6=BatteryChargeLevel（U16 百分比）。Rust 侧 AE00 订阅位未置 →
+    // 静默丢弃（返回 0）——车机没订阅就不打扰，即固件同形。
+
+    /** type 1 = 设备电池是否充电中（value 0/1）。 */
+    fun sendPowerBatteryCharging(charging: Boolean): Int =
+        NativeBridge.nativeSessionSendPowerUpdate(controlSessionHandle, 1, if (charging) 1 else 0)
+
+    /** type 4 = 外接充电器已连接（value 0/1；与 type 1 同源——充电中即外接供电）。 */
+    fun sendPowerExternalCharger(connected: Boolean): Int =
+        NativeBridge.nativeSessionSendPowerUpdate(controlSessionHandle, 4, if (connected) 1 else 0)
+
+    /** type 5 = 电池充电状态（value：0=未充 1=充电中 2=充满——BATTERY_STATUS 映射）。 */
+    fun sendPowerChargingState(status: Int): Int = NativeBridge.nativeSessionSendPowerUpdate(controlSessionHandle, 5, status)
+
+    /** type 6 = 电量百分比（U16，0-100）。 */
+    fun sendPowerChargeLevel(percent: Int): Int =
+        NativeBridge.nativeSessionSendPowerUpdate(controlSessionHandle, 6, percent.coerceIn(0, 100))
+
+    // ---- NowPlaying 注入（0x5002，fw: `mediaItemAttributesUpdateHandler`
+    // @0x100176b68 + `__addMediaItemAttributesToMessage` 跳表直切）----
+    // 车 5000 订阅 → Rust 即回 5001 快照（copyDefault 径，attrs 来自本
+    // 方法最后一次注入）；此后媒体变化 → 本方法推 5002 增量。
+
+    /**
+     * 推 NowPlaying 属性（固件 28 例跳表 16 可发形，id 恒等映射 wire
+     * paramID；载荷字典由 [title]/[artist] 等查得——fw 键名
+     * AlbumTrackNum/AlbumTrackCount/AlbumDiscNum/AlbumDiscCount/Artist/
+     * Genre/Composer/IsLike 与 IsBan 族/ChapterCount 已解名 ident.rs）。
+     * 返回 true = 至少一帧上线。
+     */
+    fun sendNowPlaying(
+        title: String?,
+        artist: String?,
+        albumTitle: String?,
+        durationMs: Long,
+        playing: Boolean,
+    ): Boolean {
+        val items =
+            buildList {
+                title?.takeIf { it.isNotBlank() }?.let {
+                    add("""{"id":1,"s":${org.json.JSONObject.quote(it)}}""")
+                }
+                artist?.takeIf { it.isNotBlank() }?.let {
+                    add("""{"id":12,"s":${org.json.JSONObject.quote(it)}}""")
+                }
+                albumTitle?.takeIf { it.isNotBlank() }?.let {
+                    add("""{"id":6,"s":${org.json.JSONObject.quote(it)}}""")
+                }
+                if (durationMs > 0) add("""{"id":4,"u":$durationMs}""")
+                add("""{"id":21,"b":$playing}""")
+            }
+        if (items.isEmpty()) return false
+        val sent =
+            NativeBridge.nativeSessionSendNowPlaying(
+                controlSessionHandle,
+                items.joinToString(",", prefix = "[", postfix = "]").toByteArray(),
+            )
+        return sent > 0
+    }
+
     /**
      * 请求车机 UI（车机桌面 OEM 图标点击语义）：会话保持不断，车机切回原
      * 界面。协议形在 Rust（EventChannel::send_request_car_ui——fw:

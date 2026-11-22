@@ -1,8 +1,12 @@
 package io.github.shaonialife.cardeck
 
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.net.Network
+import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -303,6 +307,114 @@ object SessionController {
 
     @Volatile
     var currentClient: AirPlayLink? = null
+
+    // ---- 电源状态注入（0xAE01 电池接线，2026-11-23 固件 type 表定谳）----
+    // ACTION_BATTERY_CHANGED 为 sticky 广播：会话建立时注册即拿到当前值，
+    // 立即推一轮（等效固件「订阅 → 平台首推快照」）；此后变化即推。
+    // 车机未发 AE00 订阅时 Rust 侧静默丢弃（返回 0）——不扰线。
+    private var batteryReceiver: BroadcastReceiver? = null
+
+    /** 注册电池广播（会话建立时调；重复注册先解旧——sticky 重放即快照）。 */
+    @Synchronized
+    private fun registerBatteryRelay() {
+        val ctx = appContext ?: return
+        unregisterBatteryRelay()
+        val receiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    context: Context,
+                    intent: Intent,
+                ) = relayBatteryToCar(intent)
+            }
+        ctx.registerReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        batteryReceiver = receiver
+        appendLog("POWER: 电池广播已接线（AE01 注入，sticky 回填当前电量）")
+    }
+
+    @Synchronized
+    private fun unregisterBatteryRelay() {
+        val ctx = appContext ?: return
+        batteryReceiver?.let { runCatching { ctx.unregisterReceiver(it) } }
+        batteryReceiver = null
+    }
+
+    /** BATTERY_CHANGED → AE01 四 type（1=充电中 4=外接电源 5=充电态 6=电量）。 */
+    private fun relayBatteryToCar(intent: Intent?) {
+        val client = currentClient ?: return
+        val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        if (level < 0 || scale <= 0) return
+        val percent = level * 100 / scale
+        val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val charging =
+            status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+        // 充电态映射（fw: BatteryChargingState）：0=未充 1=充电中 2=充满
+        val state =
+            when (status) {
+                BatteryManager.BATTERY_STATUS_CHARGING -> 1
+                BatteryManager.BATTERY_STATUS_FULL -> 2
+                else -> 0
+            }
+        Bg.run("power-relay") {
+            val sent =
+                listOf(
+                    client.sendPowerBatteryCharging(charging),
+                    client.sendPowerExternalCharger(charging),
+                    client.sendPowerChargingState(state),
+                    client.sendPowerChargeLevel(percent),
+                ).sum()
+            if (sent > 0) {
+                appendLog("POWER: AE01 已上报（充电=$charging 电量=$percent%，发出 $sent 帧——车机订阅域内）")
+            }
+        }
+    }
+
+    // ---- NowPlaying 注入（0x5002，键配对真值表见 NativeBridge 注）----
+    // 媒体变化监听随会话注册（5000 订阅 → Rust 即回 5001 快照 = 最后一次
+    // 注入的 attrs；此后变化即推 5002 增量）。
+    private var nowPlayingListener: (() -> Unit)? = null
+    private var lastNowPlayingKey: String? = null
+
+    @Synchronized
+    private fun registerNowPlayingRelay() {
+        unregisterNowPlayingRelay()
+        val listener = {
+            relayNowPlayingToCar()
+        }
+        MediaSessionsState.addListener(listener)
+        nowPlayingListener = listener
+        relayNowPlayingToCar() // sticky 首推
+    }
+
+    @Synchronized
+    private fun unregisterNowPlayingRelay() {
+        nowPlayingListener?.let { MediaSessionsState.removeListener(it) }
+        nowPlayingListener = null
+        lastNowPlayingKey = null
+    }
+
+    /** NowPlaying 变化 → 0x5002（键变化才推——位置进度每秒刷不吃这条）。 */
+    private fun relayNowPlayingToCar() {
+        val client = currentClient ?: return
+        val np = MediaSessionsState.nowPlaying ?: return
+        val key = "${np.title}|${np.artist}|${np.durationMs}|${np.playing}"
+        if (key == lastNowPlayingKey) return
+        lastNowPlayingKey = key
+        Bg.run("nowplaying-relay") {
+            val sent =
+                client.sendNowPlaying(
+                    title = np.title,
+                    artist = np.artist,
+                    albumTitle = null, // 媒体通知无专辑名（METADATA_KEY_ALBUM 未采，后补）
+                    durationMs = np.durationMs,
+                    playing = np.playing,
+                )
+            if (sent) {
+                appendLog("MEDIA: NowPlaying 已上报（${np.title ?: "?"} / ${np.artist ?: "?"}）")
+            }
+        }
+    }
 
     /**
      * 车机桌面「OEM 图标」块点击（用户令 2026-11-04）：**退出序列（FSM
@@ -957,6 +1069,10 @@ object SessionController {
      *  屏与屏上任务原样挂着，下轮 attach 走复用分支（setDisplaySurface 接回新编码
      *  surface）；其余管线（编码器/音频/控制通道）照常收口。 */
     fun retireSession(keepDisplays: Boolean = false) {
+        // 电源注入随会话拆除（先解广播再清 client——relay 里 currentClient
+        // 判空双保险）
+        unregisterBatteryRelay()
+        unregisterNowPlayingRelay()
         videoSender?.stop()
         videoSender = null
         // 暗幕/常亮随会话收掉（本方法在每轮配对起步也会执行，新一轮推流起来后会重新置位）
@@ -2969,6 +3085,12 @@ object SessionController {
                                         ScreenDimmer.setSessionActive(true)
                                         // 视频起流（虚拟屏已就绪）——modesChanged 宣告的事件触发源
                                         client.onStreamingStarted?.invoke()
+                                        // 电池广播接线（AE01 注入）：sticky 回填当前值
+                                        // = 固件「订阅 → 平台首推快照」等效形
+                                        registerBatteryRelay()
+                                        // NowPlaying 注入接线（0x5002；5000 订阅
+                                        // → Rust 即回 5001 快照=最后注入 attrs）
+                                        registerNowPlayingRelay()
                                         // 虚拟屏已建好 → 按「连接时真息屏」开关决定是否硬件断电
                                         if (DisplayPrefs.screenOffOnConnect(context)) {
                                             enterPhoneScreenOff()

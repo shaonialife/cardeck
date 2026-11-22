@@ -163,6 +163,34 @@ object NativeBridge {
         paramsJson: ByteArray,
     ): Int
 
+    /** 发电源状态（0xAE01，fw: `_iap2_power_sendPowerUpdate` 直切）：
+     *  [updateType] = 固件 powerUpdateTypeStr 表索引（1=IsDeviceBattery
+     *  Charging / 4=isExternalChargerConnected / 5=BatteryChargingState /
+     *  6=BatteryChargeLevel，1/2/4/5 走 U8、3/6-11 走 U16）；Rust 侧
+     *  三重门（AE00 订阅位 / 0xc 上界 / 值截断）——未订阅静默丢弃。
+     *  返回实际发出帧数（0 = 门丢弃）。 */
+    external fun nativeSessionSendPowerUpdate(
+        handle: Long,
+        updateType: Int,
+        value: Int,
+    ): Int
+
+    /** 发 NowPlaying 属性更新（0x5002，fw: `mediaItemAttributesUpdateHandler`
+     *  @0x100176b68 + `__addMediaItemAttributesToMessage` 跳表直切）：
+     *  [valuesJson] = [{"id":1,"s":"歌名"},{"id":4,"u":213000},
+     *  {"id":21,"b":true}]——id = wire paramID 恒等映射，键配对真值表
+     *  （fw handler 栈槽降序赋值 2026-11-23 实读）：0=PersistentID U64 /
+     *  1=Title String / 4=PlaybackDurationMS U32 / 6=AlbumTitle String /
+     *  7=AlbumTrackNum U16 / 8=AlbumTrackCount U16 / 9=AlbumDiscNum U16 /
+     *  10=AlbumDiscCount U16 / 12=Artist String / 16=Genre String /
+     *  18=Composer String / 21=IsLikeSupported Boolean /
+     *  22=IsBanSupported Boolean / 23=IsLiked Boolean / 24=IsBanned
+     *  Boolean / 27=ChapterCount U16。类型查表错型丢弃。 */
+    external fun nativeSessionSendNowPlaying(
+        handle: Long,
+        valuesJson: ByteArray,
+    ): Int
+
     /** 取走会话层入站事件（kind 0=hid/1=power/2=comm/3=feature/4=nowplaying；
      *  返回 {"kind":N,"events":[{"msg":N,"params":[{"id":N,"data":[..]}]}]}）。 */
     external fun nativeSessionTakeEvents(
