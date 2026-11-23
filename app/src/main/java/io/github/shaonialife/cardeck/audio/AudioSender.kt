@@ -116,6 +116,16 @@ class AudioSender(
          *  重启——迟到包被接收端 R3 discardLate 丢弃，补发无意义。 */
         const val RESYNC_BEHIND_NANOS = 1_000_000_000L
 
+        /** 真暂停判定连续静音帧数（AAC 46.9pps 下 ≈1.5 秒无内容）：音乐
+         *  内自然静音段（歌间/弱拍）远短于此，不触发暂停态 → 恢复沿
+         *  只在真暂停后出现（08:58 实测假沿每 5-15s 一次 = 连环掏洞源）。 */
+        const val SILENT_RUN_FRAMES = 70
+
+        /** 暂停期降速分母（2026-11-23 晚——替代恢复掏洞）：真暂停态下
+         *  pacer 每 N tick 发 1 静音包维持链路（ts 慢 N 倍），恢复时 ts
+         *  天然贴近车机排播点。N=10 → 暂停 30s 只超前 ~150ms（阈值内）。 */
+        const val PAUSE_THROTTLE_DENOM = 10
+
         /** resync 跳包数（纯函数，JVM 可测）：落后 ≤ 阈值 → 0（走追赶补发）；
          *  超 → 跳过的包数（seq/ts/nonce 同步前进，队列内容重获新 ts）。 */
         internal fun resyncSkipPackets(
@@ -209,6 +219,23 @@ class AudioSender(
     @Volatile private var lastSentTs = -1L
 
     @Volatile private var lastSentNanos = 0L
+
+    // ---- 内容恢复沿（2026-11-23 暂停杂音定谳）----
+    // 暂停期 REMOTE_SUBMIX read() 快返零：采集/pacer/ts 全速走（补静音），
+    // 车机相位停滞 → 恢复瞬间 ts 超前相位一大截 → jitter buffer 灌爆
+    // （08:14 会话实测 +1175ms 冲高 = 暂停洞 70s×15ms/s）。恢复沿检测
+    // 在采集线程置标志（全零→非零跳变），pacer 见标志以相位为锚 resync。
+    @Volatile private var contentResumedNanos = 0L
+
+    /** 连续静音帧计数（真暂停判定的运行长度——单帧静音 ≠ 暂停，音乐
+     *  内自然静音段每几秒一次，短静音不触发暂停态）。 */
+    private var silentRunFrames = 0
+
+    /** 暂停态（连续静音 ≥ SILENT_RUN_FRAMES 后置位；恢复沿从这里出发）。 */
+    @Volatile private var inSilentPause = false
+
+    /** 暂停期降速跳拍计数（PAUSE_THROTTLE_DENOM 取模——每 N tick 发 1 包）。 */
+    private var pauseThrottleTick = 0
 
     private var pacerThread: Thread? = null
 
@@ -774,30 +801,64 @@ class AudioSender(
                 // 内容诊断（2026-10-17）：播放捕获可能拿到全零（app 禁止捕获 / 音频路由
                 // 到蓝牙 / 无音频播放）。全零时车机静音但手机仍在响，用户会报「声音在
                 // 手机上」——必须能区分「没采到」与「采到了但车机没播」。
-                if (sequence < 3 || sequence % diagnosticStride == 0) {
-                    var nonZero = 0
-                    var peak = 0
-                    var index = 0
-                    while (index + 1 < read) {
-                        val value = ((pcm[index + 1].toInt() and 0xFF) shl 8) or (pcm[index].toInt() and 0xFF)
-                        val magnitude = if (value > 32767) 65536 - value else value
-                        if (magnitude > peak) peak = magnitude
-                        if (magnitude > 0) nonZero++
-                        index += 2
+                // **沿检测逐帧统一在这里做（2026-11-23 修正：原诊断/非诊断
+                // 两分支缩进错乱致状态机混乱，假恢复沿泛滥 = 连环掏洞杂音）**：
+                // 单帧静音 ≠ 暂停——音乐内的自然静音段（歌间/弱拍）每几秒
+                // 一次，必须**连续 SILENT_RUN_FRAMES 帧全零**才判真暂停进入；
+                // 恢复 = 暂停态下单帧非零。
+                var peak = 0
+                var anyNonZero = false
+                var index = 0
+                while (index + 1 < read) {
+                    val value = ((pcm[index + 1].toInt() and 0xFF) shl 8) or (pcm[index].toInt() and 0xFF)
+                    val magnitude = if (value > 32767) 65536 - value else value
+                    if (magnitude > peak) peak = magnitude
+                    if (magnitude > 0 && !anyNonZero) anyNonZero = true
+                    index += 2
+                }
+                if (anyNonZero) {
+                    silentRunFrames = 0
+                    if (inSilentPause) {
+                        // 真恢复沿：暂停态（连续静音 ≥ 阈值）下的首个非零帧
+                        // → 翻转暂停态（pacer 降速径自动恢复正常节拍,ts 贴回）
+                        inSilentPause = false
+                        log("AUDIO: 内容恢复——退出暂停限流（ts 贴回实时）")
                     }
-                    val percent = nonZero * 100 / (read / 2).coerceAtLeast(1)
+                } else {
+                    silentRunFrames++
+                    if (!inSilentPause && silentRunFrames >= SILENT_RUN_FRAMES) {
+                        inSilentPause = true
+                    }
+                }
+                if (sequence < 3 || sequence % diagnosticStride == 0) {
+                    var nz = 0
+                    var i2 = 0
+                    while (i2 + 1 < read) {
+                        val value = ((pcm[i2 + 1].toInt() and 0xFF) shl 8) or (pcm[i2].toInt() and 0xFF)
+                        if ((if (value > 32767) 65536 - value else value) > 0) nz++
+                        i2 += 2
+                    }
+                    val percent = nz * 100 / (read / 2).coerceAtLeast(1)
                     log(
                         "AUDIO: 采集样本 seq=$sequence 非零$percent% 峰值=$peak" +
                             if (peak == 0) "（⚠ 全零：捕获不到音频——app 可能禁止播放捕获或音频走了蓝牙）" else "",
                     )
-                    // 全零即通知宿主做路由抢占判定（宿主侧再核「确有应用在播」，
-                    // 避免把「没放歌的正常静音」误判成抢占）
                     if (peak == 0) {
                         onRouteHijackSuspect?.invoke()
                     }
                 }
 
                 // PCM 通路：采一段 = 发一包；AAC 通路：喂一帧 PCM，编码器可能吐出 0~N 帧
+                //
+                // **暂停态拦截在编码前（0.1.30.2 修正）**：0.1.30.1 曾在编码后
+                // 按比特流比较丢弃——失败（AAC 编码器对全零 PCM 的输出**非恒定**，
+                // 依赖编码器内部状态，与 [lastSilenceFrame] 逐字节比较恒 false
+                // → 丢弃逻辑失效 → 队列满丢帧依旧，09:15 实测）。改为源头：
+                // 暂停态 + 输入 PCM 全零 → 不喂编码直接跳过（pcm 全零在采集
+                // 诊断处已算得 peak）。恢复沿翻转 inSilentPause 后自动恢复编码。
+                if (inSilentPause && peak == 0) {
+                    continue
+                }
                 val payloads: List<ByteArray> =
                     if (codec == AudioCodec.AAC_LC) {
                         val encoder = aacEncoder ?: break
@@ -941,6 +1002,22 @@ class AudioSender(
                         "$skip 包（seq=$sequence ts=$timestamp，累计 resync=$resyncCount）",
                 )
             }
+            // **暂停期限流（2026-11-23 晚定谳——替代已撤的「恢复掏洞」）**：
+            // 暂停洞期 REMOTE_SUBMIX 快返零 → 采集/pacer/ts 全速走 → 恢复
+            // 瞬间 ts 超前洞时长。以车机相位为锚掏洞已证三宗罪（相位读数
+            // 被掏洞自身污染 → 假超前 → 连环掏 → 缓冲爬到 13.6s）。改修
+            // **源头**：真暂停态（连续静音 ≥ SILENT_RUN_FRAMES，采集线程
+            // 判定）下 pacer 时间表**降速 10 倍**（每 10 tick 发 1 静音包
+            // 维持链路活性，ts 慢 10 倍）——恢复时 ts 天然贴近车机排播点，
+            // 零空洞零掏洞。真 iPhone 暂停 = 停流，降速 10 倍 = 平台面近似。
+            if (inSilentPause) {
+                pauseThrottleTick = (pauseThrottleTick + 1) % PAUSE_THROTTLE_DENOM
+                if (pauseThrottleTick != 0) {
+                    // 降速跳拍：不发包不推 ts,时间表照走（节拍本身冻结）
+                    nextTick += effectiveTick
+                    continue
+                }
+            }
             // 到点（或滞后）：真内容优先，空则补静音；追赶上限 12 包
             var fatal = false
             var burst = 0
@@ -1008,7 +1085,17 @@ class AudioSender(
                 val fedInWindow = fedNow - calibFedFrames
                 if (fedInWindow > 0 && now2 > calibStartNanos) {
                     val windowNanos = now2 - calibStartNanos
-                    val targetTick = windowNanos / fedInWindow
+                    var targetTick = windowNanos / fedInWindow
+                    // **水位目标纳入校准（2026-11-23 延迟定谳）**：队列常驻
+                    // 11-12 包（≈250ms）= 校准只对齐速率、排水被下一窗 tick
+                    // 放慢抵消（水位冻结在中途）。队列超目标时按超出深度
+                    // 加速节拍：每超 1 包 tick 缩 0.3%，封顶 3%（与钳制同界
+                    // ——9 包深即触顶）。水位回目标后自然回喂入速率。
+                    val depth = sendQueue.size - QUEUE_TARGET
+                    if (depth > 0) {
+                        val shrinkPercent = (depth * 3L).coerceAtMost(TICK_ADJUST_PERCENT_MAX)
+                        targetTick = targetTick * (100 - shrinkPercent) / 100
+                    }
                     val lo = tickNanos * (100 - TICK_ADJUST_PERCENT_MAX) / 100
                     val hi = tickNanos * (100 + TICK_ADJUST_PERCENT_MAX) / 100
                     effectiveTick = targetTick.coerceIn(lo, hi)
