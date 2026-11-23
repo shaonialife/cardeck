@@ -88,7 +88,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var audioDesc: TextView
     private lateinit var rowAudio: View
     private lateinit var switchAudio: androidx.appcompat.widget.SwitchCompat
-    private lateinit var switchAlwaysOn: androidx.appcompat.widget.SwitchCompat
     private lateinit var advBody: View
     private lateinit var advChevron: ImageView
     private lateinit var shellStateText: TextView
@@ -567,7 +566,6 @@ class MainActivity : AppCompatActivity() {
         audioDesc = findViewById(R.id.audioDesc)
         rowAudio = findViewById(R.id.rowAudio)
         switchAudio = findViewById(R.id.switchAudio)
-        switchAlwaysOn = findViewById(R.id.switchAlwaysOn)
         advBody = findViewById(R.id.advBody)
         advChevron = findViewById(R.id.advChevron)
         shellStateText = findViewById(R.id.shellStateText)
@@ -788,32 +786,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ---- 常亮+暗幕 ----
-        ScreenDimmer.enabled =
-            preferences.getBoolean("alwaysOn", true)
-        switchAlwaysOn.isChecked = ScreenDimmer.enabled
-        switchAlwaysOn.setOnCheckedChangeListener { _, checked ->
-            ScreenDimmer.enabled = checked
-            preferences.edit().putBoolean("alwaysOn", checked).apply()
-            if (checked) {
-                if (!android.provider.Settings.canDrawOverlays(this)) {
-                    promptOverlayPermission("已开启「常亮+暗幕」。")
-                } else {
-                    ScreenDimmer
-                        .attach(this)
-                }
-            } else {
-                if (VirtualLauncher.appDisplayId >= 0) {
-                    // 会话中：仅关闭常亮/暗幕（投屏探针等资源留待会话结束统一释放）
-                    ScreenDimmer
-                        .disableDim()
-                } else {
-                    ScreenDimmer
-                        .detach()
-                }
-            }
-            log("MODE: 常亮+暗幕 ${if (checked) "开启" else "关闭"}")
-        }
+        // ---- 常亮+暗幕（2026-11-23 迁至 车机设置→显示；默认关）----
+        // 开关逻辑见 DisplayPanelFragment；这里只做进程启动初始化（ScreenDimmer 是
+        // 进程级单例，SessionController 会读 enabled 决定会话起停行为）。
+        ScreenDimmer.enabled = DisplayPrefs.alwaysOnDim(this)
 
         // ---- 英雄卡主操作 ----
         ctaButton.setOnClickListener {

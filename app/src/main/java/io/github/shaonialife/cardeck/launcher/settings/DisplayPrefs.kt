@@ -135,6 +135,7 @@ object DisplayPrefs {
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_FPS = "display_fps"
     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
+    private const val KEY_ALWAYS_ON = "alwaysOn"
     private const val KEY_HID_RAW_LOG = "hid_raw_log"
     private const val KEY_TOUCH_FULL_LOG = "touch_full_log"
     private const val KEY_AUDIO_ROUTE_RECLAIM = "audio_route_reclaim"
@@ -307,6 +308,31 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_SCREEN_OFF, enabled)
+            .apply()
+    }
+
+    /**
+     * 常亮 + 暗幕（默认关，2026-11-23 自首页 hero 面板迁入并改默认）：屏幕超时改
+     * 永不 + 45s 无操作盖暗幕（触摸唤醒）。锁屏推流（VDM 路线）成熟后该功能不再
+     * 需要默认开启，仅作为无悬浮窗权限/特殊机型下的备选。
+     *
+     * 存量迁移语义：沿用旧 key（首页开关时代写的 true/false 原样保留），仅**默认值**
+     * 从 true 改 false——从未动过开关的用户（无存储值）升级后自动转关；显式开过的
+     * 用户保持开启。
+     */
+    fun alwaysOnDim(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_ALWAYS_ON, false)
+
+    fun setAlwaysOnDim(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ALWAYS_ON, enabled)
             .apply()
     }
 

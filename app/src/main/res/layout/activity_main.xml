@@ -643,67 +643,8 @@
                     android:textSize="12.5sp"
                     android:textStyle="bold" />
 
-                <!-- 常亮+暗幕 -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:gravity="center_vertical"
-                    android:minHeight="60dp"
-                    android:orientation="horizontal"
-                    android:paddingTop="6dp"
-                    android:paddingBottom="6dp">
-
-                    <FrameLayout
-                        android:layout_width="38dp"
-                        android:layout_height="38dp"
-                        android:background="@drawable/bg_icon_tile">
-
-                        <ImageView
-                            android:layout_width="20dp"
-                            android:layout_height="20dp"
-                            android:layout_gravity="center"
-                            android:contentDescription="常亮"
-                            android:src="@drawable/ic_brightness" />
-                    </FrameLayout>
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="14dp"
-                        android:layout_weight="1"
-                        android:orientation="vertical">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="常亮 + 暗幕"
-                            android:textColor="@color/m3_on_surface"
-                            android:textSize="14.5sp"
-                            android:textStyle="bold" />
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="2dp"
-                            android:text="手机不锁屏，无操作时真息屏（断电） · 车机不受影响"
-                            android:textColor="@color/m3_on_var"
-                            android:textSize="12sp" />
-                    </LinearLayout>
-
-                    <androidx.appcompat.widget.SwitchCompat
-                        android:id="@+id/switchAlwaysOn"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:thumb="@drawable/sw_thumb"
-                        app:track="@drawable/sw_track"
-                        xmlns:app="http://schemas.android.com/apk/res-auto" />
-                </LinearLayout>
-
-                <View
-                    android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:layout_marginStart="54dp"
-                    android:background="#5A394444" />
+                <!-- 常亮+暗幕：2026-11-23 迁至 车机设置→显示（默认关）——锁屏推流成熟后
+                     首页不再常驻该开关，避免误导新用户为投屏必选项 -->
 
                 <!-- 立即息屏 -->
                 <LinearLayout

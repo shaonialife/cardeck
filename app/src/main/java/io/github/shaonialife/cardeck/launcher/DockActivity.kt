@@ -290,6 +290,9 @@ class DockActivity : AppCompatActivity() {
 
     private var lastRendered: List<String> = emptyList()
 
+    /** 上轮渲染有图标走了兜底（iconCache 未就绪/未命中）→ 下轮 refresh 不早退，等缓存暖自动补真图标。 */
+    private var iconsPending = false
+
     private fun refresh() {
         val container = appsContainer ?: return
         val apps = synchronized(VirtualLauncher.runningApps) { VirtualLauncher.runningApps.toList() }
@@ -307,15 +310,25 @@ class DockActivity : AppCompatActivity() {
                 apps.forEach { if (it != mapComponent && it != pinnedComponent) add(it) }
             }
         val current = ordered.map { it.flattenToString() }
-        if (current == lastRendered) return
+        // 早退必须连带图标判定：常驻项 component 来自 resolveActivity(launchIntent)、
+        // iconCache 的 key 来自桌面扫描 queryIntentActivities——两者入口可能不同（同包
+        // 多入口/别名），且首次渲染时缓存可能还没暖；只比列表会让默认机器人图标永远
+        // 停在屏上（2026-11-23 K40 实测）。
+        if (current == lastRendered && !iconsPending) return
         lastRendered = current
         container.removeAllViews()
         val density = resources.displayMetrics.density
         val iconPx = ((if (barForm) 32 else 30) * density).toInt()
         val pad = (6 * density).toInt()
         val iconCache = VirtualLauncher.iconCache
+        var missing = false
         ordered.forEach { component ->
-            val drawable = iconCache[component] ?: packageManager.defaultActivityIcon
+            val drawable =
+                iconCache[component]
+                    // 缓存未命中：按 component 直接向 PackageManager 取（常驻项入口与
+                    // 扫描入口不一致时也能拿到真图标）；再不行才用系统占位并标记待补
+                    ?: runCatching { packageManager.getActivityIcon(component) }.getOrNull()
+                    ?: packageManager.defaultActivityIcon.also { missing = true }
             // 位图化渲染（与桌面网格同一路径）：直接 setImageDrawable 会让 ImageView
             // 长期持有共享 Drawable 实例，其 bounds 被网格重绑改写后渲染错位
             // （实机故障：点 home 后 dock 图标变小且偏左）
@@ -332,6 +345,7 @@ class DockActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams(iconPx + pad * 2, iconPx + pad * 2),
             )
         }
+        iconsPending = missing
     }
 
     override fun onBackPressed() = Unit // dock 常驻，不响应返回

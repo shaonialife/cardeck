@@ -33,9 +33,12 @@ object ScreenDimmer {
     private const val IDLE_TIMEOUT_MS = 45_000L
     private const val TIMEOUT_MAX = 2_147_483_647
 
-    /** 由设置项控制（默认开）。 */
+    /**
+     * 由设置项控制（默认关，2026-11-23；控制入口在 车机设置→显示）。
+     * MainActivity 启动时会用 DisplayPrefs.alwaysOnDim 覆盖为本机偏好。
+     */
     @Volatile
-    var enabled: Boolean = true
+    var enabled: Boolean = false
 
     /**
      * 自动暗幕总开关（45s 无操作假息屏/盖暗幕）。remote 调试变体在 Application

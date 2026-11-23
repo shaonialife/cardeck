@@ -20,6 +20,7 @@ import io.github.shaonialife.cardeck.launcher.DockPrefs
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppRowsAdapter.AppHolder
 import io.github.shaonialife.cardeck.ui.DarkMessageDialog
+import io.github.shaonialife.cardeck.ui.ScreenDimmer
 import io.github.shaonialife.cardeck.ui.WallpaperStore
 import io.github.shaonialife.cardeck.util.Bg
 
@@ -606,42 +607,44 @@ class DashboardPanelFragment : SettingsPanelFragment() {
         refresh()
     }
 
-    /** 默认地图单选（原 DefaultMapPanelFragment 逻辑原样搬移）。 */
+    /**
+     * 默认地图单选（原 DefaultMapPanelFragment 逻辑搬移）+ 自定义应用（2026-11-23）：
+     * 白名单快捷行之外新增「自定义应用」行——任意应用可选作地图卡片（解析/路由按
+     * DefaultMapPrefs.manualPackage 走，存储层本就支持任意包名）。选中的自定义应用
+     * 同时享受地图屏路由语义（桌面/dock 点击 → 地图屏全屏，isMapPackage 判定）。
+     */
     private fun buildMapSection(container: LinearLayout) {
+        val ctx = requireContext()
         val installed =
             VirtualLauncher.MAP_PACKAGES_PRIORITY.mapNotNull { pkg ->
                 val launch =
-                    requireContext().packageManager.getLaunchIntentForPackage(pkg)
+                    ctx.packageManager.getLaunchIntentForPackage(pkg)
                         ?: return@mapNotNull null
                 val label =
                     runCatching {
-                        requireContext()
-                            .packageManager
+                        ctx.packageManager
                             .getApplicationInfo(pkg, 0)
-                            .loadLabel(requireContext().packageManager)
+                            .loadLabel(ctx.packageManager)
                             .toString()
                     }.getOrDefault(pkg)
                 pkg to label
             }
         if (installed.isEmpty()) {
             container.addView(
-                TextView(requireContext()).apply {
-                    text = "未安装任何受支持的地图应用（高德/百度车机版、高德/百度/腾讯手机版）"
+                TextView(ctx).apply {
+                    text = "未安装白名单地图应用（高德/百度车机版、高德/百度/腾讯手机版）——可用下方「自定义应用」选任意应用"
                     setTextColor(0xFF8E8E93.toInt())
                     textSize = 13f
                 },
             )
-            return
         }
-        var current =
-            DefaultMapPrefs.manualPackage(requireContext())
-                ?: installed.firstOrNull()?.first
+        var current = DefaultMapPrefs.manualPackage(ctx) ?: installed.firstOrNull()?.first
         installed.forEach { (pkg, label) ->
             val row = layoutInflater.inflate(R.layout.item_map_option, container, false)
             val iconPx = (34 * resources.displayMetrics.density).toInt()
             val appIcon =
                 runCatching {
-                    requireContext().packageManager.getApplicationIcon(pkg)
+                    ctx.packageManager.getApplicationIcon(pkg)
                 }.getOrNull()
             if (appIcon != null) {
                 row
@@ -659,7 +662,7 @@ class DashboardPanelFragment : SettingsPanelFragment() {
             refresh()
             row.setOnClickListener {
                 current = pkg
-                DefaultMapPrefs.set(requireContext(), pkg)
+                DefaultMapPrefs.set(ctx, pkg)
                 for (i in 0 until container.childCount) {
                     (container.getChildAt(i).tag as? (() -> Unit))?.invoke()
                 }
@@ -668,10 +671,141 @@ class DashboardPanelFragment : SettingsPanelFragment() {
             row.tag = { refresh() }
             container.addView(row)
         }
+
+        // 自定义应用行：选中态 = manual 为非白名单包；点击开全应用选择弹窗
+        val rowCustom = layoutInflater.inflate(R.layout.item_map_option, container, false)
+        val iconPx = (34 * resources.displayMetrics.density).toInt()
+        runCatching {
+            ctx.getDrawable(R.drawable.ic_app_settings)?.let {
+                rowCustom
+                    .findViewById<ImageView>(R.id.mapOptionIcon)
+                    .setImageBitmap(AppIcons.rounded(it, iconPx))
+            }
+        }
+        val customName = rowCustom.findViewById<TextView>(R.id.mapOptionName)
+        val customRadio = rowCustom.findViewById<ImageView>(R.id.mapOptionRadio)
+
+        fun appLabel(pkg: String): String =
+            runCatching {
+                ctx.packageManager
+                    .getApplicationLabel(ctx.packageManager.getApplicationInfo(pkg, 0))
+                    .toString()
+            }.getOrDefault(pkg)
+
+        fun refreshCustom() {
+            val manual = DefaultMapPrefs.manualPackage(ctx)
+            val isCustom = manual != null && manual !in VirtualLauncher.MAP_PACKAGES_PRIORITY
+            current = manual ?: installed.firstOrNull()?.first
+            customRadio.setImageResource(
+                if (isCustom) R.drawable.bg_radio_on else R.drawable.bg_radio_off,
+            )
+            customName.text =
+                if (isCustom && manual != null) {
+                    "自定义应用（${appLabel(manual)}）"
+                } else {
+                    "自定义应用…（选任意应用作地图卡片）"
+                }
+        }
+
+        fun refreshAll() {
+            for (i in 0 until container.childCount) {
+                (container.getChildAt(i).tag as? (() -> Unit))?.invoke()
+            }
+        }
+        refreshCustom()
+        rowCustom.setOnClickListener {
+            showMapAppPicker { picked ->
+                current = picked
+                DefaultMapPrefs.set(ctx, picked)
+                refreshAll()
+                hostToast("默认地图：${appLabel(picked)}")
+            }
+        }
+        rowCustom.tag = { refreshCustom() }
+        container.addView(rowCustom)
+    }
+
+    /**
+     * 地图应用选择弹窗（全应用单选；与固定应用弹窗同交互——点行选中、确定生效）。
+     * 排除当前固定应用（同包在固定屏与地图屏互抢任务，与 DashCardPrefs 反向对称）。
+     */
+    private fun showMapAppPicker(onPick: (String) -> Unit) {
+        if (!enterAppPicker()) return
+        loadApps {
+            val ctx = requireContext()
+            val pinned = DashCardPrefs.pinnedPackage(ctx)
+            val candidates = apps.filter { it.component.packageName != pinned }
+            if (candidates.isEmpty()) {
+                appPickerActive = false
+                hostToast("没有可选的应用")
+                return@loadApps
+            }
+            val themed = android.view.ContextThemeWrapper(ctx, androidx.appcompat.R.style.Theme_AppCompat)
+            var selectedPkg: String? = DefaultMapPrefs.manualPackage(ctx)
+            val list =
+                LinearLayout(themed).apply {
+                    orientation = LinearLayout.VERTICAL
+                    val pad = (10 * resources.displayMetrics.density).toInt()
+                    setPadding(pad, pad / 2, pad, pad)
+                }
+            val iconPx = (34 * resources.displayMetrics.density).toInt()
+            val radios = mutableListOf<Pair<String, ImageView>>()
+
+            fun refreshRadios() {
+                radios.forEach { (pkg, radio) ->
+                    radio.setImageResource(
+                        if (pkg == selectedPkg) R.drawable.bg_radio_on else R.drawable.bg_radio_off,
+                    )
+                }
+            }
+            val scroll = android.widget.ScrollView(themed)
+            candidates.forEach { entry ->
+                val pkg = entry.component.packageName
+                val row = layoutInflater.inflate(R.layout.item_map_option, list, false)
+                row
+                    .findViewById<ImageView>(R.id.mapOptionIcon)
+                    .setImageBitmap(AppIcons.rounded(entry.icon, iconPx))
+                row.findViewById<TextView>(R.id.mapOptionName).text = entry.label
+                val radio = row.findViewById<ImageView>(R.id.mapOptionRadio)
+                radios.add(pkg to radio)
+                row.setOnClickListener {
+                    selectedPkg = pkg
+                    refreshRadios()
+                }
+                list.addView(row)
+            }
+            refreshRadios()
+            scroll.addView(list)
+            androidx.appcompat.app.AlertDialog
+                .Builder(themed)
+                .setTitle("选择地图应用")
+                .setView(scroll)
+                .setPositiveButton("确定") { _, _ ->
+                    val pkg = selectedPkg ?: return@setPositiveButton
+                    onPick(pkg)
+                }.setNegativeButton("取消", null)
+                .setOnDismissListener { appPickerActive = false }
+                .show()
+        }
     }
 
     /** 右侧卡片单选行刷新闭包（buildCardSection 内装配；选中态变化时逐行 invoke）。 */
     private var refreshCardRows: (() -> Unit)? = null
+
+    /**
+     * 应用选择弹窗在途守卫（2026-11-23 用户反馈）：应用清单未扫出时点击「自定义应用/
+     * 指定应用」要等后台扫描完弹窗才出现，用户以为没点上连点几下 → 叠出多个弹窗。
+     * 冷路径立即 toast「正在加载」给出反馈；守卫在弹窗 dismiss 时释放（取消/确定/
+     * 返回键都走 dismiss）。
+     */
+    private var appPickerActive = false
+
+    private fun enterAppPicker(): Boolean {
+        if (appPickerActive) return false
+        appPickerActive = true
+        if (VirtualLauncher.peekCachedApps().isNullOrEmpty()) hostToast("正在加载应用列表…")
+        return true
+    }
 
     private fun buildCardSection(container: LinearLayout) {
         val ctx = requireContext()
@@ -785,10 +919,12 @@ class DashboardPanelFragment : SettingsPanelFragment() {
      * 关弹窗」），点「确定」才落偏好并实时生效。
      */
     private fun showAppPicker() {
+        if (!enterAppPicker()) return
         loadApps {
             val ctx = requireContext()
             val candidates = apps.filter { !VirtualLauncher.isMapPackage(it.component.packageName) }
             if (candidates.isEmpty()) {
+                appPickerActive = false
                 hostToast("没有可选的应用")
                 return@loadApps
             }
@@ -839,6 +975,7 @@ class DashboardPanelFragment : SettingsPanelFragment() {
                     refreshCardRows?.invoke()
                     hostToast("右侧卡片：${candidates.firstOrNull { it.component.packageName == pkg }?.label ?: pkg}")
                 }.setNegativeButton("取消", null)
+                .setOnDismissListener { appPickerActive = false }
                 .show()
         }
     }
@@ -915,6 +1052,49 @@ class DisplayPanelFragment : SettingsPanelFragment() {
         }
         screenOffOn.setOnClickListener { applyScreenOff(true) }
         screenOffOff.setOnClickListener { applyScreenOff(false) }
+
+        // 常亮 + 暗幕（2026-11-23 自首页 hero 面板迁入，默认关）：屏幕超时改永不 +
+        // 45s 无操作盖暗幕。锁屏推流成熟后仅作备选，逻辑与首页开关时代一致。
+        val alwaysOnOn = view.findViewById<TextView>(R.id.btnAlwaysOnOn)
+        val alwaysOnOff = view.findViewById<TextView>(R.id.btnAlwaysOnOff)
+
+        fun refreshAlwaysOn(enabled: Boolean) {
+            alwaysOnOn.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment_sel else R.drawable.bg_segment,
+            )
+            alwaysOnOn.setTextColor(if (enabled) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
+            alwaysOnOff.setBackgroundResource(
+                if (enabled) R.drawable.bg_segment else R.drawable.bg_segment_sel,
+            )
+            alwaysOnOff.setTextColor(if (enabled) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
+        }
+
+        val savedAlwaysOn = DisplayPrefs.alwaysOnDim(ctx)
+        refreshAlwaysOn(savedAlwaysOn)
+
+        fun applyAlwaysOn(enabled: Boolean) {
+            if (enabled == DisplayPrefs.alwaysOnDim(ctx)) return
+            DisplayPrefs.setAlwaysOnDim(ctx, enabled)
+            ScreenDimmer.enabled = enabled
+            refreshAlwaysOn(enabled)
+            if (enabled) {
+                if (!android.provider.Settings.canDrawOverlays(ctx)) {
+                    hostToast("已开启——还需授予悬浮窗权限（回到手机首页按提示授予）")
+                } else {
+                    ScreenDimmer.attach(ctx)
+                }
+            } else {
+                if (VirtualLauncher.appDisplayId >= 0) {
+                    // 会话中：仅关常亮/暗幕（触摸探针等资源留待会话结束统一释放）
+                    ScreenDimmer.disableDim()
+                } else {
+                    ScreenDimmer.detach()
+                }
+            }
+            hostToast(if (enabled) "已开启：常亮 + 暗幕" else "已关闭：常亮 + 暗幕")
+        }
+        alwaysOnOn.setOnClickListener { applyAlwaysOn(true) }
+        alwaysOnOff.setOnClickListener { applyAlwaysOn(false) }
 
         // 滑条 progress（0..26）→ 百分比（30..160，步进 5）
         fun progressOf(percent: Int) = (percent - DisplayPrefs.SCALE_MIN) / DisplayPrefs.SCALE_STEP
