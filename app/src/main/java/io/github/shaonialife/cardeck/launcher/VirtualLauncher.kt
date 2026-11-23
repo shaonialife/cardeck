@@ -473,6 +473,17 @@ object VirtualLauncher {
      */
     fun dashMiddleGapPx(): Float = if (splitFixedMode) CARD_MARGIN_PX.toFloat() else DASH_GAP_PX
 
+    /** 安全区（S0.6 异形屏，画布坐标系 Rect(left,top,right,bottom)，
+     *  right/bottom = x+w/y+h；null = 无声明全幅）。会话建立时由
+     *  SessionController 从 /info 注入，attach 布局计算消费。 */
+    @Volatile
+    var safeAreaRect: android.graphics.Rect? = null
+
+    /** 车机许可 UI 画到安全区外（/info drawUIOutsideSafeArea）。true =
+     *  背景可铺满缺口（本实现交互仍避开——保守形）。 */
+    @Volatile
+    var safeAreaDrawOutside: Boolean = false
+
     /** 应用区尺寸（全屏形态的地图屏目标尺寸）。 */
     @Volatile
     var appAreaWidth: Int = 0
@@ -797,7 +808,7 @@ object VirtualLauncher {
         dockAtBottom = totalHeight > totalWidth
         streamWidthPx = totalWidth
         streamHeightPx = totalHeight
-        val appWidth: Int
+        var appWidth: Int
         if (dockAtBottom) {
             dockWidthPx = totalWidth
             dockHeightPx = thicknessPx
@@ -808,6 +819,34 @@ object VirtualLauncher {
             dockHeightPx = totalHeight
             appHeightPx = totalHeight
             appWidth = (totalWidth - thicknessPx).coerceAtLeast(200)
+        }
+        // **安全区内缩（S0.6 异形屏，别克实证 2026-11-23）**：车机 /info
+        // 声明 safeArea 且未许可外绘时，应用区按缺口收拢。策略 = 只收
+        // 「与 dock 对侧」的水平缺口（别克：dock 左竖条、safeArea 右
+        // 286px 竖条——应用区宽度再缩 286px，网格/卡片避开缺口）；垂直
+        // 缺口（44px 横条）由 GL 合成器壁纸层吃（背景铺满）。许可外绘
+        // （drawUIOutsideSafeArea=true）时只记录不收拢——与 CarPlay 框架
+        // 「背景铺满、交互避开」同义；本实现 = 交互全部避开（保守形，
+        // 别克 drawOutside=true 但缺口区域本来就是仪表装饰，画了也被遮）。
+        safeAreaRect?.let { sa ->
+            if (!safeAreaDrawOutside) {
+                // 水平缺口判定：safeArea 右边界 < 画布宽 → 右侧有竖条缺口
+                val rightGap = (totalWidth - sa.right).coerceAtLeast(0)
+                val leftGap = sa.left.coerceAtLeast(0)
+                if (dockAtBottom) {
+                    if (rightGap > 0 || leftGap > 0) {
+                        appWidth = (appWidth - rightGap - leftGap).coerceAtLeast(200)
+                    }
+                } else {
+                    if (rightGap > 0) {
+                        appWidth = (appWidth - rightGap).coerceAtLeast(200)
+                    }
+                }
+                log(
+                    "DISPLAY: safeArea 内缩——应用区 ${appWidth}x$appHeightPx" +
+                        "（右缺口 ${rightGap}px 左缺口 ${leftGap}px）",
+                )
+            }
         }
         appAreaWidth = appWidth
         appAreaHeight = appHeightPx

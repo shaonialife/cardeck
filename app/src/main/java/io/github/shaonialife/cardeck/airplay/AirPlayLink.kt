@@ -1451,6 +1451,32 @@ class AirPlayLink(
         if (hidUuids.isNotEmpty()) {
             log("AIRPLAY: hidDevices=" + hidUuids.joinToString(",") + "（武装 hidSetInputMode）")
         }
+        // 安全区（S0.6 异形屏）：displays[0].viewAreas[0].safeArea（别克
+        // 真值 278,44 起 1408×476、drawUIOutsideSafeArea=true）。缺声明 =
+        // null（全幅渲染，非异形屏常态）。
+        val safeArea =
+            display
+                ?.optJSONArray("viewAreas")
+                ?.optJSONObject(0)
+                ?.optJSONObject("safeArea")
+                ?.let { sa ->
+                    val drawOutside = sa.optBoolean("drawUIOutsideSafeArea", false)
+                    mapOf(
+                        "x" to sa.optInt("originXPixels", 0),
+                        "y" to sa.optInt("originYPixels", 0),
+                        "w" to sa.optInt("widthPixels", 0),
+                        "h" to sa.optInt("heightPixels", 0),
+                        // 外绘许可编码进 Int（0/1）——布尔与坐标统一 Map<String,Int>
+                        "drawOutside" to if (drawOutside) 1 else 0,
+                    )
+                }
+        if (safeArea != null) {
+            log(
+                "DISPLAY: safeArea x=" + safeArea["x"] + " y=" + safeArea["y"] +
+                    " w=" + safeArea["w"] + " h=" + safeArea["h"] +
+                    " drawOutside=" + (safeArea["drawOutside"] == 1) + "（异形屏）",
+            )
+        }
         return SetupInfo(
             eventPort = cj.optInt("eventPort"),
             timingPort = cj.optInt("timingPort"),
@@ -1462,6 +1488,7 @@ class AirPlayLink(
             maxFps = (display?.optLong("maxFPS") ?: 30L).toInt(),
             hidDeviceUuids = hidUuids,
             hidDescriptors = hidDescriptors,
+            safeArea = safeArea,
             // R3 恢复接线（M5.2 起断链——/info 该键无人读；奥迪 3315 声明 true，
             // true = keepAlive 帧须携统计体 opcode=5+bplist）
             keepAliveSendStatsAsBody = root?.optBoolean("keepAliveSendStatsAsBody", false) ?: false,
@@ -1486,6 +1513,9 @@ class AirPlayLink(
          * 必须解析描述符才能得到正确映射（奥迪实测：按下「下一首」收 0x05=usages[5]=0xB5）。
          */
         val hidDescriptors: Map<String, ByteArray> = emptyMap(),
+        /** 安全区（S0.6 异形屏，/info displays[0].viewAreas[0].safeArea）：
+         *  x/y/w/h + drawOutside（允许画到安全区外）。null = 无声明（全幅）。 */
+        val safeArea: Map<String, Int>? = null,
         /**
          * `/info.keepAliveSendStatsAsBody`：屏幕流 keepAlive 帧是否携带统计体
          * （true → opcode=5 + bplist；false → opcode=2 空帧）。奥迪 3315 为 true。

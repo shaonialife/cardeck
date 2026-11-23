@@ -2979,6 +2979,20 @@ object SessionController {
                                 )
                                 pendingVideoW = streamW
                                 pendingVideoH = streamH
+                                // 安全区注入（S0.6 异形屏）：/info viewAreas[0]
+                                // → VirtualLauncher 布局内缩（交互避开缺口）
+                                setup.safeArea?.let { sa ->
+                                    VirtualLauncher.safeAreaRect =
+                                        android.graphics.Rect(
+                                            sa["x"] ?: 0,
+                                            sa["y"] ?: 0,
+                                            (sa["x"] ?: 0) + (sa["w"] ?: 0),
+                                            (sa["y"] ?: 0) + (sa["h"] ?: 0),
+                                        )
+                                    VirtualLauncher.safeAreaDrawOutside =
+                                        (sa["drawOutside"] ?: 0) == 1
+                                }
+                                    ?: run { VirtualLauncher.safeAreaRect = null }
                                 // dock 屏密度随画布短边等比（设计基准 1160×540@420dpi，
                                 // 见 design/launcher-proto.html：dock 48dp=126px）：高分辨率
                                 // 车机（测试台 2320×1080=2×）下 dock 文字/图标与奥迪同比例
