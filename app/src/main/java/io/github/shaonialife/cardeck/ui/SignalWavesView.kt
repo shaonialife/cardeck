@@ -56,8 +56,14 @@ class SignalWavesView
         private var animator: ValueAnimator? = null
         private var orbitRotation = 0f
 
+        /** 排队中的动画启动任务（post 到主线程执行；见 [startAnimation] 竞态防护）。 */
+        private var pendingStart: Runnable? = null
+
         fun setState(next: State) {
-            if (state == next) return
+            // 同状态且动画形态一致（CONNECTING/CONNECTED 应有动画在跑，IDLE 应无）
+            // 才跳过——否则自愈式重启（历史 bug：停止连接后蚂蚁线仍在转）。
+            val animExpected = next != State.IDLE
+            if (state == next && (animator != null) == animExpected && pendingStart == null) return
             state = next
             startAnimation()
             invalidate()
@@ -69,13 +75,18 @@ class SignalWavesView
         }
 
         override fun onDetachedFromWindow() {
+            pendingStart?.let { removeCallbacks(it) }
+            pendingStart = null
             animator?.cancel()
             animator = null
             super.onDetachedFromWindow()
         }
 
         private fun startAnimation() {
+            pendingStart?.let { removeCallbacks(it) }
+            pendingStart = null
             animator?.cancel()
+            animator = null
             orbitRotation = 0f
             val idle = state == State.IDLE
             if (idle) {
@@ -97,7 +108,16 @@ class SignalWavesView
                     }
                 }
             animator = newAnim
-            post(newAnim::start)
+            // 竞态防护：start 排队到主线程下一拍执行，其间 setState/startAnimation
+            // 可能已重入（cancel+置空/换新）——执行时校验仍是当前动画才启动，否则
+            // 会泄出一个无人取消的无限动画（停止连接后蚂蚁线仍在转的历史根因）。
+            val r =
+                Runnable {
+                    pendingStart = null
+                    if (animator === newAnim) newAnim.start()
+                }
+            pendingStart = r
+            post(r)
         }
 
         private var arcPhase = 0f
