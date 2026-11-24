@@ -667,12 +667,22 @@ object VirtualLauncher {
     /**
      * 地图路由判定：白名单成员，**或**用户在 车机设置→仪表盘 自定义选择的「地图应用」
      * （2026-11-23 起支持任意应用——DefaultMapPrefs.manualPackage 存的包名同样享受
-     * 地图屏路由/互斥语义）。appContextRef 在 SessionController.ensure 后进程内常驻，
-     * 设置 UI（同进程）调用时非空；空 = 无会话进程初态，仅按白名单判。
+     * 地图屏路由/互斥语义）。
+     *
+     * 单参版仅供会话内调用（attach 后 appContextRef 非空）；**设置 UI 必须用
+     * [isMapPackage] 的 Context 版**——无会话时 appContextRef 为 null（attach 设、
+     * detach 清），单参版的 manual 检查会短路失效：固定应用弹窗在未连接状态下
+     * 放行当前地图应用 → 双卡片同包冲突（2026-11-24 实测：红果同时进了地图+固定）。
      */
-    fun isMapPackage(packageName: String): Boolean =
+    fun isMapPackage(packageName: String): Boolean = isMapPackage(appContextRef, packageName)
+
+    /** 显式 Context 版（设置 UI 用——不依赖会话生命周期）。 */
+    fun isMapPackage(
+        context: Context?,
+        packageName: String,
+    ): Boolean =
         packageName in MAP_PACKAGES_PRIORITY ||
-            appContextRef?.let { DefaultMapPrefs.manualPackage(it) == packageName } == true
+            context?.let { DefaultMapPrefs.manualPackage(it) == packageName } == true
 
     /**
      * 已安装的默认地图（用户显式设置优先——DefaultMapPrefs；否则按优先序取

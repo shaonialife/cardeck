@@ -733,7 +733,11 @@ class DashboardPanelFragment : SettingsPanelFragment() {
         if (!enterAppPicker()) return
         loadApps {
             val ctx = requireContext()
-            val pinned = DashCardPrefs.pinnedPackage(ctx)
+            // 只排除**当前生效**的固定应用（resolve：mode=app 且可启动才非空）——
+            // 裸存储 pinnedPackage 在切回音乐卡片后仍保留旧包名（有意设计：重选无需
+            // 重挑），拿它排除会让「选过 A 当固定应用、切回音乐、再来自定义地图」的
+            // 用户找不到 A（2026-11-24 用户实测）。音乐模式下固定屏不存在，无互抢。
+            val pinned = DashCardPrefs.resolve(ctx)?.packageName
             val candidates = apps.filter { it.component.packageName != pinned }
             if (candidates.isEmpty()) {
                 appPickerActive = false
@@ -922,7 +926,9 @@ class DashboardPanelFragment : SettingsPanelFragment() {
         if (!enterAppPicker()) return
         loadApps {
             val ctx = requireContext()
-            val candidates = apps.filter { !VirtualLauncher.isMapPackage(it.component.packageName) }
+            // Context 版 isMapPackage：无会话时 appContextRef 为 null，单参版的
+            // manual 地图选择检查会失效（红果双选根因，2026-11-24）
+            val candidates = apps.filter { !VirtualLauncher.isMapPackage(ctx, it.component.packageName) }
             if (candidates.isEmpty()) {
                 appPickerActive = false
                 hostToast("没有可选的应用")
