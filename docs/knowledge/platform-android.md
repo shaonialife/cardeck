@@ -159,3 +159,11 @@
   还原。用户选择不处理（导航期间手机跟随转向反而有用）。若日后要治：会话级快照
   还原（同 screen_off_timeout 备份/恢复模式）或 `appops set <地图包> WRITE_SETTINGS
   ignore`（可能影响地图功能，慎用）。
+
+- **卸载 Shizuku APK ≠ 服务下线**（2026-11-25 实证）：`shizuku_server` 由 ADB/root 以
+  shell uid 拉起，卸载 APK 只杀应用 uid 进程——服务进程与 binder 原样存活到重启，
+  ShizukuGate 仍报 READY（真实状态：连接/建屏/注入全部可用）。`pm list packages` 空
+  但 `ps -A | grep shizuku_server` 有进程即为该形态。对用户是收益：换 Shizuku+/Sui
+  时先卸官方再装新的，服务不掉线无缝接管。同理 ShizukuGate.installed 的权限定义发现
+  在此形态下返回 null（定义方已卸载），引导会落到「未安装」——但 binder-first 的
+  state() 不受影响（先探 binder）。

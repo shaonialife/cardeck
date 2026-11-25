@@ -435,17 +435,23 @@ class MainActivity : AppCompatActivity() {
                 ensureShizukuReady { beginConnect() }
             }
         when (state) {
-            ShizukuGate.State.NOT_RUNNING ->
+            ShizukuGate.State.NOT_RUNNING -> {
+                // 按实际安装的实现跳转（Shizuku / Sui / Shizuku+；弹窗标签同步）
+                val impl = ShizukuGate.installed(this)
                 actions +=
-                    DarkMessageDialog.Action("打开 Shizuku", DarkMessageDialog.Emphasis.PRIMARY) {
-                        val intent = packageManager.getLaunchIntentForPackage(ShizukuGate.PACKAGE_NAME)
+                    DarkMessageDialog.Action(
+                        "打开 ${impl?.label ?: "Shizuku"}",
+                        DarkMessageDialog.Emphasis.PRIMARY,
+                    ) {
+                        val intent = impl?.let { packageManager.getLaunchIntentForPackage(it.pkg) }
                         if (intent == null) {
-                            snack("无法打开 Shizuku App——请手动打开")
+                            snack("无法打开 ${impl?.label ?: "Shizuku"} App——请手动打开")
                         } else {
                             runCatching { startActivity(intent) }
-                                .onFailure { snack("无法打开 Shizuku App——请手动打开") }
+                                .onFailure { snack("无法打开 ${impl?.label ?: "Shizuku"} App——请手动打开") }
                         }
                     }
+            }
 
             ShizukuGate.State.UNAUTHORIZED ->
                 actions +=

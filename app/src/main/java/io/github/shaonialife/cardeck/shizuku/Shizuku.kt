@@ -15,6 +15,12 @@ import java.util.concurrent.TimeUnit
  * Shizuku 网关 + shell 执行 + CarInput UserService 绑定。
  * 激活（无线调试，Android 11+，免 root）：开发者选项 → 无线调试 → 配对 → Shizuku App 点启动。
  * （移植自参考项目 android-auto）
+ *
+ * 2026-11-25 起实现无关（binder-first + 通用发现）：api 13 的 binder 获取是纯推送
+ * 协议（服务端扫描应用声明的 `<pkg>.shizuku_provider` 主动送 binder，客户端零实现
+ * 清单），Shizuku 官方 / Sui（root 版）/ Shizuku+ 及一切忠实 fork 天然可用——本网关
+ * 只按 binder 探活授权，包名仅用于引导（未装/未启动文案、打开按钮、解冻看门狗），
+ * 经生态标准权限的定义方通用发现（见 [installed]）。
  */
 object ShizukuGate {
     enum class State { NOT_INSTALLED, NOT_RUNNING, UNAUTHORIZED, READY }
@@ -22,17 +28,74 @@ object ShizukuGate {
     /** Shizuku 授权请求码（授权结果回调按它过滤）。 */
     const val PERMISSION_REQUEST_CODE = 101
 
-    /** Shizuku App 包名（打开/检测共用）。 */
-    const val PACKAGE_NAME = "moe.shizuku.privileged.api"
+    /** 生态标准权限：其**定义方**（packageName）即已安装的服务端实现（真机验证）。 */
+    private const val MANAGER_PERMISSION = "moe.shizuku.manager.permission.MANAGER"
+
+    /** 已安装的服务端实现（引导文案 /「打开」按钮 / 解冻看门狗用）。 */
+    data class Implementation(
+        val pkg: String,
+        val label: String,
+    )
+
+    /**
+     * 已知实现兜底清单（探测顺序 = 列表序）。[installed] 的权限定义发现是主路径，
+     * 这里只兜「权限定义缺失/改名」的异常形态。官方包名同时是 Shizuku+ Drop-In 版 /
+     * Compat Hub 转发器注册的包名，放最前。（internal：单测钉死清单内容）
+     */
+    internal val KNOWN_IMPLEMENTATIONS =
+        listOf(
+            "moe.shizuku.privileged.api", // Shizuku 官方（免 root）
+            "moe.shizuku.privilegedapi", // Sui（root 版，Magisk 模块）
+            "af.shizuku.plus.api", // Shizuku+（社区分支）
+        )
+
+    /**
+     * 本机已安装的实现（null = 一个都没有）。
+     *
+     * **通用发现优先**：api 13 的 binder 获取是纯推送（服务端扫描 `<pkg>.shizuku_provider`
+     * 主动推送，客户端无任何实现清单），任何忠实 fork 都能交付 binder——检测同样不
+     * 应写死包名。生态标准权限 `moe.shizuku.manager.permission.MANAGER` 由服务端
+     * App 声明（signature 级，真机实证 package= 定义方），fork 继承声明 → 定义方
+     * 包名即「用户实际装的那个」，标签取应用名自动跟随。
+     */
+    fun installed(context: Context): Implementation? {
+        val pm = context.packageManager
+        runCatching {
+            val perm = pm.getPermissionInfo(MANAGER_PERMISSION, 0)
+            val pkg = perm.packageName
+            if (!pkg.isNullOrBlank() && pkg != context.packageName) {
+                val label =
+                    runCatching {
+                        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                    }.getOrDefault("Shizuku")
+                return Implementation(pkg, label)
+            }
+        } // NameNotFoundException = 无实现定义过此权限，走兜底
+        return KNOWN_IMPLEMENTATIONS.firstNotNullOfOrNull { pkg ->
+            try {
+                context.packageManager.getPackageInfo(pkg, 0)
+                val label =
+                    runCatching {
+                        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                    }.getOrDefault("Shizuku")
+                Implementation(pkg, label)
+            } catch (_: PackageManager.NameNotFoundException) {
+                null
+            }
+        }
+    }
 
     fun state(context: Context): State {
-        return try {
-            context.packageManager.getPackageInfo(PACKAGE_NAME, 0)
-        } catch (_: PackageManager.NameNotFoundException) {
-            return State.NOT_INSTALLED
-        }.let {
+        // binder-first：binder 活着就说明有某个实现把服务跑起来了（授权事务直接走
+        // binder）；binder 死了才按包名区分「装了没启动 / 根本没装」。
+        val alive =
             try {
-                if (!rikka.shizuku.Shizuku.pingBinder()) return State.NOT_RUNNING
+                rikka.shizuku.Shizuku.pingBinder()
+            } catch (_: Throwable) {
+                false
+            }
+        if (alive) {
+            return try {
                 if (rikka.shizuku.Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
                     State.READY
                 } else {
@@ -42,6 +105,7 @@ object ShizukuGate {
                 State.NOT_RUNNING
             }
         }
+        return if (installed(context) != null) State.NOT_RUNNING else State.NOT_INSTALLED
     }
 
     fun requestPermission() {
@@ -65,8 +129,9 @@ object ShizukuGate {
                     message =
                         "连接车机依赖 Shizuku 提供的 shell 权限：创建虚拟屏、注入触摸、" +
                             "读取窗口状态都要经过它。\n\n" +
-                            "请先安装 Shizuku App 并按官方说明启动服务（无线调试激活，免 root），" +
-                            "完成后回到这里点「重试检查」。",
+                            "以下任一实现均可：Shizuku（官方，免 root，ADB / 无线调试启动）、" +
+                            "Sui（官方 root 版，Magisk 模块）、Shizuku+（社区分支）。" +
+                            "安装并启动服务后，回到这里点「重试检查」。",
                     primaryLabel = null,
                 )
 
@@ -74,9 +139,10 @@ object ShizukuGate {
                 ShizukuGuidance(
                     title = "Shizuku 服务未运行",
                     message =
-                        "Shizuku 已安装，但服务当前没有运行，此时连接会失败" +
+                        "已安装 Shizuku 系实现，但服务当前没有运行，此时连接会失败" +
                             "（车机没有画面、触摸也不可用）。\n\n" +
-                            "请打开 Shizuku App 点「启动」启动服务（手机重启后需要重新启动一次），" +
+                            "请打开对应的 App 启动服务（官方 Shizuku 手机重启后需重新启动一次；" +
+                            "Sui 走 Magisk 模块通常开机自启，未运行请检查模块是否启用），" +
                             "然后回来点「重试检查」。",
                     primaryLabel = "打开 Shizuku",
                 )

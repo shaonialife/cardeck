@@ -2692,8 +2692,12 @@ object VirtualLauncher {
                     try {
                         val ctx = appContextRef
                         if (ctx != null && CarInputClient.service == null) {
-                            runCatching {
-                                Shell.exec("am unfreeze moe.shizuku.privileged.api", timeoutMs = 2500)
+                            // 解冻实际安装的实现（通用发现，见 ShizukuGate.installed）；
+                            // 检测不到安装 = 没有可解冻的服务端，跳过
+                            ShizukuGate.installed(ctx)?.let { impl ->
+                                runCatching {
+                                    Shell.exec("am unfreeze ${impl.pkg}", timeoutMs = 2500)
+                                }
                             }
                             CarInputClient
                                 .ensure(ctx)

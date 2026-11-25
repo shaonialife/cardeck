@@ -58,4 +58,22 @@ class ShizukuGuidanceTest {
         assertNotNull(guidance)
         assertNull(guidance.primaryLabel)
     }
+
+    @Test
+    fun fallbackImplementationListCoversOfficialSuiAndPlus() {
+        // 兜底清单（权限定义发现的备用路径）：互不相同、官方包名探测首位
+        val pkgs = ShizukuGate.KNOWN_IMPLEMENTATIONS
+        assertEquals(pkgs.size, pkgs.toSet().size)
+        assertEquals("moe.shizuku.privileged.api", pkgs[0]) // Shizuku 官方（探测首位）
+        assertTrue(pkgs.contains("moe.shizuku.privilegedapi")) // Sui（root 版）
+        assertTrue(pkgs.contains("af.shizuku.plus.api")) // Shizuku+
+    }
+
+    @Test
+    fun notInstalledGuidanceMentionsAllImplementations() {
+        // 未安装引导必须列出三种可选实现，用户才知道 root 机有 Sui 这条路
+        val message = ShizukuGate.guidanceOf(ShizukuGate.State.NOT_INSTALLED).message
+        assertTrue(message.contains("Sui"))
+        assertTrue(message.contains("Shizuku+"))
+    }
 }
